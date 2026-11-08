@@ -1,0 +1,50 @@
+[package]
+name = "sqlparser-expr-eval"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Evaluates sqlparser expressions into the sets of outcomes they can take, and reads conditions backward into guarantees."
+repository = "https://github.com/connetto-rs/sqlparser-expr-eval"
+documentation = "https://docs.rs/sqlparser-expr-eval"
+readme = "README.md"
+keywords = ["sql", "sqlparser", "postgresql", "static-analysis", "nullability"]
+categories = ["database", "no-std"]
+
+[dependencies]
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", default-features = false, features = ["visitor"] }
+sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
+
+[features]
+default = ["std"]
+std = ["sqlparser/std", "sqlparser/recursive-protection"]
+
+[lints.rust]
+missing_docs = "forbid"
+unused_macro_rules = "forbid"
+unconditional_recursion = "forbid"
+unreachable_patterns = "forbid"
+unused_import_braces = "forbid"
+unused_must_use = "forbid"
+deprecated = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(coverage_nightly)"] }
+
+[lints.rustdoc]
+broken_intra_doc_links = "forbid"
+bare_urls = "forbid"
+invalid_codeblock_attributes = "forbid"
+invalid_html_tags = "forbid"
+missing_crate_level_docs = "forbid"
+unescaped_backticks = "forbid"
+redundant_explicit_links = "forbid"
+invalid_rust_codeblocks = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+clone_on_copy = "forbid"
+pedantic = { level = "deny", priority = -1 }

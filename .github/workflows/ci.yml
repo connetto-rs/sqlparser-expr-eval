@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Test, lint and document
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy without std
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Test without std
+        run: cargo test --release --no-default-features
+
+      # A target without std proves the library never reaches for it.
+      - name: Build for a target without std
+        run: |
+          rustup target add thumbv7em-none-eabihf
+          cargo build --no-default-features --target thumbv7em-none-eabihf
+
+      - name: Document
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustfmt.toml uses nightly-only options, so the format check needs nightly rustfmt.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate coverage
+        run: |
+          mkdir -p target/coverage
+          cargo +nightly llvm-cov --all-targets --no-report
+          cargo +nightly llvm-cov --doc --no-clean --lcov --output-path target/coverage/coverage.lcov
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/coverage/coverage.lcov
+          fail_ci_if_error: true
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Tracks `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.88"
+
+      - name: Test
+        run: cargo test --all-targets
