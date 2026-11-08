@@ -1,6 +1,6 @@
 //! The scalar types the evaluator reads an expression as.
 
-use sql_values::IntegerType;
+use sql_values::{CastTarget, CastValue, IntegerType, PgNumeric, PgValue, cast_value};
 use sqlparser::ast::{DataType, TimezoneInfo};
 
 /// What a text collation lets the evaluator decide about text values.
@@ -102,9 +102,42 @@ impl ScalarType {
     }
 }
 
+/// The character length of a text value.
+pub(crate) fn text_length(value: &PgValue) -> Option<u64> {
+    // the character count always fits a `u64`
+    value.as_text().map(|text| text.chars().count() as u64)
+}
+
+/// The value rounded half away from zero, as `numeric::bigint` rounds it,
+/// `None` for `NaN`, an infinity or a value past `bigint`.
+pub(crate) fn rounded_i64(value: &PgNumeric) -> Option<i64> {
+    match cast_value(CastValue::Numeric(value.clone()), CastTarget::Bigint) {
+        Ok(CastValue::Bigint(rounded)) => Some(rounded),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use super::*;
+
+    fn text(value: &str) -> PgValue {
+        PgValue::Text(String::from(value))
+    }
+
+    fn numeric(value: &str) -> PgNumeric {
+        PgNumeric::parse(value).unwrap()
+    }
+
+    #[test]
+    fn numerics_convert_to_i64_as_bigint_does() {
+        assert_eq!(rounded_i64(&numeric("2.5")), Some(3));
+        assert_eq!(rounded_i64(&numeric("-2.5")), Some(-3));
+        assert_eq!(rounded_i64(&PgNumeric::NAN), None);
+        assert_eq!(rounded_i64(&numeric("9223372036854775808")), None);
+    }
 
     #[test]
     fn scalar_type_of_maps_every_datatype() {
@@ -176,5 +209,11 @@ mod tests {
             Some((i64::from(i16::MIN), i64::from(i16::MAX)))
         );
         assert_eq!(ScalarType::Boolean.integer_bounds(), None);
+    }
+
+    #[test]
+    fn text_length_counts_characters() {
+        assert_eq!(text_length(&text("héllo")), Some(5));
+        assert_eq!(text_length(&PgValue::Integer(1)), None);
     }
 }
