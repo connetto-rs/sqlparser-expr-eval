@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    ignore:
+      # Dependabot reads this action's toolchain references as releases and offers nonexistent ones.
+      - dependency-name: dtolnay/rust-toolchain
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
