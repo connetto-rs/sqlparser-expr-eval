@@ -207,6 +207,11 @@ pub(crate) fn rounded_i64(value: &PgNumeric) -> Option<i64> {
     }
 }
 
+/// The value as an `i64` when it is a whole number within `bigint`.
+pub(crate) fn exact_i64(value: &PgNumeric) -> Option<i64> {
+    if value.is_integral() { rounded_i64(value) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::String;
@@ -384,6 +389,8 @@ mod tests {
         assert_eq!(rounded_i64(&numeric("-2.5")), Some(-3));
         assert_eq!(rounded_i64(&PgNumeric::NAN), None);
         assert_eq!(rounded_i64(&numeric("9223372036854775808")), None);
+        assert_eq!(exact_i64(&numeric("4.00")), Some(4));
+        assert_eq!(exact_i64(&numeric("2.5")), None);
     }
 
     #[test]

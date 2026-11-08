@@ -11,6 +11,7 @@ use super::{
         context::Context,
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
+        guarantees::Guarantees,
         scalar::{self, ScalarType, TextRules},
         support,
     },
@@ -580,29 +581,127 @@ pub(super) fn binary<D: EvalDialect, C: Context>(
 }
 
 /// The forward evaluation of the flat `AND`/`OR` chain of `terms`, walked
-/// iteratively: each term is read once under the base guarantees, and the
-/// terms' outcomes combine three-valued.
+/// iteratively. While the path budget holds, a term is read under what each
+/// outcome of the prefix seen so far implies, so the terms stay correlated;
+/// past the budget, the terms read independently under the base guarantees.
 fn and_or<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     terms: &[&Expr],
     and: bool,
 ) -> Result<Evaluation, C::Error> {
     let combine = if and { support::and_outcomes_set } else { support::or_outcomes_set };
+    // The guarantees each outcome of the prefix seen so far implies, and
+    // the guarantee of the prefix not being false, or not being true for an
+    // `OR`, which the outcome updates draw on.
+    let base = state.guarantees.clone();
+    let mut true_guarantee = if and { base.clone() } else { Guarantees::impossible() };
+    let mut false_guarantee = if and { Guarantees::impossible() } else { base.clone() };
+    let mut null_guarantee = Guarantees::impossible();
+    let mut helper_guarantee = base.clone();
     let mut outcomes = if and { Outcomes::TRUE } else { Outcomes::FALSE };
     let mut error = false;
+    let mut first = true;
     for term in terms {
-        let evaluation = support::as_condition(super::evaluate_within(
-            term,
-            state.dialect,
-            state.options,
-            state.context,
-            state.guarantees,
-            state.budget,
-        )?);
-        outcomes = combine(outcomes, evaluation.outcomes());
-        error |= evaluation.may_raise();
+        // The first term has no prefix to read under, and each later term
+        // reads correlated only while the budget holds.
+        if !first && state.budget.get() > 0 {
+            state.budget.set(state.budget.get() - 1);
+            let mut next_outcomes = Outcomes::NONE;
+            // The term is read once per outcome the prefix may take, under
+            // what that outcome implies, so the sides correlate.
+            for (single, guarantee) in [
+                (Outcomes::TRUE, &true_guarantee),
+                (Outcomes::FALSE, &false_guarantee),
+                (Outcomes::NULL, &null_guarantee),
+            ] {
+                if single.intersection(outcomes).is_empty() {
+                    continue;
+                }
+                let evaluation = support::as_condition(super::evaluate_within(
+                    term,
+                    state.dialect,
+                    state.options,
+                    state.context,
+                    guarantee,
+                    state.budget,
+                )?);
+                let evaluation_outcomes = evaluation.outcomes();
+                for reading in support::OUTCOMES {
+                    if reading.intersection(evaluation_outcomes).is_empty() {
+                        continue;
+                    }
+                    next_outcomes = next_outcomes.union(combine(single, reading));
+                }
+                error |= evaluation.may_raise();
+            }
+            outcomes = next_outcomes;
+        } else {
+            let evaluation = support::as_condition(super::evaluate_within(
+                term,
+                state.dialect,
+                state.options,
+                state.context,
+                state.guarantees,
+                state.budget,
+            )?);
+            outcomes = combine(outcomes, evaluation.outcomes());
+            error |= evaluation.may_raise();
+        }
+        first = false;
+        // The running guarantees feed the next term's correlated reads.
+        if state.budget.get() > 0 {
+            if and {
+                let next_true = narrow_within(state, term, &true_guarantee, Outcomes::TRUE)?;
+                let next_null = Guarantees::join(
+                    &narrow_within(state, term, &null_guarantee, Outcomes::NOT_FALSE)?,
+                    &narrow_within(state, term, &true_guarantee, Outcomes::NULL)?,
+                );
+                let next_false = Guarantees::join(
+                    &false_guarantee,
+                    &narrow_within(state, term, &helper_guarantee, Outcomes::FALSE)?,
+                );
+                let next_helper =
+                    narrow_within(state, term, &helper_guarantee, Outcomes::NOT_FALSE)?;
+                (true_guarantee, false_guarantee, null_guarantee, helper_guarantee) =
+                    (next_true, next_false, next_null, next_helper);
+            } else {
+                let next_false = narrow_within(state, term, &false_guarantee, Outcomes::FALSE)?;
+                // The term alone may be the true one, so it is read under
+                // the base, not the prefix.
+                let next_true = Guarantees::join(
+                    &true_guarantee,
+                    &narrow_within(state, term, &base, Outcomes::TRUE)?,
+                );
+                let next_null = Guarantees::join(
+                    &narrow_within(state, term, &null_guarantee, Outcomes::NOT_TRUE)?,
+                    &narrow_within(state, term, &helper_guarantee, Outcomes::NULL)?,
+                );
+                let next_helper =
+                    narrow_within(state, term, &helper_guarantee, Outcomes::NOT_TRUE)?;
+                (true_guarantee, false_guarantee, null_guarantee, helper_guarantee) =
+                    (next_true, next_false, next_null, next_helper);
+            }
+        }
     }
     Ok(Evaluation::condition(outcomes, error))
+}
+/// [`backward::implied_within`](super::super::backward::implied_within) on one
+/// term, drawing on the pass's budget.
+fn narrow_within<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    term: &Expr,
+    base: &Guarantees<C::Reference>,
+    single: Outcomes,
+) -> Result<Guarantees<C::Reference>, C::Error> {
+    super::super::backward::implied_within(
+        term,
+        single,
+        state.dialect,
+        state.options,
+        state.context,
+        base,
+        state.budget,
+    )
 }
 
 /// The unary operator of an expression, forward.
@@ -909,7 +1008,7 @@ fn negate<D: EvalDialect, C: Context>(
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeSet;
-    use core::ops::Bound;
+    use core::{cell::Cell, ops::Bound};
 
     use sql_values::{IntegerType, PgNumeric, PgValue};
     use sqlparser::{
@@ -924,7 +1023,7 @@ mod tests {
     };
     use crate::{
         domain::{Evaluation, Interval, Unlisted, Values},
-        forward::evaluate,
+        forward::{evaluate, evaluate_within},
         guarantees::{Guarantees, Subject},
         scalar::{ScalarType, TextRules},
         test_context::{ColumnContext, HookDialect, parse},
@@ -1150,20 +1249,6 @@ mod tests {
             .with_column("y", text_unlisted());
         let evaluation = read(context, "x || y || 'a'");
         assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
-    }
-
-    /// `AND` and `OR` combine the terms' outcomes, reading each term once.
-    #[test]
-    fn and_or_combine_the_terms() {
-        let context = || ColumnContext::new().with_column("x", int4_unlisted());
-        let result = read(context(), "x IS NULL OR x IS NOT NULL");
-        assert!(result.may_be_true());
-        assert!(result.may_be_false());
-        assert!(!result.may_be_null());
-        let result = read(context(), "x IS NULL AND x IS NOT NULL");
-        assert!(result.may_be_true());
-        assert!(result.may_be_false());
-        assert!(!result.may_be_null());
     }
 
     /// A dialect's `= NULL` answer reads the form as `IS NULL`.
@@ -1716,6 +1801,39 @@ mod tests {
         let Values::Unlisted(unlisted) = result.values() else { panic!("stays unlisted") };
         assert_eq!(unlisted.numbers.low, Bound::Included(PgNumeric::from(-100)));
         assert_eq!(unlisted.numbers.high, Bound::Excluded(PgNumeric::from(0_i64)));
+    }
+
+    /// `AND` and `OR` keep the sides correlated.
+    #[test]
+    fn and_or_correlate_the_sides() {
+        let context = || ColumnContext::new().with_column("x", int4_unlisted());
+        let result = read(context(), "x IS NULL OR x IS NOT NULL");
+        assert!(result.may_be_true());
+        assert!(!result.may_be_false());
+        assert!(!result.may_be_null());
+        let result = read(context(), "x IS NULL AND x IS NOT NULL");
+        assert!(!result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(!result.may_be_null());
+    }
+
+    /// A depleted path budget stays sound.
+    #[test]
+    fn a_depleted_path_budget_stays_sound() {
+        let budget = Cell::new(1);
+        let expression = parse("x = 1 AND x = 2 AND x = 3");
+        let result = evaluate_within(
+            &expression,
+            &GenericDialect,
+            &(),
+            &mut ColumnContext::new().with_column("x", int4_unlisted()),
+            &Guarantees::new(),
+            &budget,
+        )
+        .expect("the context resolves");
+        assert!(!result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(result.may_be_null());
     }
 
     /// An unknown literal whose reading a setting decides stays open.

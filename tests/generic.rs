@@ -1,24 +1,32 @@
 //! The conservative answers every non-PostgreSQL dialect shares, read
 //! through the public API.
 
+extern crate alloc;
+
+use alloc::collections::BTreeSet;
+
 use sqlparser::{
     ast::{Expr, Function, ObjectNamePart, SelectItem, SetExpr, Statement},
     dialect::PostgreSqlDialect,
     parser::{Parser, ParserError},
 };
-extern crate alloc;
-
-use alloc::collections::BTreeSet;
-
 use sqlparser_expr_eval::{
-    Callee, Context, Evaluation, Guarantees, Resolved, ScalarType, Unlisted, Values, evaluate,
+    Builtin, Callee, CalleeKind, Context, Evaluation, Guarantees, NullInput, Outcomes, Resolved,
+    ScalarType, Unlisted, Values, Volatility, evaluate, implied,
     sql_values::{IntegerType, PgValue},
 };
 
-/// A context that resolves a fixed set of columns.
+/// A context that resolves a fixed set of columns and callees.
 struct Ctx {
     columns: Vec<(String, Evaluation)>,
     callees: Vec<(String, Callee)>,
+}
+
+impl Ctx {
+    fn with_callee(mut self, name: &str, callee: Callee) -> Self {
+        self.callees.push((name.to_string(), callee));
+        self
+    }
 }
 
 /// A nullable, non-raising column of `ty` with unlisted values.
@@ -99,6 +107,47 @@ fn context() -> Ctx {
     }
 }
 
+/// Reads `sql`'s guarantee under the given outcomes, in the conservative
+/// dialect.
+#[expect(clippy::expect_used, reason = "a context error fails the test")]
+fn imply(mut context: Ctx, sql: &str, outcomes: Outcomes) -> Guarantees<String> {
+    implied(
+        &parse(sql),
+        outcomes,
+        &sqlparser::dialect::GenericDialect,
+        &(),
+        &mut context,
+        &Guarantees::new(),
+    )
+    .expect("the context resolves")
+}
+
+/// A strict callee returning `returns`.
+fn strict_callee(returns: ScalarType) -> Callee {
+    Callee::new(
+        None,
+        NullInput::Strict,
+        Volatility::Immutable,
+        CalleeKind::Normal,
+        returns,
+        false,
+        0,
+    )
+}
+
+/// A callee that folds the built-in `builtin` and returns `returns`.
+fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
+    Callee::new(
+        Some(builtin),
+        NullInput::Strict,
+        Volatility::Immutable,
+        CalleeKind::Normal,
+        returns,
+        false,
+        0,
+    )
+}
+
 #[test]
 fn arithmetic_stays_unknown_but_may_raise() {
     let evaluation = read(context(), "1 + 2");
@@ -176,6 +225,33 @@ fn a_call_with_no_callees_reads_unknown() {
     let evaluation = read(context(), "f('a')");
     assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     assert!(evaluation.may_raise());
+}
+
+#[test]
+fn a_strict_boolean_call_nulls_for_no_input_reason() {
+    // The conservative dialect knows no builtin returning `NULL` exactly on
+    // a `NULL` argument, so a `NULL` result says nothing about `x`
+    let guarantees = imply(
+        context().with_callee("f", strict_callee(ScalarType::Boolean)),
+        "f(x)",
+        Outcomes::NULL,
+    );
+    assert_eq!(guarantees.reference(&"x".to_string()), None);
+}
+
+#[test]
+fn a_length_comparison_counts_nothing() {
+    // The conservative dialect counts no argument, so the comparison says
+    // nothing about `x`
+    let guarantees = imply(
+        context().with_callee(
+            "length",
+            builtin_callee(Builtin::Length, ScalarType::Integer(IntegerType::Integer)),
+        ),
+        "length(x) = 3",
+        Outcomes::TRUE,
+    );
+    assert_eq!(guarantees.reference(&"x".to_string()), None);
 }
 
 /// `= ALL` over a `NULL` member reads `NULL` when the value equals the rest,

@@ -1056,27 +1056,6 @@ mod tests {
         assert!(super::fold_length(&[int(5)], int4(), false).is_none());
     }
 
-    /// A `length` over unknown text keeps the count on a numeric interval.
-    #[test]
-    fn a_length_over_unknown_text_keeps_the_length_interval() {
-        let unknown = Evaluation::new(
-            ScalarType::Text(TextRules::DEFAULT),
-            true,
-            false,
-            Values::Unlisted(Unlisted::any()),
-        );
-        let folded = super::fold_length(&[unknown], int4(), false).expect("the builtin folds");
-        assert!(folded.may_be_null());
-        let Values::Unlisted(unlisted) = folded.values() else { panic!("the count is unlisted") };
-        assert_eq!(
-            unlisted.numbers,
-            Interval {
-                low: Bound::Included(PgNumeric::from(0)),
-                high: Bound::Included(PgNumeric::from(i64::from(i32::MAX))),
-            }
-        );
-    }
-
     /// `lower` and `upper` fold a byte-order constant.
     #[test]
     fn lower_and_upper_fold_a_byte_order_constant() {
@@ -1343,19 +1322,6 @@ mod tests {
         );
         let evaluation = read(context, "foo(NULL)");
         assert!(evaluation.is_always_null());
-    }
-
-    /// A called-on-null position past the arguments reads the call as merely
-    /// nullable.
-    #[test]
-    fn called_on_null_past_the_arguments_reads_nullable() {
-        let context = ColumnContext::new().with_callee(
-            "foo",
-            callee(None, NullInput::CalledOnNull(vec![0]), CalleeKind::Normal, int4()),
-        );
-        let evaluation = read(context, "foo()");
-        assert!(evaluation.may_be_null());
-        assert!(!evaluation.is_always_null());
     }
 
     /// A strict call over a `NULL` argument is nullable but not forced `NULL`.

@@ -3,8 +3,10 @@
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+#[macro_use]
 extern crate alloc;
 
+mod backward;
 mod context;
 mod dialect;
 mod domain;
@@ -15,6 +17,7 @@ mod support;
 #[cfg(test)]
 mod test_context;
 
+pub use backward::implied;
 pub use context::{
     Builtin, Callee, CalleeKind, Context, NullInput, QueryEvaluation, Resolved, Rows, Volatility,
 };

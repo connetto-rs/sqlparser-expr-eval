@@ -1,19 +1,21 @@
-//! Helpers the forward evaluation pass shares.
+//! Helpers shared by the forward and the backward evaluation passes.
 
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::ops::Bound;
 
 use sql_values::{PgNumeric, PgValue};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Value,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName, Value,
     ValueWithSpan,
 };
 
 use super::{
-    context::{Context, Resolved},
+    context::{CalleeKind, Context, Resolved, Volatility},
     domain::{Evaluation, Interval, Outcomes, Values},
+    guarantees::Subject,
     scalar::ScalarType,
 };
+
 /// Whether the expression is one the context could resolve: an identifier, a
 /// compound identifier or a positional parameter.
 #[must_use]
@@ -34,6 +36,115 @@ pub(crate) fn resolve_reference<C: Context>(
 ) -> Result<Option<Resolved<C::Reference>>, C::Error> {
     if is_reference(expression) { context.reference(expression) } else { Ok(None) }
 }
+
+/// The subject a guarantee about `expression` is keyed under, asking the
+/// context to resolve a reference, `None` when no guarantee may be keyed
+/// under it.
+///
+/// An expression other than a reference is a subject only when every
+/// evaluation in one statement gives it one value. It is built from literals,
+/// operators, casts, `CASE`, lists and calls of immutable or stable ordinary
+/// functions alone, so it reads no column and holds no subquery. Two calls of
+/// `random()` differ, and a column named alike in a subquery may be another
+/// column.
+pub(crate) fn subject<C: Context>(
+    context: &mut C,
+    expression: &Expr,
+) -> Result<Option<Subject<C::Reference>>, C::Error> {
+    let expression = unnest(expression);
+    if let Some(resolved) = resolve_reference(context, expression)? {
+        return Ok(Some(Subject::Reference(resolved.reference)));
+    }
+    // The walk keeps its own stack, so a long left-deep chain costs no
+    // recursion.
+    let mut stack = vec![expression];
+    while let Some(node) = stack.pop() {
+        if !push_fixed_children(context, &mut stack, node)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(Subject::Expression(expression.clone())))
+}
+
+/// Pushes the children of `node` when `node` itself gives one value per
+/// statement, answering `false` for any other node.
+fn push_fixed_children<'a, C: Context>(
+    context: &mut C,
+    stack: &mut Vec<&'a Expr>,
+    node: &'a Expr,
+) -> Result<bool, C::Error> {
+    match node {
+        Expr::Value(_) | Expr::TypedString(_) => {}
+        Expr::Nested(value)
+        | Expr::Cast { expr: value, .. }
+        | Expr::UnaryOp { expr: value, .. }
+        | Expr::IsNull(value)
+        | Expr::IsNotNull(value)
+        | Expr::IsTrue(value)
+        | Expr::IsNotTrue(value)
+        | Expr::IsFalse(value)
+        | Expr::IsNotFalse(value)
+        | Expr::IsUnknown(value)
+        | Expr::IsNotUnknown(value) => stack.push(value),
+        Expr::BinaryOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => stack.extend([&**left, &**right]),
+        Expr::Between { expr, low, high, .. } => stack.extend([&**expr, &**low, &**high]),
+        Expr::In { expr, target: InTarget::List(list), .. } => {
+            stack.push(expr);
+            stack.extend(list);
+        }
+        Expr::Tuple(values) => stack.extend(values),
+        Expr::Array(array) => stack.extend(&array.elem),
+        Expr::Case { operand, conditions, else_result, .. } => {
+            stack.extend(operand.as_deref());
+            stack.extend(else_result.as_deref());
+            for when in conditions {
+                stack.extend([&when.condition, &when.result]);
+            }
+        }
+        Expr::Function(call) => return push_fixed_call(context, stack, call),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Pushes the arguments of `call` when it is a plain call whose every callee
+/// is an immutable or stable ordinary function.
+fn push_fixed_call<'a, C: Context>(
+    context: &mut C,
+    stack: &mut Vec<&'a Expr>,
+    call: &'a Function,
+) -> Result<bool, C::Error> {
+    let arguments = match &call.args {
+        FunctionArguments::None => &[][..],
+        FunctionArguments::List(list)
+            if list.clauses.is_empty() && list.duplicate_treatment.is_none() =>
+        {
+            &list.args[..]
+        }
+        _ => return Ok(false),
+    };
+    if call.over.is_some()
+        || call.filter.is_some()
+        || !call.within_group.is_empty()
+        || !matches!(call.parameters, FunctionArguments::None)
+    {
+        return Ok(false);
+    }
+    for argument in arguments {
+        let Some(value) = argument_expression(argument) else {
+            return Ok(false);
+        };
+        stack.push(value);
+    }
+    let callees = context.callees(call)?;
+    Ok(!callees.is_empty()
+        && callees.iter().all(|callee| {
+            callee.kind == CalleeKind::Normal && callee.volatility != Volatility::Volatile
+        }))
+}
+
 /// `expression` without the parentheses around it.
 #[must_use]
 pub(crate) fn unnest(mut expression: &Expr) -> &Expr {
@@ -68,6 +179,37 @@ pub(crate) fn and_or_terms<'a>(
     terms.push(chain_left);
     terms.reverse();
     terms
+}
+
+/// The evaluation narrowed to the values and the `NULL` possibility that
+/// `outcomes` allow, as a condition restricted to them.
+#[must_use]
+pub(crate) fn prune(evaluation: &Evaluation, outcomes: Outcomes) -> Evaluation {
+    let values = match evaluation.values() {
+        Values::Listed(listed) => {
+            let kept: BTreeSet<PgValue> = listed
+                .iter()
+                .filter(|value| {
+                    match value {
+                        PgValue::Boolean(true) => outcomes.truth,
+                        PgValue::Boolean(false) => outcomes.falsity,
+                        _ => true,
+                    }
+                })
+                .cloned()
+                .collect();
+            Values::Listed(kept)
+        }
+        // A boolean set always lists its members, so an unlisted value
+        // keeps its exclusions.
+        Values::Unlisted(_) => evaluation.values().clone(),
+    };
+    Evaluation::new(
+        evaluation.ty(),
+        evaluation.may_be_null() && outcomes.null,
+        evaluation.may_raise(),
+        values,
+    )
 }
 
 /// The outcomes of `left AND right`, three-valued.
@@ -238,6 +380,25 @@ pub(crate) fn count_numeric(count: u64) -> Option<PgNumeric> {
     i64::try_from(count).ok().map(PgNumeric::from)
 }
 
+/// The values of a listed set, admitted by `interval`.
+#[must_use]
+pub(crate) fn filter_listed_by_interval(
+    values: &BTreeSet<PgValue>,
+    interval: &Interval<PgNumeric>,
+) -> BTreeSet<PgValue> {
+    values
+        .iter()
+        .filter(|value| value.as_numeric().is_some_and(|number| interval.contains(&number)))
+        .cloned()
+        .collect()
+}
+
+/// Whether the type could stand for a condition.
+#[must_use]
+pub(crate) fn could_be_boolean(ty: ScalarType) -> bool {
+    matches!(ty, ScalarType::Boolean | ScalarType::Unknown | ScalarType::UnknownLiteral)
+}
+
 /// `evaluation` read as a condition: an untyped literal through the
 /// `boolean` input, and a value of another type as any `boolean` an engine
 /// may coerce it to, or a raise.
@@ -274,17 +435,202 @@ mod tests {
     use alloc::collections::BTreeSet;
     use core::ops::Bound;
 
-    use sql_values::{PgNumeric, PgValue};
+    use sql_values::{IntegerType, PgNumeric, PgValue};
     use sqlparser::ast::{Expr, Function};
 
-    use super::{and_outcomes, intervals_disjoint, not_outcomes, number_bounds, or_outcomes};
-    use crate::{
-        domain::{Interval, Outcomes, Unlisted, Values},
-        test_context::parse,
+    use super::{
+        and_outcomes, intervals_disjoint, is_reference, not_outcomes, number_bounds, or_outcomes,
+        prune, subject, unnest,
     };
+    use crate::{
+        context::{Callee, CalleeKind, Context, NullInput, Resolved, Volatility},
+        domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
+        guarantees::Subject,
+        scalar::{ScalarType, TextRules},
+        test_context::{ColumnContext, parse, strict_callee},
+    };
+
+    /// A context whose callee lookup always fails.
+    struct FailingCallees;
+
+    impl Context for FailingCallees {
+        type Reference = String;
+        type Error = String;
+
+        fn reference(
+            &mut self,
+            _expression: &Expr,
+        ) -> Result<Option<Resolved<Self::Reference>>, Self::Error> {
+            Ok(None)
+        }
+
+        fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Self::Error> {
+            Err("no callee table".to_string())
+        }
+    }
+
+    fn volatile_callee() -> Callee {
+        Callee {
+            builtin: None,
+            null_input: NullInput::Strict,
+            volatility: Volatility::Volatile,
+            kind: CalleeKind::Normal,
+            returns: ScalarType::Float,
+            returns_set: false,
+            token: 0,
+        }
+    }
 
     fn integers(values: &[i64]) -> Vec<PgValue> {
         values.iter().map(|value| PgValue::Integer(*value)).collect()
+    }
+
+    #[test]
+    fn a_reference_subject_comes_from_the_context() {
+        let int4 = ScalarType::Integer(IntegerType::Integer);
+        let mut context =
+            ColumnContext::new().with_column("x", Evaluation::known(PgValue::Integer(1), int4));
+        assert!(matches!(
+            subject(&mut context, &parse("x")).expect("resolves"),
+            Some(Subject::Reference(_))
+        ));
+        // a positional parameter is a reference only when the context names it
+        assert!(is_reference(&parse("$1")));
+        assert!(matches!(
+            subject(&mut context, &parse("$1")).expect("resolves"),
+            Some(Subject::Expression(_))
+        ));
+        assert!(!is_reference(&parse("1 + 2")));
+    }
+
+    #[test]
+    fn a_stable_expression_is_a_subject_and_a_column_is_not() {
+        let text = ScalarType::Text(TextRules::DEFAULT);
+        let mut context = ColumnContext::new().with_callee("upper", strict_callee(text));
+        // a call of a stable function over constants reads no column
+        assert!(matches!(
+            subject(&mut context, &parse("upper('a') + 1")).expect("resolves"),
+            Some(Subject::Expression(_))
+        ));
+        // the same shape that reads a column is no subject at all
+        let mut context =
+            context.with_column("x", Evaluation::known(PgValue::Text("a".to_string()), text));
+        assert!(subject(&mut context, &parse("upper(x)")).expect("resolves").is_none());
+        // a volatile callee changes between two evaluations of one statement
+        let mut context = ColumnContext::new().with_callee("random", volatile_callee());
+        assert!(subject(&mut context, &parse("random()")).expect("resolves").is_none());
+        // an aggregate and a window are two values per row, not one
+        let aggregate = Callee { kind: CalleeKind::Aggregate, ..volatile_callee() };
+        let mut context = ColumnContext::new().with_callee("sum", aggregate);
+        assert!(subject(&mut context, &parse("sum(1)")).expect("resolves").is_none());
+        let mut context = ColumnContext::new().with_callee("upper", strict_callee(text));
+        assert!(subject(&mut context, &parse("upper('a') OVER ()")).expect("resolves").is_none());
+        // a callee the context cannot read is no subject
+        let mut context = ColumnContext::new();
+        assert!(subject(&mut context, &parse("nosuch('a')")).expect("resolves").is_none());
+        // a subquery names another query's columns
+        assert!(subject(&mut context, &parse("EXISTS (SELECT 1)")).expect("resolves").is_none());
+        let mut context = FailingCallees;
+        // a reference the context cannot name is still no expression subject
+        assert!(subject(&mut context, &parse("x")).expect("resolves").is_none());
+        assert!(subject(&mut context, &parse("nosuch('a')")).is_err());
+    }
+
+    #[test]
+    fn every_constant_form_is_a_subject_and_others_are_not() {
+        let text = ScalarType::Text(TextRules::DEFAULT);
+        let mut context = ColumnContext::new()
+            .with_callee("upper", strict_callee(text))
+            .with_callee("now", strict_callee(text));
+        for sql in [
+            "DATE '2026-01-01'",
+            "CAST(upper('a') AS int)",
+            "-1",
+            "upper('a') IS NULL",
+            "upper('a') IS NOT NULL",
+            "upper('a') IS TRUE",
+            "upper('a') IS NOT TRUE",
+            "upper('a') IS FALSE",
+            "upper('a') IS NOT FALSE",
+            "upper('a') IS UNKNOWN",
+            "upper('a') IS NOT UNKNOWN",
+            "1 IS DISTINCT FROM 2",
+            "1 IS NOT DISTINCT FROM 2",
+            "2 BETWEEN 1 AND 3",
+            "1 IN (1, 2)",
+            "(1, 2)",
+            "ARRAY[1, 2]",
+            "CASE 1 WHEN 1 THEN 'a' ELSE 'b' END",
+            "CASE WHEN true THEN 'a' END",
+            "now()",
+            "upper(arg => 'a')",
+        ] {
+            assert!(
+                matches!(subject(&mut context, &parse(sql)), Ok(Some(Subject::Expression(_)))),
+                "{sql}"
+            );
+        }
+        // every refusal is a shape that may differ between rows or evaluations
+        for sql in [
+            "1 IN (SELECT 1)",
+            "(SELECT 1)",
+            "upper('a') FILTER (WHERE true)",
+            "upper(DISTINCT 'a')",
+            "upper('a' ORDER BY 1)",
+            "upper(*)",
+            "upper(upper('a') + x)",
+            "percentile_cont(0.5) WITHIN GROUP (ORDER BY 1)",
+            "1 LIKE 2",
+            "array(SELECT 1)",
+        ] {
+            assert!(matches!(subject(&mut context, &parse(sql)), Ok(None)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn unnest_strips_the_parentheses() {
+        assert!(matches!(
+            subject(
+                &mut ColumnContext::new(),
+                &parse("((1 + 2))")
+            )
+            .expect("resolves"),
+            Some(Subject::Expression(expr)) if matches!(&unnest(&expr), Expr::BinaryOp { .. })
+        ));
+    }
+
+    #[test]
+    fn prune_keeps_only_the_admitted_values() {
+        let boolean = Evaluation::new(
+            ScalarType::Boolean,
+            true,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Boolean(false), PgValue::Boolean(true)])),
+        );
+        let pruned = prune(&boolean, Outcomes { truth: true, falsity: false, null: true });
+        assert_eq!(pruned.values(), &Values::Listed(BTreeSet::from([PgValue::Boolean(true)])));
+        assert!(pruned.may_be_null());
+        let pruned = prune(&boolean, Outcomes { truth: false, falsity: true, null: false });
+        assert_eq!(pruned.values(), &Values::Listed(BTreeSet::from([PgValue::Boolean(false)])));
+        assert!(!pruned.may_be_null());
+        // a non-boolean listed set keeps its members and only the null
+        // possibility is restricted
+        let int4 = ScalarType::Integer(IntegerType::Integer);
+        let numbers = Evaluation::new(
+            int4,
+            true,
+            false,
+            Values::Listed(integers(&[1, 2]).into_iter().collect()),
+        );
+        let pruned = prune(&numbers, Outcomes::NULL);
+        assert_eq!(pruned.values(), &Values::Listed(integers(&[1, 2]).into_iter().collect()));
+        assert!(pruned.may_be_null());
+        // an unlisted set keeps its exclusions
+        let unlisted =
+            Evaluation::new(ScalarType::Numeric, true, false, Values::Unlisted(Unlisted::any()));
+        let pruned = prune(&unlisted, Outcomes::NULL);
+        assert!(matches!(pruned.values(), Values::Unlisted(_)));
+        assert!(pruned.may_be_null());
     }
 
     #[test]
