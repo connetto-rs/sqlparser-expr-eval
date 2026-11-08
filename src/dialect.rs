@@ -192,3 +192,34 @@ default_dialect! {
     sqlparser::dialect::SQLiteDialect,
     sqlparser::dialect::TeradataDialect,
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::ast::Expr;
+
+    use crate::{
+        context::{Callee, CalleeKind, NullInput, Volatility},
+        dialect::EvalDialect,
+        scalar::ScalarType,
+        test_context::parse,
+    };
+
+    #[test]
+    fn the_default_hooks_answer_conservatively() {
+        let dialect = sqlparser::dialect::GenericDialect;
+        assert!(dialect.null_equals_operand(&parse("x"), &parse("NULL"), &()).is_none());
+        let callee = Callee::new(
+            None,
+            NullInput::Strict,
+            Volatility::Immutable,
+            CalleeKind::Normal,
+            ScalarType::Boolean,
+            false,
+            0,
+        );
+        assert!(!dialect.null_only_on_null_input(&[callee], &()));
+        let call = parse("length(x)");
+        let Expr::Function(function) = call else { panic!("not a call") };
+        assert!(dialect.counted_length_argument(&function, &[], &()).is_none());
+    }
+}

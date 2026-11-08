@@ -228,20 +228,18 @@ pub trait Context {
 
 #[cfg(test)]
 mod tests {
-    use alloc::collections::BTreeSet;
-    use core::{convert::Infallible, ops::Bound};
+    use core::convert::Infallible;
 
-    use sql_values::{IntegerType, PgNumeric};
+    use sql_values::IntegerType;
     use sqlparser::{
-        ast::{Expr, Function, Statement},
+        ast::{Expr, Function, Ident, ObjectNamePart},
         dialect::GenericDialect,
-        parser::Parser,
     };
 
     use super::*;
     use crate::{
-        CalleeKind, Evaluation, Interval, NullInput, ScalarType, TextRules, Values, Volatility,
-        guarantees::Guarantees,
+        CalleeKind, Evaluation, NullInput, ScalarType, TextRules, Values, Volatility,
+        forward::evaluate, guarantees::Guarantees, test_context::parse,
     };
 
     /// A context that answers only `reference` and `callees`, so the default
@@ -255,65 +253,124 @@ mod tests {
 
         fn reference(
             &mut self,
-            _expression: &Expr,
+            expression: &Expr,
         ) -> Result<Option<Resolved<&'static str>>, Infallible> {
-            Ok(None)
+            match expression {
+                Expr::Identifier(Ident { value, .. }) if value.as_str() == "x" => {
+                    Ok(Some(Resolved {
+                        reference: "x",
+                        evaluation: Evaluation::unknown(ScalarType::Text(TextRules::DEFAULT)),
+                    }))
+                }
+                _ => Ok(None),
+            }
         }
 
-        fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
-            Ok(Vec::new())
+        fn callees(&mut self, call: &Function) -> Result<Vec<Callee>, Infallible> {
+            let Some(name) = call.name.0.last().and_then(ObjectNamePart::as_ident) else {
+                return Ok(Vec::new());
+            };
+            if name.value.as_str() != "f" {
+                return Ok(Vec::new());
+            }
+            Ok(Vec::from([Callee {
+                builtin: None,
+                null_input: NullInput::Strict,
+                volatility: Volatility::Immutable,
+                kind: CalleeKind::Normal,
+                returns: ScalarType::Integer(IntegerType::Integer),
+                returns_set: false,
+                token: 0,
+            }]))
         }
     }
 
     #[test]
-    fn the_default_bodies_answer_conservatively() {
-        let callee = Callee::new(
-            None,
-            NullInput::Strict,
-            Volatility::Immutable,
-            CalleeKind::Normal,
-            ScalarType::Integer(IntegerType::Integer),
-            false,
-            0,
+    fn a_call_with_no_body_reads_the_callee() {
+        let evaluation =
+            evaluate(&parse("f('a')"), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
+                .unwrap();
+        assert_eq!(evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
+        // An unknown routine may return `NULL` on non-`NULL` input, and `f`
+        // is declared not to raise
+        assert!(evaluation.may_be_null());
+        assert!(!evaluation.may_raise());
+        assert!(matches!(evaluation.values(), Values::Unlisted(_)));
+    }
+
+    #[test]
+    fn a_nested_query_reads_unknown() {
+        let evaluation = evaluate(
+            &parse("EXISTS (SELECT 1)"),
+            &GenericDialect,
+            &(),
+            &mut Minimal,
+            &Guarantees::new(),
+        )
+        .unwrap();
+        // The default query reads a row count of any, so `EXISTS` may be
+        // true and false, never `NULL`, and the read may raise
+        assert!(evaluation.may_raise());
+        assert!(!evaluation.may_be_null());
+        assert_eq!(
+            evaluation.values(),
+            &Values::Listed(alloc::collections::BTreeSet::from([
+                sql_values::PgValue::Boolean(true),
+                sql_values::PgValue::Boolean(false)
+            ]))
         );
-        assert_eq!(callee.returns, ScalarType::Integer(IntegerType::Integer));
-        let argument = Evaluation::new(
-            ScalarType::Text(TextRules::DEFAULT),
-            true,
-            false,
-            Values::Unlisted(crate::domain::Unlisted::any()),
-        );
-        let mut context = Minimal;
-        assert!(context.evaluate_body(&callee, &[argument]).unwrap().is_none());
-        let statement = Parser::parse_sql(&GenericDialect, "SELECT 1").unwrap().pop().unwrap();
-        let Statement::Query(query) = statement else { panic!("the statement is a query") };
-        let reading = context.query(&query, &Guarantees::new()).unwrap();
-        assert_eq!(reading.rows, Rows::ANY);
-        assert!(reading.columns.is_none());
-        assert!(reading.error);
-        assert_eq!(QueryEvaluation::unknown().rows, reading.rows);
-        assert_eq!(QueryEvaluation::unknown().error, reading.error);
-        let type_of = context.data_type(&sqlparser::ast::DataType::Integer(None));
-        assert_eq!(type_of, ScalarType::Integer(IntegerType::Integer));
-        let name = sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("name"));
-        assert!(context.reference(&name).unwrap().is_none());
-        let value = sqlparser::ast::Expr::Value(
-            sqlparser::ast::Value::Number("1".to_string(), false).into(),
-        );
-        assert!(context.reference(&value).unwrap().is_none());
-        let call = sqlparser::ast::Function {
-            name: sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
-                sqlparser::ast::Ident::new("length"),
+    }
+
+    #[test]
+    fn a_cast_reads_the_default_type() {
+        let evaluation =
+            evaluate(&parse("1::text"), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
+                .unwrap();
+        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert!(!evaluation.is_always_null());
+        // The default cast is conservative and may raise on a type change
+        assert!(evaluation.may_raise());
+        // A `NULL` source keeps its values absent
+        let evaluation =
+            evaluate(&parse("NULL::text"), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
+                .unwrap();
+        assert!(evaluation.is_always_null());
+        assert!(!evaluation.may_raise());
+    }
+
+    #[test]
+    fn a_column_and_an_unnamed_call_read_their_context() {
+        // `x` resolves to the column the context spells
+        let evaluation =
+            evaluate(&parse("x"), &GenericDialect, &(), &mut Minimal, &Guarantees::new()).unwrap();
+        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert!(evaluation.may_be_null());
+        // `y` resolves to nothing, so the node reads unknown
+        let evaluation =
+            evaluate(&parse("y"), &GenericDialect, &(), &mut Minimal, &Guarantees::new()).unwrap();
+        assert!(matches!(evaluation.ty(), ScalarType::Unknown | ScalarType::UnknownLiteral));
+        // A call the context does not know keeps any value of an unknown type
+        let evaluation =
+            evaluate(&parse("g('a')"), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
+                .unwrap();
+        assert!(matches!(evaluation.values(), Values::Unlisted(_)));
+        // A call whose name the context cannot read as an identifier reaches
+        // no callee at all
+        let call = Expr::Function(sqlparser::ast::Function {
+            name: sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Function(
+                sqlparser::ast::ObjectNamePartFunction { name: Ident::new("f"), args: Vec::new() },
             )]),
             uses_odbc_syntax: false,
             parameters: sqlparser::ast::FunctionArguments::None,
             args: sqlparser::ast::FunctionArguments::None,
-            within_group: vec![],
+            within_group: Vec::new(),
             filter: None,
             null_treatment: None,
             over: None,
-        };
-        assert!(context.callees(&call).unwrap().is_empty());
+        });
+        let evaluation =
+            evaluate(&call, &GenericDialect, &(), &mut Minimal, &Guarantees::new()).unwrap();
+        assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     }
 
     #[test]
@@ -322,36 +379,5 @@ mod tests {
         assert!(rows.none);
         assert!(!rows.one);
         assert!(rows.many);
-    }
-
-    #[test]
-    fn the_integer_normalisation_drops_the_out_of_range_unlisted() {
-        let beyond = Evaluation::new(
-            ScalarType::Integer(IntegerType::Integer),
-            false,
-            false,
-            Values::none(),
-        )
-        .with_values(Values::Unlisted(crate::domain::Unlisted {
-            excluded: BTreeSet::new(),
-            numbers: Interval {
-                low: Bound::Included(PgNumeric::from(1_i64 << 40)),
-                high: Bound::Included(PgNumeric::from((1_i64 << 40) + 5)),
-            },
-            length: Interval::unbounded(),
-        }));
-        assert!(beyond.is_impossible());
-    }
-
-    #[test]
-    fn the_query_constructor_holds_its_fields() {
-        let reading = QueryEvaluation::new(
-            Rows::ONE,
-            Some(vec![Evaluation::unknown(ScalarType::Boolean)]),
-            true,
-        );
-        assert_eq!(reading.rows, Rows::ONE);
-        assert!(matches!(reading.columns.as_deref().unwrap()[0].ty(), ScalarType::Boolean));
-        assert!(reading.error);
     }
 }

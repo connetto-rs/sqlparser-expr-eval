@@ -1149,34 +1149,73 @@ mod tests {
     }
 
     #[test]
-    fn condition_lists_the_admitted_outcomes() {
-        assert_eq!(
-            Evaluation::condition(Outcomes::TRUE, false),
-            Evaluation::new(
-                ScalarType::Boolean,
-                false,
-                false,
-                Values::Listed(BTreeSet::from([PgValue::Boolean(true)])),
-            )
+    fn outcomes_negated_swaps_the_truths() {
+        let outcomes = Outcomes { truth: true, falsity: false, null: true };
+        let negated = outcomes.negated();
+        assert!(!negated.truth);
+        assert!(negated.falsity);
+        assert!(negated.null);
+    }
+
+    #[test]
+    fn number_range_reads_both_value_forms() {
+        let listed = Evaluation::new(
+            ScalarType::Numeric,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Numeric(PgNumeric::from(0_i64))])),
         );
         assert_eq!(
-            Evaluation::condition(Outcomes::FALSE, false),
-            Evaluation::new(
-                ScalarType::Boolean,
-                false,
-                false,
-                Values::Listed(BTreeSet::from([PgValue::Boolean(false)])),
-            )
+            listed.number_range(),
+            Interval {
+                low: Bound::Included(PgNumeric::from(0_i64)),
+                high: Bound::Included(PgNumeric::from(0_i64)),
+            }
         );
-        assert_eq!(
-            Evaluation::condition(Outcomes::ANY, true),
-            Evaluation::new(
-                ScalarType::Boolean,
-                true,
-                true,
-                Values::Listed(BTreeSet::from([PgValue::Boolean(true), PgValue::Boolean(false),])),
-            )
+        let unlisted =
+            Evaluation::new(ScalarType::Numeric, false, false, Values::Unlisted(Unlisted::any()));
+        assert_eq!(unlisted.number_range(), Interval::unbounded());
+    }
+
+    #[test]
+    fn with_null_sets_the_null_possibility() {
+        let evaluation = Evaluation::new(
+            ScalarType::Boolean,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Boolean(true)])),
         );
+        assert!(evaluation.with_null(true).may_be_null());
+    }
+
+    #[test]
+    fn meet_takes_the_type_from_a_typed_side() {
+        let unknown = Evaluation::unknown(ScalarType::UnknownLiteral);
+        let typed = Evaluation::new(
+            ScalarType::Boolean,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Boolean(true)])),
+        );
+        assert_eq!(unknown.meet(&typed).ty(), ScalarType::Boolean);
+    }
+
+    #[test]
+    fn a_numeric_interval_with_no_numbers_normalises_to_none() {
+        let evaluation = Evaluation::new(
+            ScalarType::Numeric,
+            false,
+            false,
+            Values::Unlisted(Unlisted {
+                numbers: Interval {
+                    low: Bound::Included(PgNumeric::from(0_i64)),
+                    high: Bound::Excluded(PgNumeric::from(0_i64)),
+                },
+                ..Unlisted::any()
+            }),
+        );
+        assert!(evaluation.values().is_empty());
+        assert!(!evaluation.may_be_null());
     }
 
     /// The ranges of a listed set read the members of each kind, whatever

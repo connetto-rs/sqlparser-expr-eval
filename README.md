@@ -6,112 +6,78 @@
 [![crates.io](https://img.shields.io/crates/v/sqlparser-expr-eval.svg)](https://crates.io/crates/sqlparser-expr-eval)
 [![docs.rs](https://docs.rs/sqlparser-expr-eval/badge.svg)](https://docs.rs/sqlparser-expr-eval)
 
-What a SQL expression can evaluate to over every row: an [`Evaluation`] of its [`ScalarType`], its `NULL`-ness, whether it can raise, and the [`Values`] it can take, read into what the subjects an expression reads are known to satisfy by [`Guarantees`]. Every answer over-approximates, so unknown is always a safe answer. Values and their PostgreSQL rules come from [`sql-values`](https://docs.rs/sql-values), re-exported as [`sql_values`]. The crate is `no_std`, needing only `alloc`.
+Reads a [`sqlparser`](https://docs.rs/sqlparser) expression into what it can evaluate to over every row: whether it can be `NULL`, which values it can take, and whether it can raise. Every answer over-approximates, so unknown is always a safe answer. Values and their PostgreSQL rules come from [`sql-values`](https://docs.rs/sql-values), re-exported as [`sql_values`]. The crate is `no_std`, needing only `alloc`.
 
-An [`EvalDialect`] answers the questions an expression's meaning turns on; a dialect whose answers are the conservative ones implements no method and carries no settings in `Options`. A [`Context`] resolves the columns, calls and subqueries an expression reads. The dialect and its settings are passed to the entry points; nothing the context answers depends on them.
+An [`EvalDialect`] answers the questions an expression's meaning turns on, and carries its settings in `Options`. A [`Context`] resolves the columns, calls and subqueries an expression reads. The dialect and its settings are passed to the entry points; nothing the context answers depends on them.
 
 ```rust
-use sqlparser::ast::DataType;
+use sqlparser::ast::{Expr, Function, FunctionArguments, Ident, ObjectName, ObjectNamePart};
+use sqlparser::parser::Parser;
 use sqlparser_expr_eval::{
-    Callee, CalleeKind, Context, Evaluation, Guarantees, NullInput, QueryEvaluation,
-    Resolved, Rows, ScalarType, TextRules, Unlisted, Values, Volatility,
+    Callee, Context, Evaluation, Guarantees, Resolved, ScalarType, TextRules,
+    Unlisted, Values, evaluate,
     sql_values::IntegerType,
 };
-use core::convert::Infallible;
 
-/// A scope that resolves a single `id` column.
-struct Teams {
-    /// Whether the scope has seen the column.
-    seen: bool,
-}
+/// `id INT NOT NULL` and `note TEXT`.
+struct Teams;
 
 impl Context for Teams {
     type Reference = &'static str;
-    type Error = Infallible;
+    type Error = core::convert::Infallible;
 
-    fn reference(
-        &mut self,
-        expression: &sqlparser::ast::Expr,
-    ) -> Result<Option<Resolved<&'static str>>, Self::Error> {
-        let sqlparser::ast::Expr::Identifier(name) = expression else {
-            return Ok(None);
+    fn reference(&mut self, expression: &Expr) -> Result<Option<Resolved<&'static str>>, Self::Error> {
+        let Expr::Identifier(name) = expression else { return Ok(None) };
+        let (reference, ty, null) = match name.value.as_str() {
+            "id" => ("id", ScalarType::Integer(IntegerType::Integer), false),
+            "note" => ("note", ScalarType::Text(TextRules::DEFAULT), true),
+            _ => return Ok(None),
         };
-        if name.value.as_str() != "id" {
-            return Ok(None);
-        }
-        self.seen = true;
-        let evaluation = Evaluation::new(
-            ScalarType::Integer(IntegerType::Integer),
-            false,
-            false,
-            Values::Unlisted(Unlisted::any()),
-        );
-        Ok(Some(Resolved { reference: "id", evaluation }))
+        let evaluation = Evaluation::new(ty, null, false, Values::Unlisted(Unlisted::any()));
+        Ok(Some(Resolved { reference, evaluation }))
     }
 
-    fn callees(&mut self, _call: &sqlparser::ast::Function) -> Result<Vec<Callee>, Self::Error> {
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Self::Error> {
         Ok(Vec::new())
     }
 }
 
-let mut teams = Teams { seen: false };
-let column = teams
-    .reference(&sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("id")))
-    .unwrap()
-    .expect("the column resolves");
-assert!(teams.seen);
-assert!(!column.evaluation.may_be_null());
+let parse = |sql: &str| {
+    Parser::new(&sqlparser::dialect::GenericDialect).try_with_sql(sql)?.parse_expr()
+};
+let read = |sql: &str| {
+    let Ok(evaluation) =
+        evaluate(&parse(sql)?, &sqlparser::dialect::GenericDialect, &(), &mut Teams, &Guarantees::new());
+    Ok::<_, sqlparser::parser::ParserError>(evaluation)
+};
 
-// An expression that is not an identifier and a name the scope does not
-// hold admit no column.
-let unbound = teams
-    .reference(&sqlparser::ast::Expr::Value(
-        sqlparser::ast::Value::Number("1".to_string(), false).into(),
-    ))
-    .unwrap();
-assert!(unbound.is_none());
-assert!(teams
-    .reference(&sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("name")))
+assert!(!read("id NOT IN (1, NULL)")?.may_be_true());
+assert!(read("note = NULL")?.is_always_null());
+
+// The conservative dialect leaves values unknown, but the outcome still holds.
+let sum = read("1 + 2")?;
+assert!(sum.may_raise());
+assert!(matches!(sum.values(), Values::Unlisted(_)));
+
+// A name the scope does not hold and a call it does not declare admit nothing.
+let mut scope = Teams;
+assert!(scope
+    .reference(&Expr::Identifier(Ident::new("other")))
     .unwrap()
     .is_none());
-
-// The scope declares no callee.
-let call = sqlparser::ast::Function {
-    name: sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
-        sqlparser::ast::Ident::new("length"),
-    )]),
+assert!(scope.callees(&Function {
+    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("length"))]),
     uses_odbc_syntax: false,
-    parameters: sqlparser::ast::FunctionArguments::None,
-    args: sqlparser::ast::FunctionArguments::None,
+    parameters: FunctionArguments::None,
+    args: FunctionArguments::None,
     within_group: vec![],
     filter: None,
     null_treatment: None,
     over: None,
-};
-assert!(teams.callees(&call).unwrap().is_empty());
-
-// A callee the scope declares, with what a `NULL` argument does to it.
-let callee = Callee::new(
-    None,
-    NullInput::Strict,
-    Volatility::Immutable,
-    CalleeKind::Normal,
-    ScalarType::Text(TextRules::DEFAULT),
-    false,
-    0,
-);
-assert_eq!(callee.returns, ScalarType::Text(TextRules::DEFAULT));
-
-// A query the scope cannot answer reads every row count and may raise.
-let reading = QueryEvaluation::unknown();
-assert_eq!(reading.rows, Rows::ANY);
-assert!(reading.error);
-
-// The type a cast spells.
-let integer = ScalarType::of(&DataType::Integer(None));
-assert_eq!(integer, ScalarType::Integer(IntegerType::Integer));
-
-// The guarantees are empty until a condition narrows a subject.
-let guarantees: Guarantees<&'static str> = Guarantees::new();
-assert!(guarantees.is_empty());
+})
+.unwrap()
+.is_empty());
+# Ok::<(), sqlparser::parser::ParserError>(())
 ```
+
+A dialect whose answers are the conservative ones implements no method and carries no settings in `Options`. The conservative reading keeps three-valued logic and `NULL` propagation and leaves values unknown, so an unknown routine may return `NULL` on non-`NULL` input and an arithmetic result may raise.

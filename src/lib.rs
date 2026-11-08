@@ -12,13 +12,18 @@ mod forward;
 mod guarantees;
 mod scalar;
 mod support;
+#[cfg(test)]
+mod test_context;
 
 pub use context::{
     Builtin, Callee, CalleeKind, Context, NullInput, QueryEvaluation, Resolved, Rows, Volatility,
 };
 pub use dialect::EvalDialect;
 pub use domain::{Evaluation, Interval, Outcomes, Unlisted, Values};
-pub use forward::fold::{Comparison, RowKinds};
+pub use forward::{
+    evaluate,
+    fold::{Comparison, RowKinds},
+};
 pub use guarantees::{Guarantees, Subject};
 pub use scalar::{ScalarType, TextRules};
 pub use sql_values;

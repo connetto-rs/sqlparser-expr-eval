@@ -1,15 +1,20 @@
-//! The conservative comparison reading and the type arithmetic the default
-//! dialect answers with.
+//! Operators, forward: comparisons, arithmetic and string concatenation.
 
+use alloc::collections::BTreeSet;
 use core::ops::Bound;
 
 use sql_values::{PgNumeric, PgValue};
-use sqlparser::ast::BinaryOperator;
+use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
 
-use crate::{
-    domain::{Evaluation, Interval, Values},
-    scalar::ScalarType,
-    support,
+use super::{
+    super::{
+        context::Context,
+        dialect::EvalDialect,
+        domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
+        scalar::{self, ScalarType, TextRules},
+        support,
+    },
+    State, forward,
 };
 
 /// The category two operands compare in.
@@ -50,6 +55,14 @@ impl RowKinds {
         self.all_false || self.mixed
     }
 
+    /// The kinds against any non-empty subset of the right values, as a
+    /// subquery's rows may hold any of the values its column may hold, so a
+    /// pair that may satisfy is a subset satisfied throughout.
+    #[must_use]
+    pub(crate) fn over_subsets(self) -> Self {
+        Self { all_true: self.may_be_true(), all_false: self.may_be_false(), mixed: self.mixed }
+    }
+
     /// These kinds with a mixed row wherever a pair may satisfy, or may
     /// fail, outside the rows that may do so against every right value.
     #[must_use]
@@ -79,30 +92,72 @@ impl Comparison {
     }
 }
 
-/// The conservative reading of a comparison: only boolean and exact-number
-/// literals compare by value, because the standard dialects type untyped
-/// literals with their own affinity and compare text under their own
-/// collation.
+/// A dialect's comparison with the operands' `NULL` possibility, which
+/// together decide its outcomes.
+pub(crate) struct Compared {
+    /// The kinds of answer a left value may give against the right values.
+    pub(crate) rows: RowKinds,
+    /// A side may be `NULL`.
+    pub(crate) null: bool,
+    /// Evaluating the operands or applying the operator may raise.
+    pub(crate) error: bool,
+}
+
+impl Compared {
+    /// The outcomes the comparison takes.
+    pub(crate) fn outcomes(&self) -> Outcomes {
+        Outcomes {
+            truth: self.rows.may_be_true(),
+            falsity: self.rows.may_be_false(),
+            null: self.null,
+        }
+    }
+}
+
+/// The comparison of two already-evaluated operands under the dialect.
+pub(super) fn comparison_evals<D: EvalDialect, C: Context>(
+    state: &State<'_, D, C>,
+    left: Evaluation,
+    op: &BinaryOperator,
+    right: Evaluation,
+) -> Compared {
+    let error = left.may_raise() || right.may_raise();
+    if left.is_impossible() || right.is_impossible() {
+        return Compared { rows: RowKinds::NONE, null: false, error };
+    }
+    // A comparison operator is strict, so an always-`NULL` side decides the
+    // outcome before any type resolution.
+    if left.is_always_null() || right.is_always_null() {
+        let error = error || !comparable(&left, &right);
+        return Compared { rows: RowKinds::NONE, null: true, error };
+    }
+    let null = left.may_be_null() || right.may_be_null();
+    let Comparison { rows, error } = state.dialect.comparison(left, op, right, state.options);
+    Compared { rows, null, error }
+}
+
+/// The conservative reading of a comparison: number values and, for
+/// equality, booleans compare by value, while the standard dialects type
+/// untyped literals with their own affinity and compare text under their
+/// own collation.
 pub(crate) fn standard_comparison(
     left: &Evaluation,
     op: &BinaryOperator,
     right: &Evaluation,
     error: bool,
 ) -> Comparison {
-    let decidable = match (left.constant(), right.constant()) {
-        (Some(PgValue::Boolean(_)), Some(PgValue::Boolean(_))) => {
-            matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq)
-        }
-        (Some(_), Some(_)) => left.ty().is_number() && right.ty().is_number(),
-        _ => false,
-    };
-    if !decidable {
-        return Comparison::new(RowKinds::ANY, error);
-    }
-    let category = if matches!(left.constant(), Some(PgValue::Boolean(_))) {
-        Category::Boolean
+    let category = if left.ty().is_number() && right.ty().is_number() {
+        Some(Category::Number)
+    } else if left.ty() == ScalarType::Boolean && right.ty() == ScalarType::Boolean {
+        (matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq)).then_some(Category::Boolean)
     } else {
-        Category::Number
+        None
+    };
+    // The engine resolves the values' types under its own rules, so the
+    // pair facts are undecidable; every outcome they support stays
+    // possible.
+    let Some(category) = category else {
+        return Comparison::new(RowKinds::ANY, error || !comparable(left, right));
     };
     Comparison::new(pair_analysis(left, right, &category, op), error)
 }
@@ -127,6 +182,67 @@ pub(crate) fn pair_analysis(
                 BinaryOperator::NotEq => boolean_pairs(left, right, false),
                 _ => RowKinds::NONE.with_pairs(true, true),
             }
+        }
+    }
+}
+
+/// An untyped literal re-read as the type that resolved it, the way
+/// PostgreSQL types an untyped literal against its use.
+pub(crate) fn reinterpret_unknown(evaluation: Evaluation, target: ScalarType) -> Evaluation {
+    if evaluation.ty() != ScalarType::UnknownLiteral || target.is_text() {
+        return evaluation.with_type(target);
+    }
+    if let Values::Listed(listed) = evaluation.values() {
+        let mut values = BTreeSet::new();
+        let mut error = evaluation.may_raise();
+        let mut open = false;
+        for datum in listed {
+            match scalar::cast(datum, ScalarType::UnknownLiteral, target) {
+                scalar::Cast::Folded(value) => {
+                    values.insert(value);
+                }
+                // The cast raises on the rows this literal stands for, while
+                // the other literals may still fold.
+                scalar::Cast::Raises => error = true,
+                // Undecidable, so any value may and the input may refuse it.
+                scalar::Cast::Unknown => {
+                    open = true;
+                    error = true;
+                }
+            }
+        }
+        let values = if open { Values::Unlisted(Unlisted::any()) } else { Values::Listed(values) };
+        return Evaluation::new(target, evaluation.may_be_null(), error, values);
+    }
+    // An unlisted literal may hold text the target's input refuses.
+    Evaluation::new(target, evaluation.may_be_null(), true, Values::Unlisted(Unlisted::any()))
+}
+
+/// Whether every engine has a comparison between the two sides, an untyped
+/// literal only when its text reads as the other side's type.
+fn comparable(left: &Evaluation, right: &Evaluation) -> bool {
+    let reads_as = |literal: &Evaluation, other: &Evaluation| {
+        match other.ty() {
+            ScalarType::UnknownLiteral | ScalarType::Unknown | ScalarType::Text(_) => true,
+            ScalarType::Float | ScalarType::Other => false,
+            ty => !reinterpret_unknown(literal.clone(), ty).may_raise(),
+        }
+    };
+    let number = |ty: ScalarType| ty.is_number() || ty == ScalarType::Float;
+    let temporal = |ty: ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
+    let (l, r) = (left.ty(), right.ty());
+    match (l, r) {
+        (ScalarType::UnknownLiteral, _) => reads_as(left, right),
+        (_, ScalarType::UnknownLiteral) => reads_as(right, left),
+        (ScalarType::Unknown, _) | (_, ScalarType::Unknown) => true,
+        _ => {
+            (number(l) && number(r))
+                || (temporal(l) && temporal(r))
+                || matches!(
+                    (l, r),
+                    (ScalarType::Text(_), ScalarType::Text(_))
+                        | (ScalarType::Boolean, ScalarType::Boolean)
+                )
         }
     }
 }
@@ -351,20 +467,303 @@ fn number_eq_absent(left: &Values, right: &Values) -> bool {
 /// under the equality or the inequality. A boolean evaluation lists its
 /// values, both when it holds them.
 fn boolean_pairs(left: &Evaluation, right: &Evaluation, equality: bool) -> RowKinds {
-    let holds = |a: bool, b: bool| if equality { a == b } else { a != b };
-    let rights = [true, false].map(|b| (b, right.may_be(&PgValue::Boolean(b))));
-    let held = rights.iter().filter(|(_, may)| *may).count();
+    let holds = |a: &bool, b: &bool| if equality { a == b } else { a != b };
+    pair_certainties(booleans_held(left), &booleans_held(right), |a, b| {
+        let satisfies = holds(a, b);
+        (satisfies, !satisfies)
+    })
+}
+
+/// The booleans a boolean evaluation may hold.
+fn booleans_held(side: &Evaluation) -> impl Iterator<Item = bool> + Clone + '_ {
+    [true, false].into_iter().filter(move |&value| side.may_be(&PgValue::Boolean(value)))
+}
+
+/// The kinds of answer a left value may give against the right values.
+/// `judge` answers whether a pair certainly satisfies and whether it
+/// certainly fails, which an undecidable pair answers with neither.
+fn pair_certainties<A, B>(
+    lefts: impl Iterator<Item = A>,
+    rights: &(impl Iterator<Item = B> + Clone),
+    judge: impl Fn(&A, &B) -> (bool, bool),
+) -> RowKinds {
     let mut rows = RowKinds::NONE;
-    for a in [true, false] {
-        if !left.may_be(&PgValue::Boolean(a)) {
-            continue;
+    for a in lefts {
+        let (mut may_satisfy, mut may_fail) = (false, false);
+        let (mut always_may_satisfy, mut always_may_fail) = (true, true);
+        for b in rights.clone() {
+            let (satisfies, fails) = judge(&a, &b);
+            may_satisfy |= !fails;
+            may_fail |= !satisfies;
+            always_may_satisfy &= !fails;
+            always_may_fail &= !satisfies;
         }
-        let satisfied = rights.iter().filter(|(b, may)| *may && holds(a, *b)).count();
-        rows.all_true |= satisfied == held;
-        rows.all_false |= satisfied == 0;
-        rows.mixed |= satisfied != 0 && satisfied != held;
+        rows = RowKinds {
+            all_true: rows.all_true || always_may_satisfy,
+            all_false: rows.all_false || always_may_fail,
+            mixed: rows.mixed,
+        }
+        .with_pairs(may_satisfy, may_fail);
     }
     rows
+}
+
+/// The comparison of two expressions, forward.
+pub(super) fn comparison<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+) -> Result<Evaluation, C::Error> {
+    let left = forward(state, left)?;
+    let right = forward(state, right)?;
+    let comparison = comparison_evals(state, left, op, right);
+    Ok(support::condition(comparison.outcomes(), comparison.error))
+}
+
+/// `[ NOT ] BETWEEN`, forward.
+pub(super) fn between<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    expr: &Expr,
+    low: &Expr,
+    high: &Expr,
+    negated: bool,
+) -> Result<Evaluation, C::Error> {
+    let x = forward(state, expr)?;
+    let low = forward(state, low)?;
+    let high = forward(state, high)?;
+    let low_cmp = comparison_evals(state, x.clone(), &BinaryOperator::GtEq, low);
+    let high_cmp = comparison_evals(state, x, &BinaryOperator::LtEq, high);
+    let outcomes = support::and_outcomes(low_cmp.outcomes(), high_cmp.outcomes());
+    let outcomes = if negated { support::not_outcomes(outcomes) } else { outcomes };
+    Ok(support::condition(outcomes, low_cmp.error || high_cmp.error))
+}
+
+/// The operator of a binary expression, forward.
+pub(super) fn binary<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+) -> Result<Evaluation, C::Error> {
+    match op {
+        BinaryOperator::Eq => {
+            if let Some(operand) = state.dialect.null_equals_operand(left, right, state.options) {
+                return super::functions::is_null(state, operand, false);
+            }
+            comparison(state, left, op, right)
+        }
+        BinaryOperator::NotEq
+        | BinaryOperator::Lt
+        | BinaryOperator::LtEq
+        | BinaryOperator::Gt
+        | BinaryOperator::GtEq => comparison(state, left, op, right),
+        BinaryOperator::StringConcat => left_deep(state, left, op, right, Class::Concat),
+        BinaryOperator::Plus | BinaryOperator::Minus => {
+            left_deep(state, left, op, right, Class::Additive)
+        }
+        BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => {
+            left_deep(state, left, op, right, Class::Multiplicative)
+        }
+        BinaryOperator::And | BinaryOperator::Or => {
+            let and = *op == BinaryOperator::And;
+            and_or(state, &support::and_or_terms(left, right, and), and)
+        }
+        _ => {
+            // An operator the reading does not model may raise or answer
+            // `NULL`.
+            forward(state, left)?;
+            forward(state, right)?;
+            Ok(Evaluation::new(ScalarType::Unknown, true, true, Values::Unlisted(Unlisted::any())))
+        }
+    }
+}
+
+/// The forward evaluation of the flat `AND`/`OR` chain of `terms`, walked
+/// iteratively: each term is read once under the base guarantees, and the
+/// terms' outcomes combine three-valued.
+fn and_or<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    terms: &[&Expr],
+    and: bool,
+) -> Result<Evaluation, C::Error> {
+    let combine = if and { support::and_outcomes_set } else { support::or_outcomes_set };
+    let mut outcomes = if and { Outcomes::TRUE } else { Outcomes::FALSE };
+    let mut error = false;
+    for term in terms {
+        let evaluation = support::as_condition(super::evaluate_within(
+            term,
+            state.dialect,
+            state.options,
+            state.context,
+            state.guarantees,
+            state.budget,
+        )?);
+        outcomes = combine(outcomes, evaluation.outcomes());
+        error |= evaluation.may_raise();
+    }
+    Ok(Evaluation::condition(outcomes, error))
+}
+
+/// The unary operator of an expression, forward.
+pub(super) fn unary<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    op: UnaryOperator,
+    expr: &Expr,
+) -> Result<Evaluation, C::Error> {
+    match op {
+        UnaryOperator::Not => {
+            let inner = support::as_condition(forward(state, expr)?);
+            if inner.is_impossible() {
+                return Ok(Evaluation::impossible(ScalarType::Boolean));
+            }
+            let outcomes = inner.outcomes();
+            Ok(support::condition(
+                Outcomes { truth: outcomes.falsity, falsity: outcomes.truth, null: outcomes.null },
+                inner.may_raise(),
+            ))
+        }
+        UnaryOperator::Minus => negate(state, expr),
+        UnaryOperator::Plus => {
+            let inner = forward(state, expr)?;
+            if state.dialect.unary_plus_preserves(&inner, state.options) {
+                return Ok(inner);
+            }
+            Ok(Evaluation::new(
+                inner.ty(),
+                inner.may_be_null(),
+                inner.may_raise() || support::sign_may_raise(&inner),
+                Values::Unlisted(Unlisted::any()),
+            ))
+        }
+        _ => {
+            // An operator the reading does not model may raise or answer
+            // `NULL`.
+            forward(state, expr)?;
+            Ok(Evaluation::new(ScalarType::Unknown, true, true, Values::Unlisted(Unlisted::any())))
+        }
+    }
+}
+
+/// The precedence class a flat left-nested chain of binary operators walks
+/// over; operators of a class fold left-associatively along their own spine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Additive,
+    Multiplicative,
+    Concat,
+}
+
+/// The chain class of `op`, when it walks a left-deep spine.
+fn chain_class(op: &BinaryOperator) -> Option<Class> {
+    match op {
+        BinaryOperator::Plus | BinaryOperator::Minus => Some(Class::Additive),
+        BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => {
+            Some(Class::Multiplicative)
+        }
+        BinaryOperator::StringConcat => Some(Class::Concat),
+        _ => None,
+    }
+}
+
+/// The forward evaluation of a flat left-nested chain of `op` and the same
+/// precedence class, walked iteratively so a long spine keeps the stack flat:
+/// the leftmost operand is read once, then the (operator, right operand)
+/// pairs fold upward.
+fn left_deep<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    class: Class,
+) -> Result<Evaluation, C::Error> {
+    // The spine's (operator, right operand) pairs read top-down, the root
+    // first; the walk stops at a different class or a non-operator.
+    let mut pairs: alloc::vec::Vec<(&BinaryOperator, &Expr)> = alloc::vec::Vec::new();
+    let mut spine = support::unnest(left);
+    pairs.push((op, right));
+    loop {
+        let node = support::unnest(spine);
+        let Expr::BinaryOp { left: l, op: o, right: r } = node else {
+            break;
+        };
+        if chain_class(o) != Some(class) {
+            break;
+        }
+        pairs.push((o, support::unnest(r)));
+        spine = support::unnest(l);
+    }
+    let mut acc = forward(state, support::unnest(spine))?;
+    for (o, r) in pairs.iter().rev() {
+        let right = forward(state, r)?;
+        acc = match class {
+            Class::Additive | Class::Multiplicative => arithmetic_combine(state, acc, o, right),
+            Class::Concat => concat_combine(state, &acc, &right),
+        };
+    }
+    Ok(acc)
+}
+
+/// The combination of two already-evaluated operands of `left || right`.
+fn concat_combine<D: EvalDialect, C: Context>(
+    state: &State<'_, D, C>,
+    left: &Evaluation,
+    right: &Evaluation,
+) -> Evaluation {
+    if left.is_uninformative() || right.is_uninformative() {
+        return Evaluation::unknown(ScalarType::Unknown);
+    }
+    let error = left.may_raise() || right.may_raise();
+    let null = left.may_be_null() || right.may_be_null();
+    if left.is_impossible() || right.is_impossible() {
+        return Evaluation::impossible(ScalarType::Text(TextRules::DEFAULT));
+    }
+    // An untyped `NULL` takes the text side `||` needs.
+    let is_text = |evaluation: &Evaluation| {
+        evaluation.ty().is_text()
+            || evaluation.ty() == ScalarType::UnknownLiteral
+            || (evaluation.ty() == ScalarType::Unknown && evaluation.is_always_null())
+    };
+    if !is_text(left) && !is_text(right) {
+        // Neither side is text, so `||` has no type to resolve to.
+        return Evaluation::new(
+            ScalarType::Text(TextRules::DEFAULT),
+            null,
+            true,
+            Values::Unlisted(Unlisted::any()),
+        );
+    }
+    // `||` is strict: a `NULL` side nulls the result.
+    if left.is_always_null() || right.is_always_null() {
+        return Evaluation::null(ScalarType::Text(TextRules::DEFAULT)).with_error(error);
+    }
+    if let Some(folded) = state.dialect.concat(left, right, state.options) {
+        return folded;
+    }
+    Evaluation::new(
+        ScalarType::Text(TextRules::DEFAULT),
+        null,
+        error,
+        Values::Unlisted(Unlisted::any()),
+    )
+}
+
+/// The combination of two already-evaluated operands of a numeric operator,
+/// deferring the fold and the bounds to the dialect.
+fn arithmetic_combine<D: EvalDialect, C: Context>(
+    state: &State<'_, D, C>,
+    left: Evaluation,
+    op: &BinaryOperator,
+    right: Evaluation,
+) -> Evaluation {
+    if left.is_uninformative() || right.is_uninformative() {
+        return Evaluation::unknown(ScalarType::Unknown);
+    }
+    let (left, right) = arithmetic_sides(left, right);
+    if left.is_impossible() || right.is_impossible() {
+        return Evaluation::impossible(ScalarType::Unknown);
+    }
+    state.dialect.arithmetic(&left, op, &right, state.options)
 }
 
 /// The type a numeric binary operator resolves to.
@@ -380,6 +779,36 @@ pub(crate) fn arithmetic_type(left: ScalarType, right: ScalarType) -> ScalarType
         (ScalarType::UnknownLiteral, b) if b.is_number() => b,
         (a, b) if a == ScalarType::Float || b == ScalarType::Float => ScalarType::Float,
         _ => ScalarType::Unknown,
+    }
+}
+
+/// The arithmetic operands with untyped literals resolved to the type of the
+/// other operand, or to the default `int4` when both are untyped, the way
+/// PostgreSQL types them.
+fn arithmetic_sides(left: Evaluation, right: Evaluation) -> (Evaluation, Evaluation) {
+    let left_ty = left.ty();
+    let right_ty = right.ty();
+    match (left_ty, right_ty) {
+        (ScalarType::UnknownLiteral, right_ty) if right_ty.is_number() => {
+            (reinterpret_unknown(left, right_ty), right)
+        }
+        (left_ty, ScalarType::UnknownLiteral) if left_ty.is_number() => {
+            (left, reinterpret_unknown(right, left_ty))
+        }
+        (ScalarType::UnknownLiteral, ScalarType::UnknownLiteral) => {
+            let integer = ScalarType::Integer(sql_values::IntegerType::Integer);
+            (reinterpret_unknown(left, integer), reinterpret_unknown(right, integer))
+        }
+        _ => (left, right),
+    }
+}
+
+/// The bound negated.
+pub(crate) fn neg_bound(bound: &Bound<PgNumeric>) -> Bound<PgNumeric> {
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(value) => Bound::Included(-value.clone()),
+        Bound::Excluded(value) => Bound::Excluded(-value.clone()),
     }
 }
 
@@ -399,394 +828,1019 @@ pub(crate) fn interval_contains_zero(interval: &Interval<PgNumeric>) -> bool {
     low_ok && high_ok
 }
 
+/// The forward evaluation of `-expr`.
+fn negate<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    expr: &Expr,
+) -> Result<Evaluation, C::Error> {
+    // A minus chain over a number literal folds into the literal, typed the
+    // way PostgreSQL's `make_const` types the signed constant.
+    let mut node = support::unnest(expr);
+    let mut negated = true;
+    while let Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } = node {
+        negated = !negated;
+        node = support::unnest(inner);
+    }
+    if let Expr::Value(value) = node
+        && let Value::Number(number, _) = &value.value
+        && let Some((value, ty)) = scalar::number_literal(number, negated)
+    {
+        return Ok(Evaluation::known(value, ty));
+    }
+    let inner = forward(state, expr)?;
+    let ty = inner.ty();
+    if !ty.is_number() {
+        // A `float` negates to a `float` the reading does not fold.
+        let negated = if ty == ScalarType::Float { ty } else { ScalarType::Unknown };
+        return Ok(Evaluation::new(
+            negated,
+            inner.may_be_null(),
+            inner.may_raise() || support::sign_may_raise(&inner),
+            Values::Unlisted(Unlisted::any()),
+        ));
+    }
+    if inner.is_impossible() {
+        return Ok(Evaluation::impossible(ty));
+    }
+    let null = inner.may_be_null();
+    let error0 = inner.may_raise();
+    match inner.values() {
+        Values::Listed(listed) => {
+            let mut out = BTreeSet::new();
+            let mut error = error0;
+            for datum in listed {
+                // A numeric type lists only numeric datums.
+                if let PgValue::Integer(value) = datum {
+                    if let ScalarType::Integer(target) = ty
+                        && *value == *target.range().start()
+                    {
+                        error = true;
+                        continue;
+                    }
+                    // The negation of the `i64` minimum lies in the wider type.
+                    let negated = value.checked_neg().map_or_else(
+                        || PgValue::Numeric(-PgNumeric::from(*value)),
+                        PgValue::Integer,
+                    );
+                    out.insert(negated);
+                }
+                if let PgValue::Numeric(numeric) = datum {
+                    out.insert(PgValue::Numeric(-numeric.clone()));
+                }
+            }
+            Ok(Evaluation::new(ty, null, error, Values::Listed(out)))
+        }
+        Values::Unlisted(unlisted) => {
+            let (low, high) = (neg_bound(&unlisted.numbers.high), neg_bound(&unlisted.numbers.low));
+            let mut error = error0;
+            if let ScalarType::Integer(target) = ty {
+                let min = PgNumeric::from(*target.range().start());
+                if unlisted.numbers.contains(&min) {
+                    error = true;
+                }
+            }
+            let mut narrowed = unlisted.clone();
+            narrowed.numbers = Interval { low, high };
+            Ok(Evaluation::new(ty, null, error, Values::Unlisted(narrowed)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeSet;
     use core::ops::Bound;
 
-    use sql_values::{IntegerType, PgNumeric};
-    use sqlparser::ast::BinaryOperator;
+    use sql_values::{IntegerType, PgNumeric, PgValue};
+    use sqlparser::{
+        ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan},
+        dialect::GenericDialect,
+        tokenizer::Span,
+    };
 
-    use super::*;
-    use crate::{Interval, ScalarType, Unlisted};
+    use super::{
+        Category, RowKinds, arithmetic_type, interval_contains_zero, pair_analysis,
+        reinterpret_unknown, standard_comparison,
+    };
+    use crate::{
+        domain::{Evaluation, Interval, Unlisted, Values},
+        forward::evaluate,
+        guarantees::{Guarantees, Subject},
+        scalar::{ScalarType, TextRules},
+        test_context::{ColumnContext, HookDialect, parse},
+    };
 
-    fn listed(ty: ScalarType, values: Vec<PgValue>) -> Evaluation {
-        Evaluation::new(
-            ty,
-            false,
-            false,
-            Values::Listed(values.into_iter().collect::<BTreeSet<PgValue>>()),
-        )
+    /// Reads `sql` under the conservative default dialect, with no settings.
+    fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
+        evaluate(&parse(sql), &GenericDialect, &(), &mut context, &Guarantees::new())
+            .expect("resolves")
     }
 
-    fn int4(value: i64) -> PgValue {
-        PgValue::Integer(value)
+    /// Reads `sql` under the hook dialect, which answers every dialect hook.
+    fn read_hook(mut context: ColumnContext, sql: &str) -> Evaluation {
+        evaluate(&parse(sql), &HookDialect, &(), &mut context, &Guarantees::new())
+            .expect("resolves")
     }
 
-    fn unlisted_numbers(low: Bound<PgNumeric>, high: Bound<PgNumeric>) -> Evaluation {
-        Evaluation::new(
-            ScalarType::Integer(IntegerType::Integer),
-            false,
-            false,
-            Values::Unlisted(Unlisted {
-                excluded: BTreeSet::new(),
-                numbers: Interval { low, high },
-                length: Interval::unbounded(),
-            }),
-        )
+    fn read_guarantees(
+        mut context: ColumnContext,
+        guarantees: &Guarantees<String>,
+        sql: &str,
+    ) -> Evaluation {
+        evaluate(&parse(sql), &GenericDialect, &(), &mut context, guarantees).expect("resolves")
     }
 
-    /// A `numeric`-typed range normalisation leaves unlisted, so it keeps
-    /// every width.
-    fn numeric_range(low: Bound<PgNumeric>, high: Bound<PgNumeric>) -> Evaluation {
+    fn int4(values: Values) -> Evaluation {
+        Evaluation::new(ScalarType::Integer(IntegerType::Integer), true, false, values)
+    }
+
+    fn int4_unlisted() -> Evaluation {
+        int4(Values::Unlisted(Unlisted::any()))
+    }
+
+    fn numeric_unlisted() -> Evaluation {
+        Evaluation::new(ScalarType::Numeric, true, false, Values::Unlisted(Unlisted::any()))
+    }
+
+    fn point(value: i64) -> Evaluation {
+        Evaluation::known(PgValue::Integer(value), ScalarType::Integer(IntegerType::Integer))
+    }
+
+    fn numbers(interval: Interval<PgNumeric>) -> Evaluation {
         Evaluation::new(
             ScalarType::Numeric,
             false,
             false,
-            Values::Unlisted(Unlisted {
-                excluded: BTreeSet::new(),
-                numbers: Interval { low, high },
-                length: Interval::unbounded(),
-            }),
+            Values::Unlisted(Unlisted { numbers: interval, ..Unlisted::any() }),
         )
     }
 
+    fn number_interval(low: i64, high: i64) -> Interval<PgNumeric> {
+        Interval {
+            low: Bound::Included(PgNumeric::from(low)),
+            high: Bound::Included(PgNumeric::from(high)),
+        }
+    }
+
+    fn bound(low: &str, low_value: i64, high: &str, high_value: i64) -> Interval<PgNumeric> {
+        let bound = |mode: &str, value: i64| {
+            match mode {
+                "i" => Bound::Included(PgNumeric::from(value)),
+                "e" => Bound::Excluded(PgNumeric::from(value)),
+                _ => Bound::Unbounded,
+            }
+        };
+        Interval { low: bound(low, low_value), high: bound(high, high_value) }
+    }
+
+    fn guarantees_for(
+        x: &str,
+        ty: ScalarType,
+        interval: Interval<PgNumeric>,
+    ) -> Guarantees<String> {
+        let mut guarantees = Guarantees::new();
+        guarantees.restrict(
+            Subject::Reference(x.to_string()),
+            Evaluation::new(
+                ty,
+                false,
+                false,
+                Values::Unlisted(Unlisted { numbers: interval, ..Unlisted::any() }),
+            ),
+        );
+        guarantees
+    }
+
     #[test]
-    fn undecidable_sides_keep_every_outcome_open() {
-        let ty = ScalarType::Integer(IntegerType::Integer);
-        let left = Evaluation::unknown(ty);
-        let right = Evaluation::unknown(ty);
-        let comparison = standard_comparison(&left, &BinaryOperator::Eq, &right, false);
+    fn standard_comparison_of_columns_stays_open() {
+        let result = read(
+            ColumnContext::new()
+                .with_column("a", int4_unlisted())
+                .with_column("b", int4_unlisted()),
+            "a = b",
+        );
+        assert!(result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(result.may_be_null());
+        assert!(!result.may_raise());
+    }
+
+    /// A resolved category computes each pair certainty from the values,
+    /// the facts `ANY` and `ALL` read for their outcomes.
+    #[test]
+    fn a_resolved_comparison_computes_the_pair_certainties() {
+        let one = point(1);
+        let two = point(2);
+        // every non-`NULL` pair satisfies, closing `ALL`'s falsity
+        assert!(!standard_comparison(&one, &BinaryOperator::Eq, &one, false).rows.may_be_false());
+        // no non-`NULL` pair satisfies, closing `ANY`'s truth
+        assert!(!standard_comparison(&one, &BinaryOperator::Eq, &two, false).rows.may_be_true());
+        // some left value satisfies every right value, keeping `ALL`'s
+        // `NULL` reading when a `NULL` member is possible
+        assert!(standard_comparison(&one, &BinaryOperator::Eq, &one, false).rows.all_true);
+        // some left value satisfies no right value, keeping `ANY`'s
+        // `NULL` reading when a `NULL` member is possible
+        assert!(standard_comparison(&one, &BinaryOperator::Eq, &two, false).rows.all_false);
+    }
+
+    /// An unresolved category leaves every outcome the pair facts support
+    /// open.
+    #[test]
+    fn an_unresolved_comparison_leaves_every_pair_fact_open() {
+        let text = |value: &str| {
+            Evaluation::new(
+                ScalarType::Text(TextRules::DEFAULT),
+                false,
+                false,
+                Values::Listed(BTreeSet::from([PgValue::Text(value.to_string())])),
+            )
+        };
+        let comparison = standard_comparison(&text("a"), &BinaryOperator::Eq, &text("b"), false);
         assert_eq!(comparison.rows, RowKinds::ANY);
     }
 
+    /// A comparison against an impossible operand is impossible.
     #[test]
-    fn boolean_literals_compare_by_value() {
-        let left = listed(ScalarType::Boolean, vec![PgValue::Boolean(true)]);
-        let right = listed(ScalarType::Boolean, vec![PgValue::Boolean(false)]);
-        let comparison = standard_comparison(&left, &BinaryOperator::Eq, &right, false);
-        assert!(!comparison.rows.may_be_true());
-        assert!(comparison.rows.may_be_false());
-        assert!(!comparison.rows.may_be_true());
-        let comparison = standard_comparison(&left, &BinaryOperator::NotEq, &right, false);
-        assert!(comparison.rows.may_be_true());
-        assert!(!comparison.rows.may_be_false());
-        assert!(!comparison.rows.may_be_false());
+    fn a_comparison_with_an_impossible_side_is_impossible() {
+        let context = ColumnContext::new()
+            .with_column("x", Evaluation::impossible(ScalarType::Integer(IntegerType::Integer)));
+        assert!(read(context, "x = 1").is_impossible());
     }
 
+    /// Untyped literals re-read as the type that resolved them.
     #[test]
-    fn numeric_literals_compare_by_value() {
-        let ty = ScalarType::Integer(IntegerType::Integer);
-        let left = listed(ty, vec![int4(1), int4(2)]);
-        let right = listed(ty, vec![int4(2)]);
-        let comparison = standard_comparison(&left, &BinaryOperator::Eq, &right, false);
-        assert!(comparison.rows.may_be_true());
-        assert!(comparison.rows.may_be_false());
-        let below = listed(ty, vec![int4(1)]);
-        let above = listed(ty, vec![int4(3)]);
-        let comparison = standard_comparison(&below, &BinaryOperator::Lt, &above, false);
-        assert!(comparison.rows.may_be_true());
-        assert!(!comparison.rows.may_be_false());
-        assert!(!comparison.rows.may_be_false());
-        let comparison = standard_comparison(&above, &BinaryOperator::Lt, &below, false);
-        assert!(!comparison.rows.may_be_true());
-        assert!(comparison.rows.may_be_false());
-        assert!(!comparison.rows.may_be_true());
-    }
-
-    #[test]
-    fn number_pairs_decide_the_row_certainties() {
-        let below = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(1)]);
-        let above = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(5)]);
-        let rows = number_pairs(below.values(), above.values(), &BinaryOperator::Lt);
-        assert!(!rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(rows.all_true);
-        assert!(!rows.all_false);
-        let rows = number_pairs(above.values(), below.values(), &BinaryOperator::Lt);
-        assert!(rows.may_be_false());
-        assert!(!rows.may_be_true());
-        assert!(!rows.all_true);
-        assert!(rows.all_false);
-    }
-
-    #[test]
-    fn boolean_pairs_decide_the_row_certainties() {
-        let left = listed(ScalarType::Boolean, vec![PgValue::Boolean(true)]);
-        let right = listed(ScalarType::Boolean, vec![PgValue::Boolean(true)]);
-        let rows = boolean_pairs(&left, &right, true);
-        assert!(!rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(rows.all_true);
-        assert!(!rows.all_false);
-        let rows = boolean_pairs(&left, &right, false);
-        assert!(rows.may_be_false());
-        assert!(!rows.may_be_true());
-        assert!(!rows.all_true);
-        assert!(rows.all_false);
-    }
-
-    #[test]
-    fn unlisted_bounds_decide_the_pair_analysis() {
-        let below = unlisted_numbers(Bound::Unbounded, Bound::Included(PgNumeric::from(3)));
-        let above = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(5)]);
-        let rows = number_pairs(below.values(), above.values(), &BinaryOperator::Lt);
-        assert!(!rows.may_be_false());
-        assert!(rows.may_be_true());
-        let rows = number_pairs(above.values(), below.values(), &BinaryOperator::Lt);
-        assert!(rows.may_be_false());
-        // No listed value is below every value the unlisted side admits
-        assert!(!rows.may_be_true());
-        // A listed value a single unlisted number admits is an equality match
-        let single = unlisted_numbers(
-            Bound::Included(PgNumeric::from(7)),
-            Bound::Included(PgNumeric::from(7)),
-        );
-        let pair = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(7)]);
-        assert!(number_eq_match(pair.values(), single.values()));
-        let apart = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(8)]);
-        assert!(number_eq_absent(apart.values(), single.values()));
-        assert!(number_eq_absent(single.values(), apart.values()));
-        // An unlisted side admits values the listed side cannot exclude
-        let open = unlisted_numbers(Bound::Unbounded, Bound::Unbounded);
-        assert!(number_eq_absent(open.values(), pair.values()));
-    }
-
-    #[test]
-    fn arithmetic_types_widen_the_operands() {
+    fn arithmetic_reinterprets_untyped_literals() {
+        let numeric_context = || ColumnContext::new().with_column("n", numeric_unlisted());
+        // both sides untyped: both re-read as integers
         assert_eq!(
-            arithmetic_type(
-                ScalarType::Integer(IntegerType::Smallint),
-                ScalarType::Integer(IntegerType::Integer)
+            read(numeric_context(), "1 + 2").ty(),
+            ScalarType::Integer(IntegerType::Integer),
+        );
+        // the literal re-reads against the number's type
+        assert_eq!(read(numeric_context(), "n + 1").ty(), ScalarType::Numeric);
+        assert_eq!(read(numeric_context(), "1 + n").ty(), ScalarType::Numeric);
+        // a special number text keeps the interval open
+        assert_eq!(read(numeric_context(), "n + 'NaN'").ty(), ScalarType::Numeric);
+        // a text side that cannot be a number keeps the raise reading
+        let context = || ColumnContext::new().with_column("x", int4_unlisted());
+        assert!(read(context(), "x + 'oops'").may_raise());
+        // a text side that reads as a number resolves as the other side's type
+        assert!(read(context(), "x + '1'").may_raise());
+        // an unlisted unknown literal re-reads against the type
+        let context = ColumnContext::new().with_column(
+            "u",
+            Evaluation::new(
+                ScalarType::UnknownLiteral,
+                true,
+                false,
+                Values::Unlisted(Unlisted::any()),
             ),
-            ScalarType::Integer(IntegerType::Integer)
+        );
+        assert_eq!(read(context, "u + 1").ty(), ScalarType::Integer(IntegerType::Integer));
+    }
+
+    /// A flat multiplicative spine keeps the left-deep walk.
+    #[test]
+    fn a_multiplicative_spine_walks_left_deep() {
+        let context = ColumnContext::new().with_column("x", int4_unlisted());
+        let evaluation = read(context, "x * 2 * 3");
+        assert_eq!(evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert!(evaluation.may_raise());
+    }
+
+    /// A boolean pair analysis of an empty side meets no value.
+    #[test]
+    fn a_boolean_pair_analysis_of_an_empty_side_meets_no_value() {
+        let empty = Evaluation::impossible(ScalarType::Boolean);
+        let flag = Evaluation::known(PgValue::Boolean(true), ScalarType::Boolean);
+        assert_eq!(
+            pair_analysis(&empty, &flag, &Category::Boolean, &BinaryOperator::Eq),
+            RowKinds::NONE,
         );
         assert_eq!(
-            arithmetic_type(ScalarType::Integer(IntegerType::Integer), ScalarType::Numeric),
-            ScalarType::Numeric
+            pair_analysis(&flag, &empty, &Category::Boolean, &BinaryOperator::Eq),
+            RowKinds::NONE,
         );
+    }
+
+    /// Two untyped text literals resolve as the default `int4`.
+    #[test]
+    fn two_untyped_text_literals_resolve_as_int4() {
         assert_eq!(
-            arithmetic_type(ScalarType::UnknownLiteral, ScalarType::Integer(IntegerType::Bigint)),
-            ScalarType::Integer(IntegerType::Bigint)
+            read(ColumnContext::new(), "'1' + '2'").ty(),
+            ScalarType::Integer(IntegerType::Integer),
         );
-        assert_eq!(arithmetic_type(ScalarType::Float, ScalarType::Numeric), ScalarType::Float);
-        assert_eq!(arithmetic_type(ScalarType::Boolean, ScalarType::Boolean), ScalarType::Unknown);
+    }
+
+    /// A source with a type other than an untyped literal re-reads only the
+    /// target type.
+    #[test]
+    fn a_typed_source_rereads_only_the_target_type() {
+        let source = Evaluation::known(PgValue::Boolean(true), ScalarType::Boolean);
+        let reinterpreted = reinterpret_unknown(source, ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(reinterpreted.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert!(reinterpreted.values().is_empty());
+    }
+
+    /// `||` keeps the left-deep walk on a text spine.
+    #[test]
+    fn a_text_spine_walks_left_deep() {
+        let context = ColumnContext::new()
+            .with_column("x", text_unlisted())
+            .with_column("y", text_unlisted());
+        let evaluation = read(context, "x || y || 'a'");
+        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
+    }
+
+    /// `AND` and `OR` combine the terms' outcomes, reading each term once.
+    #[test]
+    fn and_or_combine_the_terms() {
+        let context = || ColumnContext::new().with_column("x", int4_unlisted());
+        let result = read(context(), "x IS NULL OR x IS NOT NULL");
+        assert!(result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(!result.may_be_null());
+        let result = read(context(), "x IS NULL AND x IS NOT NULL");
+        assert!(result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(!result.may_be_null());
+    }
+
+    /// A dialect's `= NULL` answer reads the form as `IS NULL`.
+    #[test]
+    fn a_null_equals_hook_reads_the_null_form() {
+        let context = || ColumnContext::new().with_column("x", int4_unlisted());
+        let result = read_hook(context(), "x = NULL");
+        assert!(result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(!result.may_be_null());
+        let result = read_hook(ColumnContext::new(), "NULL = NULL");
+        assert_eq!(result.constant(), Some(&PgValue::Boolean(true)));
     }
 
     #[test]
-    fn zero_admits_the_divisor_bounds() {
-        let admits = Interval {
-            low: Bound::Included(PgNumeric::from(-1)),
-            high: Bound::Included(PgNumeric::from(1)),
+    fn number_pairs_certainties_follow_the_bounds() {
+        // a closed interval below the other admits every pair
+        assert_eq!(
+            pair_analysis(&point(1), &point(2), &Category::Number, &BinaryOperator::Lt),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        // a closed interval above the other admits no pair
+        assert_eq!(
+            pair_analysis(&point(2), &point(1), &Category::Number, &BinaryOperator::Lt),
+            RowKinds { all_true: false, all_false: true, mixed: false },
+        );
+        // an excluded lower bound decides a strict row certainty, and the
+        // unbounded upper bound keeps the opposite one possible
+        let below = numbers(bound("e", 1, "_", 0));
+        assert_eq!(
+            pair_analysis(&below, &point(3), &Category::Number, &BinaryOperator::Lt),
+            RowKinds { all_true: true, all_false: true, mixed: false },
+        );
+        // a value below any right value admits every strict pair
+        assert_eq!(
+            pair_analysis(
+                &numbers(bound("_", 0, "i", 0)),
+                &point(3),
+                &Category::Number,
+                &BinaryOperator::Lt,
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        // an unbounded right range admits no strict certainty
+        assert_eq!(
+            pair_analysis(
+                &point(0),
+                &numbers(bound("_", 0, "_", 0)),
+                &Category::Number,
+                &BinaryOperator::Lt,
+            ),
+            RowKinds { all_true: false, all_false: false, mixed: true },
+        );
+        // every value is above an excluded upper bound
+        assert_eq!(
+            pair_analysis(
+                &point(5),
+                &numbers(number_interval(1, 3)),
+                &Category::Number,
+                &BinaryOperator::Gt
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        // an excluded upper bound decides a strict row certainty
+        let above = numbers(bound("e", 1, "e", 10));
+        assert_eq!(
+            pair_analysis(&above, &point(3), &Category::Number, &BinaryOperator::Gt),
+            RowKinds { all_true: true, all_false: true, mixed: false },
+        );
+    }
+
+    #[test]
+    fn unlisted_intervals_admit_pair_certainties() {
+        // disjoint unlisted intervals admit no equal pair, and a value
+        // below the right range is certainly unequal
+        assert_eq!(
+            pair_analysis(
+                &numbers(number_interval(0, 2)),
+                &numbers(number_interval(3, 5)),
+                &Category::Number,
+                &BinaryOperator::Eq,
+            ),
+            RowKinds { all_true: false, all_false: true, mixed: false },
+        );
+        // overlapping unlisted intervals: a value below the right range is
+        // certainly unequal
+        assert_eq!(
+            pair_analysis(
+                &numbers(number_interval(0, 2)),
+                &numbers(number_interval(1, 3)),
+                &Category::Number,
+                &BinaryOperator::NotEq,
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: true },
+        );
+        // an excluded right bound still admits a certain difference
+        assert_eq!(
+            pair_analysis(
+                &numbers(number_interval(0, 2)),
+                &numbers(bound("e", 1, "e", 3)),
+                &Category::Number,
+                &BinaryOperator::NotEq,
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: true },
+        );
+        // an unbounded right range admits no certain difference
+        assert_eq!(
+            pair_analysis(
+                &numbers(number_interval(0, 2)),
+                &numbers(bound("_", 0, "_", 0)),
+                &Category::Number,
+                &BinaryOperator::NotEq,
+            ),
+            RowKinds { all_true: false, all_false: false, mixed: true },
+        );
+        // a listed value outside an unlisted range is different from every
+        // member of it, so no pair is ever equal
+        assert_eq!(
+            pair_analysis(
+                &point(5),
+                &numbers(number_interval(0, 3)),
+                &Category::Number,
+                &BinaryOperator::NotEq,
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        // a single point of an unlisted range matches its value
+        assert_eq!(
+            pair_analysis(
+                &point(2),
+                &numbers(number_interval(2, 2)),
+                &Category::Number,
+                &BinaryOperator::Eq
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: true },
+        );
+        // a numeric value equal to an unlisted point
+        let numeric_point =
+            Evaluation::known(PgValue::Numeric(PgNumeric::from(2)), ScalarType::Numeric);
+        assert_eq!(
+            pair_analysis(
+                &numeric_point,
+                &numbers(number_interval(2, 2)),
+                &Category::Number,
+                &BinaryOperator::Eq
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: true },
+        );
+    }
+
+    #[test]
+    fn an_empty_value_set_meets_nothing_and_a_boolean_ordering_stays_open() {
+        // an empty value set meets no value
+        let empty =
+            Evaluation::new(ScalarType::Integer(IntegerType::Integer), false, true, Values::none());
+        assert_eq!(
+            pair_analysis(&empty, &point(1), &Category::Number, &BinaryOperator::Eq),
+            RowKinds::NONE,
+        );
+        // a boolean pair under an ordering admits nothing
+        let flag = Evaluation::new(
+            ScalarType::Boolean,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Boolean(true)])),
+        );
+        assert_eq!(
+            pair_analysis(&flag, &flag, &Category::Boolean, &BinaryOperator::Lt),
+            RowKinds { all_true: false, all_false: false, mixed: true },
+        );
+    }
+
+    #[test]
+    fn boolean_equality_pairs_decide_per_value() {
+        let known = |value: bool| Evaluation::known(PgValue::Boolean(value), ScalarType::Boolean);
+        assert_eq!(
+            pair_analysis(&known(true), &known(true), &Category::Boolean, &BinaryOperator::Eq),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        assert_eq!(
+            pair_analysis(&known(true), &known(false), &Category::Boolean, &BinaryOperator::Eq),
+            RowKinds { all_true: false, all_false: true, mixed: false },
+        );
+        let both = Evaluation::new(
+            ScalarType::Boolean,
+            true,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Boolean(false), PgValue::Boolean(true)])),
+        );
+        assert_eq!(
+            pair_analysis(&both, &known(true), &Category::Boolean, &BinaryOperator::Eq),
+            RowKinds { all_true: true, all_false: true, mixed: false },
+        );
+        assert_eq!(
+            pair_analysis(&both, &both, &Category::Boolean, &BinaryOperator::NotEq),
+            RowKinds { all_true: false, all_false: false, mixed: true },
+        );
+    }
+
+    fn number_value(token: &str) -> Expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(token.to_string(), false),
+            span: Span::empty(),
+        })
+    }
+
+    #[test]
+    fn an_unmodelled_binary_operator_stays_unknown() {
+        let expression = Expr::BinaryOp {
+            left: Box::new(number_value("1")),
+            op: BinaryOperator::Xor,
+            right: Box::new(number_value("2")),
         };
-        assert!(interval_contains_zero(&admits));
-        let clear = Interval { low: Bound::Excluded(PgNumeric::from(0)), high: Bound::Unbounded };
-        assert!(!interval_contains_zero(&clear));
-        let open = Interval {
-            low: Bound::Excluded(PgNumeric::from(0)),
-            high: Bound::Excluded(PgNumeric::from(0)),
+        let result = evaluate(
+            &expression,
+            &GenericDialect,
+            &(),
+            &mut ColumnContext::new(),
+            &Guarantees::new(),
+        )
+        .expect("resolves");
+        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+        assert!(result.may_be_null() && result.may_raise());
+    }
+
+    #[test]
+    fn not_flips_the_outcomes() {
+        let result = read(ColumnContext::new(), "NOT true");
+        assert!(result.may_be_false());
+        assert!(!result.may_be_true());
+        assert!(!result.may_be_null());
+        let result = read(ColumnContext::new(), "NOT NULL");
+        assert!(result.may_be_null());
+        assert!(!result.may_be_true());
+        assert!(!result.may_be_false());
+        let flag =
+            Evaluation::new(ScalarType::Boolean, true, false, Values::Unlisted(Unlisted::any()));
+        let result = read(ColumnContext::new().with_column("flag", flag), "NOT flag");
+        assert!(result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(result.may_be_null());
+        let impossible = Evaluation::impossible(ScalarType::Boolean);
+        let result = read(ColumnContext::new().with_column("flag", impossible), "NOT flag");
+        assert!(result.is_impossible());
+    }
+
+    #[test]
+    fn unary_plus_keeps_a_number_and_opens_other_types() {
+        // the conservative dialect does not fold the sign
+        let result = read(ColumnContext::new().with_column("x", int4_unlisted()), "+x");
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+        assert!(!result.may_raise());
+        // a dialect that keeps the sign preserves the inner values
+        let result = read_hook(ColumnContext::new().with_column("x", int4_unlisted()), "+x");
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+        assert!(!result.may_raise());
+        // + over a non-number keeps the type and opens the values
+        let s = Evaluation::new(
+            ScalarType::Text(TextRules::DEFAULT),
+            true,
+            false,
+            Values::Unlisted(Unlisted::any()),
+        );
+        let result = read(ColumnContext::new().with_column("s", s), "+s");
+        assert_eq!(result.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+    }
+
+    #[test]
+    fn an_unmodelled_unary_operator_stays_unknown() {
+        let expression = Expr::UnaryOp {
+            op: UnaryOperator::Hash,
+            expr: Box::new(Expr::Value(ValueWithSpan {
+                value: Value::Boolean(true),
+                span: Span::empty(),
+            })),
         };
-        assert!(!interval_contains_zero(&open));
-        let unbounded = Interval { low: Bound::Unbounded, high: Bound::Unbounded };
-        assert!(interval_contains_zero(&unbounded));
+        let result = evaluate(
+            &expression,
+            &GenericDialect,
+            &(),
+            &mut ColumnContext::new(),
+            &Guarantees::new(),
+        )
+        .expect("resolves");
+        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert!(result.may_be_null() && result.may_raise());
+    }
+
+    fn text_unlisted() -> Evaluation {
+        Evaluation::new(
+            ScalarType::Text(TextRules::DEFAULT),
+            true,
+            false,
+            Values::Unlisted(Unlisted::any()),
+        )
     }
 
     #[test]
-    fn the_unhandled_operators_leave_the_pair_analysis_open() {
-        let side = listed(ScalarType::Boolean, vec![PgValue::Boolean(true)]);
-        let rows = pair_analysis(&side, &side, &Category::Boolean, &BinaryOperator::Lt);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(!rows.all_true);
-        assert!(!rows.all_false);
-        assert_eq!(
-            arithmetic_type(ScalarType::Integer(IntegerType::Integer), ScalarType::UnknownLiteral),
-            ScalarType::Integer(IntegerType::Integer)
+    fn negation_folds_and_bounds() {
+        let result = read(ColumnContext::new(), "-5");
+        assert_eq!(result.constant(), Some(&PgValue::Integer(-5)));
+        // the minimum int4 has no negative
+        let min = Evaluation::new(
+            ScalarType::Integer(IntegerType::Integer),
+            true,
+            false,
+            Values::Listed(BTreeSet::from([
+                PgValue::Integer(i64::from(i32::MIN)),
+                PgValue::Integer(1),
+            ])),
         );
-    }
-
-    #[test]
-    fn number_pairs_walk_the_bound_shapes() {
-        // An empty listed side meets no value.
-        let empty = listed(ScalarType::Integer(IntegerType::Integer), Vec::new());
-        let one = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(1)]);
-        assert_eq!(
-            pair_analysis(&empty, &one, &Category::Number, &BinaryOperator::Eq),
-            RowKinds::NONE
-        );
-
-        // A listed row a range cannot reach is disjoint from it.
-        let below_zero = unlisted_numbers(Bound::Unbounded, Bound::Included(PgNumeric::from(0)));
-        let pair = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(1), int4(2)]);
-        let rows = number_pairs(pair.values(), below_zero.values(), &BinaryOperator::Eq);
-        assert!(rows.may_be_false());
-        assert!(!rows.may_be_true());
-        assert!(!rows.all_true);
-        assert!(rows.all_false);
-
-        // Ranges that admit no common value are disjoint through their
-        // intervals.
-        let left_range =
-            numeric_range(Bound::Included(PgNumeric::from(1)), Bound::Included(PgNumeric::from(5)));
-        let right_range = numeric_range(
-            Bound::Included(PgNumeric::from(6)),
-            Bound::Included(PgNumeric::from(10)),
-        );
-        let rows = number_pairs(left_range.values(), right_range.values(), &BinaryOperator::Eq);
-        assert!(rows.may_be_false());
-        assert!(!rows.may_be_true());
-
-        // An unbounded side admits a value on either end of every row.
-        let any_number = unlisted_numbers(Bound::Unbounded, Bound::Unbounded);
-        let rows = number_pairs(one.values(), any_number.values(), &BinaryOperator::Lt);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(!rows.all_true);
-        assert!(!rows.all_false);
-        let rows = number_pairs(any_number.values(), one.values(), &BinaryOperator::Lt);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(rows.all_true);
-        assert!(rows.all_false);
-
-        // An excluded bound decides one step past its value.
-        let above_five = unlisted_numbers(Bound::Excluded(PgNumeric::from(5)), Bound::Unbounded);
-        let rows = number_pairs(one.values(), above_five.values(), &BinaryOperator::Lt);
-        assert!(!rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(rows.all_true);
-        assert!(!rows.all_false);
-        let rows = number_pairs(pair.values(), below_zero.values(), &BinaryOperator::NotEq);
-        assert!(!rows.may_be_false());
-        assert!(rows.may_be_true());
-        let rows = number_pairs(above_five.values(), one.values(), &BinaryOperator::LtEq);
-        assert!(rows.may_be_false());
-        assert!(!rows.may_be_true());
-
-        // A numeric range keeps its unbounded ends past the type's clamping.
-        let numeric_any = Evaluation::new(
+        let result = read(ColumnContext::new().with_column("x", min), "-x");
+        assert!(result.may_raise());
+        assert_eq!(result.constant_value(), Some(&PgValue::Integer(-1)));
+        // an unlisted int4 may hold the minimum, so negation may raise and
+        // the interval is mirrored
+        let result = read(ColumnContext::new().with_column("x", int4_unlisted()), "-x");
+        assert!(result.may_raise());
+        let Values::Unlisted(unlisted) = result.values() else { panic!("stays unlisted") };
+        // the mirrored interval is clamped to the int4 range, which the
+        // result type admits
+        assert_eq!(unlisted.numbers.low, Bound::Included(PgNumeric::from(-i64::from(i32::MAX))));
+        assert_eq!(unlisted.numbers.high, Bound::Included(PgNumeric::from(i64::from(i32::MAX))));
+        // a listed numeric negates value by value
+        let listed = Evaluation::new(
             ScalarType::Numeric,
             false,
             false,
-            Values::Unlisted(Unlisted {
-                excluded: BTreeSet::new(),
-                numbers: Interval { low: Bound::Unbounded, high: Bound::Unbounded },
-                length: Interval::unbounded(),
-            }),
+            Values::Listed(BTreeSet::from([PgValue::Numeric(
+                PgNumeric::parse("1.5").expect("valid"),
+            )])),
         );
-        let rows = number_pairs(numeric_any.values(), one.values(), &BinaryOperator::Lt);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(rows.all_true);
-        assert!(rows.all_false);
-        let rows = number_pairs(one.values(), numeric_any.values(), &BinaryOperator::Gt);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(!rows.all_true);
-        assert!(!rows.all_false);
-
-        // The greater-than readings run the bounds the other way.
-        let rows = number_pairs(above_five.values(), one.values(), &BinaryOperator::Gt);
-        assert!(!rows.may_be_false());
-        assert!(rows.may_be_true());
-        assert!(rows.all_true);
-        assert!(!rows.all_false);
-        let rows = number_pairs(above_five.values(), one.values(), &BinaryOperator::GtEq);
-        assert!(!rows.may_be_false());
-        assert!(rows.may_be_true());
-        let up_to_five = unlisted_numbers(Bound::Unbounded, Bound::Excluded(PgNumeric::from(5)));
-        let rows = number_pairs(up_to_five.values(), one.values(), &BinaryOperator::Gt);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-        let rows = number_pairs(above_five.values(), one.values(), &BinaryOperator::Minus);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-    }
-
-    #[test]
-    fn single_number_reads_one_value_from_either_shape() {
-        let one = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(7)]);
-        assert_eq!(single_number(one.values()), Some(PgNumeric::from(7)));
-        let pair = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(7), int4(8)]);
-        assert_eq!(single_number(pair.values()), None);
-        let point = unlisted_numbers(
-            Bound::Included(PgNumeric::from(7)),
-            Bound::Included(PgNumeric::from(7)),
-        );
-        assert_eq!(single_number(point.values()), Some(PgNumeric::from(7)));
-        let range = unlisted_numbers(
-            Bound::Included(PgNumeric::from(1)),
-            Bound::Included(PgNumeric::from(9)),
-        );
-        assert_eq!(single_number(range.values()), None);
-
-        assert!(!number_eq_match(one.values(), pair.values()));
-        assert!(number_eq_match(one.values(), point.values()));
-        assert!(number_eq_match(pair.values(), one.values()));
-        let left_range = unlisted_numbers(
-            Bound::Included(PgNumeric::from(1)),
-            Bound::Included(PgNumeric::from(5)),
-        );
-        assert!(number_eq_absent(pair.values(), left_range.values()));
-        assert!(!number_eq_absent(pair.values(), pair.values()));
-        let open = unlisted_numbers(Bound::Unbounded, Bound::Unbounded);
-        assert!(number_eq_absent(open.values(), pair.values()));
-        assert!(!number_eq_absent(point.values(), pair.values()));
-        let above_five = unlisted_numbers(Bound::Excluded(PgNumeric::from(5)), Bound::Unbounded);
-        assert!(number_eq_absent(above_five.values(), left_range.values()));
-    }
-
-    #[test]
-    fn listed_rows_disjoint_by_value() {
-        let pair = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(1), int4(2)]);
-        let one = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(1)]);
-        let rows = number_pairs(pair.values(), one.values(), &BinaryOperator::Eq);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-        let up_to_five = unlisted_numbers(Bound::Unbounded, Bound::Excluded(PgNumeric::from(5)));
-        let rows = number_pairs(one.values(), up_to_five.values(), &BinaryOperator::Gt);
-        assert!(rows.may_be_false());
-        assert!(rows.may_be_true());
-    }
-
-    #[test]
-    fn number_eq_absent_walks_the_unlisted_bounds() {
-        let below = numeric_range(Bound::Unbounded, Bound::Excluded(PgNumeric::from(3)));
-        let above = numeric_range(Bound::Excluded(PgNumeric::from(7)), Bound::Unbounded);
-        assert!(number_eq_absent(below.values(), above.values()));
-        let up_to_three = numeric_range(Bound::Unbounded, Bound::Included(PgNumeric::from(3)));
-        assert!(number_eq_absent(above.values(), up_to_three.values()));
-        let between =
-            numeric_range(Bound::Included(PgNumeric::from(1)), Bound::Excluded(PgNumeric::from(5)));
-        assert!(number_eq_absent(below.values(), between.values()));
-    }
-
-    #[test]
-    fn a_single_unlisted_value_is_not_absent() {
-        let pair = listed(ScalarType::Integer(IntegerType::Integer), vec![int4(7), int4(8)]);
-        let single_point =
-            numeric_range(Bound::Included(PgNumeric::from(7)), Bound::Included(PgNumeric::from(7)));
-        assert!(!number_eq_absent(single_point.values(), pair.values()));
-    }
-
-    #[test]
-    fn an_empty_numeric_range_admits_nothing() {
-        let empty_numbers =
-            numeric_range(Bound::Included(PgNumeric::from(3)), Bound::Excluded(PgNumeric::from(3)));
-        assert!(empty_numbers.is_impossible());
-    }
-
-    #[test]
-    fn boolean_pairs_of_an_empty_side_meet_no_value() {
-        let empty = listed(ScalarType::Boolean, Vec::new());
-        let side = listed(ScalarType::Boolean, vec![PgValue::Boolean(true)]);
+        let result = read(ColumnContext::new().with_column("n", listed), "-n");
+        assert!(!result.may_raise());
         assert_eq!(
-            pair_analysis(&empty, &side, &Category::Boolean, &BinaryOperator::Eq),
-            RowKinds::NONE
+            result.constant_value(),
+            Some(&PgValue::Numeric(PgNumeric::parse("-1.5").expect("valid"))),
+        );
+        // a numeric range away from zero negates cleanly with mirrored
+        // excluded bounds
+        let guarantees = guarantees_for("n", ScalarType::Numeric, bound("e", 0, "e", 5));
+        let result = read_guarantees(
+            ColumnContext::new().with_column("n", numeric_unlisted()),
+            &guarantees,
+            "-n",
+        );
+        assert!(!result.may_raise());
+        let Values::Unlisted(unlisted) = result.values() else { panic!("stays unlisted") };
+        assert_eq!(unlisted.numbers.low, Bound::Excluded(PgNumeric::from(-5)));
+        assert_eq!(unlisted.numbers.high, Bound::Excluded(PgNumeric::from(0_i64)));
+        // a wide integer range away from the minimum negates cleanly
+        let guarantees =
+            guarantees_for("x", ScalarType::Integer(IntegerType::Integer), number_interval(1, 100));
+        let result = read_guarantees(
+            ColumnContext::new().with_column("x", int4_unlisted()),
+            &guarantees,
+            "-x",
+        );
+        assert!(!result.may_raise());
+        let Values::Unlisted(unlisted) = result.values() else { panic!("stays unlisted") };
+        assert_eq!(unlisted.numbers.low, Bound::Included(PgNumeric::from(-100)));
+        assert_eq!(unlisted.numbers.high, Bound::Included(PgNumeric::from(-1)));
+        // a non-number negates to an unknown type
+        let result = read(ColumnContext::new().with_column("s", text_unlisted()), "-s");
+        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+    }
+
+    #[test]
+    fn a_divisor_may_be_zero_only_when_its_interval_admits_it() {
+        let result = read(ColumnContext::new().with_column("x", int4_unlisted()), "1 / x");
+        assert!(result.may_raise());
+        assert!(result.may_be_null());
+        let result = read(ColumnContext::new().with_column("n", numeric_unlisted()), "1 / n");
+        assert!(result.may_raise());
+        // a divisor proven non-zero keeps the conservative raise but
+        // narrows the `NULL` reading
+        let guarantees = guarantees_for("n", ScalarType::Numeric, bound("e", 0, "_", 0));
+        let result = read_guarantees(
+            ColumnContext::new().with_column("n", numeric_unlisted()),
+            &guarantees,
+            "1 / n",
+        );
+        assert!(result.may_raise());
+        assert!(!result.may_be_null());
+    }
+
+    #[test]
+    fn interval_contains_zero_checks_its_bounds() {
+        assert!(interval_contains_zero(&bound("_", 0, "_", 0)));
+        assert!(interval_contains_zero(&number_interval(-1, 1)));
+        assert!(!interval_contains_zero(&bound("e", 0, "_", 0)));
+        assert!(!interval_contains_zero(&bound("_", 0, "e", 0)));
+        assert!(!interval_contains_zero(&number_interval(1, 2)));
+    }
+
+    #[test]
+    fn between_keeps_its_bounds_inclusive() {
+        let context = || ColumnContext::new().with_column("x", int4_unlisted());
+        let result = read(context(), "x BETWEEN 1 AND 3");
+        assert!(result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(result.may_be_null());
+        let result = read(ColumnContext::new(), "2 BETWEEN 1 AND 3");
+        assert!(result.may_be_true());
+        assert!(!result.may_be_false());
+        assert!(!result.may_be_null());
+        let result = read(ColumnContext::new(), "1 BETWEEN 1 AND 3");
+        assert!(result.may_be_true());
+        assert!(!result.may_be_false());
+        let result = read(ColumnContext::new(), "4 BETWEEN 1 AND 3");
+        assert!(result.may_be_false());
+        assert!(!result.may_be_true());
+        let result = read(ColumnContext::new(), "0 NOT BETWEEN 0 AND 0");
+        assert!(result.may_be_false());
+        assert!(!result.may_be_true());
+        let result = read(ColumnContext::new(), "NULL BETWEEN 1 AND 3");
+        assert!(result.may_be_null());
+        assert!(!result.may_be_true());
+        assert!(!result.may_be_false());
+    }
+
+    #[test]
+    fn concatenation_keeps_its_sides_open() {
+        let result = read(ColumnContext::new(), "'a' || 'b'");
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+        assert!(!result.may_raise());
+        let result = read(ColumnContext::new().with_column("s", text_unlisted()), "s || 'x'");
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+        assert!(!result.may_raise());
+        assert!(result.may_be_null());
+        // two non-text operands have no type to resolve, so the value
+        // stays open and the error stays possible
+        let result = read(ColumnContext::new(), "1 || 2");
+        assert!(result.may_raise());
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+        // a dialect that folds the concatenation answers before the values
+        let result = read_hook(ColumnContext::new(), "'a' || 'b'");
+        assert_eq!(result.constant(), Some(&PgValue::Text("folded".to_string())));
+        let impossible = Evaluation::impossible(ScalarType::Text(TextRules::DEFAULT));
+        let result = read(ColumnContext::new().with_column("s", impossible), "'a' || s");
+        assert!(result.is_impossible());
+    }
+
+    #[test]
+    fn arithmetic_type_widens_and_resolves() {
+        let int2 = ScalarType::Integer(IntegerType::Smallint);
+        let int4 = ScalarType::Integer(IntegerType::Integer);
+        let int8 = ScalarType::Integer(IntegerType::Bigint);
+        assert_eq!(arithmetic_type(int2, int4), int4);
+        assert_eq!(arithmetic_type(int4, int8), int8);
+        assert_eq!(arithmetic_type(int4, ScalarType::Numeric), ScalarType::Numeric);
+        assert_eq!(arithmetic_type(ScalarType::Float, int4), ScalarType::Float);
+        assert_eq!(arithmetic_type(int4, ScalarType::UnknownLiteral), int4);
+        assert_eq!(
+            arithmetic_type(ScalarType::UnknownLiteral, ScalarType::Numeric),
+            ScalarType::Numeric,
         );
         assert_eq!(
-            pair_analysis(&side, &empty, &Category::Boolean, &BinaryOperator::Eq),
-            RowKinds::NONE
+            arithmetic_type(ScalarType::Text(TextRules::DEFAULT), int4),
+            ScalarType::Unknown,
         );
+        let result = read(ColumnContext::new().with_column("s", text_unlisted()), "s + 1");
+        // PostgreSQL has no `+` for a text and an integer, so the pair
+        // raises.
+        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert!(result.may_raise());
+        let result = read(
+            ColumnContext::new().with_column(
+                "f",
+                Evaluation::new(ScalarType::Float, true, false, Values::Unlisted(Unlisted::any())),
+            ),
+            "f + 1",
+        );
+        assert_eq!(result.ty(), ScalarType::Float);
+        assert!(matches!(result.values(), Values::Unlisted(_)));
+    }
+
+    #[test]
+    fn an_unmodelled_number_operator_admits_no_certainty() {
+        assert_eq!(
+            pair_analysis(&point(1), &point(1), &Category::Number, &BinaryOperator::Spaceship),
+            RowKinds { all_true: false, all_false: false, mixed: true },
+        );
+    }
+
+    #[test]
+    fn an_unlisted_range_against_a_listed_value_is_certainly_different() {
+        // some member of the range is outside the listed value
+        assert_eq!(
+            pair_analysis(
+                &numbers(number_interval(0, 3)),
+                &point(2),
+                &Category::Number,
+                &BinaryOperator::NotEq
+            ),
+            RowKinds { all_true: true, all_false: true, mixed: false },
+        );
+        // a single-valued range disjoint from the value differs on every
+        // pair, and admits the row certainty through its point
+        assert_eq!(
+            pair_analysis(
+                &numbers(number_interval(2, 2)),
+                &point(3),
+                &Category::Number,
+                &BinaryOperator::NotEq
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        // a single-valued range holding the value is certainly equal
+        assert_eq!(
+            pair_analysis(
+                &numbers(number_interval(2, 2)),
+                &point(2),
+                &Category::Number,
+                &BinaryOperator::NotEq
+            ),
+            RowKinds { all_true: false, all_false: true, mixed: true },
+        );
+    }
+
+    #[test]
+    fn an_impossible_side_nulls_the_arithmetic_and_the_negation() {
+        let impossible = Evaluation::impossible(ScalarType::Integer(IntegerType::Integer));
+        let context = || ColumnContext::new().with_column("x", impossible.clone());
+        let result = read(context(), "1 + x");
+        assert!(result.is_impossible());
+        let result = read(context(), "-x");
+        assert!(result.is_impossible());
+    }
+
+    #[test]
+    fn negation_of_an_unbounded_numeric_stays_unbounded() {
+        let result = read(ColumnContext::new().with_column("n", numeric_unlisted()), "-n");
+        assert!(!result.may_raise());
+        let Values::Unlisted(unlisted) = result.values() else { panic!("stays unlisted") };
+        assert_eq!(unlisted.numbers.low, Bound::Unbounded);
+        assert_eq!(unlisted.numbers.high, Bound::Unbounded);
+        // an excluded integer bound stays excluded when mirrored
+        let guarantees =
+            guarantees_for("x", ScalarType::Integer(IntegerType::Integer), bound("e", 0, "i", 100));
+        let result = read_guarantees(
+            ColumnContext::new().with_column("x", int4_unlisted()),
+            &guarantees,
+            "-x",
+        );
+        assert!(!result.may_raise());
+        let Values::Unlisted(unlisted) = result.values() else { panic!("stays unlisted") };
+        assert_eq!(unlisted.numbers.low, Bound::Included(PgNumeric::from(-100)));
+        assert_eq!(unlisted.numbers.high, Bound::Excluded(PgNumeric::from(0_i64)));
+    }
+
+    /// An unknown literal whose reading a setting decides stays open.
+    #[test]
+    fn an_unknown_literal_a_setting_decides_stays_open() {
+        let literal =
+            Evaluation::known(PgValue::Text("13/01/2026".to_string()), ScalarType::UnknownLiteral);
+        let resolved = super::reinterpret_unknown(literal, ScalarType::Date);
+        assert!(matches!(resolved.values(), Values::Unlisted(_)));
+        assert!(resolved.may_raise());
+    }
+
+    /// A minus over a number literal folds into the constant before it is
+    /// typed, as PostgreSQL's `make_const` types `-2147483648` as `integer`.
+    #[test]
+    fn a_negated_number_literal_is_typed_with_its_sign() {
+        let int4 = ScalarType::Integer(IntegerType::Integer);
+        let int8 = ScalarType::Integer(IntegerType::Bigint);
+        let minimum = read(ColumnContext::new(), "-2147483648");
+        assert_eq!(minimum.ty(), int4);
+        assert_eq!(minimum.constant(), Some(&PgValue::Integer(-2_147_483_648)));
+        assert_eq!(read(ColumnContext::new(), "-2147483648 + 1").ty(), int4);
+        // A double minus lifts the constant back past `integer`.
+        let lifted = read(ColumnContext::new(), "- -2147483648");
+        assert_eq!(lifted.ty(), int8);
+        assert!(!lifted.may_raise());
+        assert_eq!(read(ColumnContext::new(), "-(1.5)").ty(), ScalarType::Numeric);
+    }
+
+    /// One untyped literal the target cannot read raises on its own rows,
+    /// while the others keep the values they fold to.
+    #[test]
+    fn a_raising_literal_keeps_the_values_the_others_fold_to() {
+        let literals = Evaluation::new(
+            ScalarType::UnknownLiteral,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([
+                PgValue::Text("5".to_string()),
+                PgValue::Text("oops".to_string()),
+            ])),
+        );
+        let resolved =
+            super::reinterpret_unknown(literals, ScalarType::Integer(IntegerType::Integer));
+        assert!(resolved.may_raise());
+        assert_eq!(resolved.values(), &Values::Listed(BTreeSet::from([PgValue::Integer(5)])));
+    }
+
+    /// A negation past `i64` keeps the value the wider type holds.
+    #[test]
+    fn a_negation_past_i64_keeps_the_wider_value() {
+        let evaluation =
+            read(ColumnContext::new(), "-(CASE WHEN true THEN -9223372036854775808 ELSE 1.5 END)");
+        assert!(
+            evaluation.may_be(&PgValue::Numeric(
+                PgNumeric::parse("9223372036854775808").expect("a number")
+            ))
+        );
+    }
+
+    /// An untyped literal may raise against a type its text does not read as,
+    /// and an always-`NULL` side keeps the refusal of its type.
+    #[test]
+    fn an_untyped_or_null_side_keeps_the_refusal() {
+        let float =
+            Evaluation::new(ScalarType::Float, true, false, Values::Unlisted(Unlisted::any()));
+        let read = |sql: &str| read(ColumnContext::new().with_column("f", float.clone()), sql);
+        assert!(read("'' BETWEEN 1 AND 10").may_raise());
+        assert!(read("'' = ANY (ARRAY[-1])").may_raise());
+        assert!(!read("'1' = 1").may_raise());
+        assert!(read("1 = ''").may_raise());
+        assert!(read("'1' = f").may_raise());
+        assert!(read("NULL::text = -1").may_raise());
+        assert!(!read("NULL = -1").may_raise());
+    }
+
+    /// Operands whose operator an engine may not resolve read the raise.
+    #[test]
+    fn an_unresolved_operator_may_raise() {
+        let read = |sql: &str| read(ColumnContext::new(), sql);
+        assert!(read("-(NULL)").may_raise());
+        let float =
+            Evaluation::new(ScalarType::Float, true, false, Values::Unlisted(Unlisted::any()));
+        let negated = super::super::evaluate(
+            &parse("-f"),
+            &sqlparser::dialect::GenericDialect,
+            &(),
+            &mut ColumnContext::new().with_column("f", float),
+            &Guarantees::new(),
+        )
+        .expect("the context resolves");
+        assert_eq!(negated.ty(), ScalarType::Float);
+        assert!(read("1 || NULL::int").may_raise());
+        assert!(!read("NULL || 'a'").may_raise());
+    }
+
+    /// An untyped literal reads as the `boolean` its input gives, and another
+    /// type as any `boolean` an engine may coerce it to.
+    #[test]
+    fn a_condition_reads_its_operand_as_boolean() {
+        let read = |sql: &str| read(ColumnContext::new(), sql);
+        assert!(read("'1' AND '1'").may_be_true());
+        assert!(read("'1' AND NULL").may_be_null());
+        assert!(read("NOT 't'").may_be_false());
+        assert!(!read("'t' OR false").may_raise());
+        assert!(read("'a' AND true").may_raise());
+        let integer = read("1 AND true");
+        assert!(integer.may_raise() && integer.may_be_true());
+    }
+
+    /// An operand an engine refuses under a boolean, a sign or a comparison
+    /// reads the raise.
+    #[test]
+    fn a_refused_operand_type_reads_the_raise() {
+        let column =
+            |ty: ScalarType| Evaluation::new(ty, true, false, Values::Unlisted(Unlisted::any()));
+        let context = || {
+            ColumnContext::new()
+                .with_column("t", column(ScalarType::Text(crate::scalar::TextRules::DEFAULT)))
+                .with_column("d", column(ScalarType::Date))
+        };
+        for sql in
+            ["1 AND true", "'a' AND true", "NOT 1", "+t", "-t", "-'abc'", "d IN (1)", "1 = true"]
+        {
+            assert!(read(context(), sql).may_raise(), "{sql}");
+        }
     }
 }
