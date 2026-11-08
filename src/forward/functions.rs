@@ -654,15 +654,19 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             let error = cmp.error || qe.error;
             let rows_present = qe.rows.one || qe.rows.many;
             let empty = if qe.rows.none {
-                if rows_present { RowsEmpty::Sometimes } else { RowsEmpty::Always }
+                if rows_present { Presence::Sometimes } else { Presence::Always }
             } else {
-                RowsEmpty::Never
+                Presence::Never
             };
-            let members = Members {
-                nonempty: !column.values().is_empty(),
-                null: column.may_be_null(),
-                empty,
+            // A row set may leave out the `NULL` rows a column may hold.
+            let null = if column.is_always_null() {
+                Presence::Always
+            } else if column.may_be_null() {
+                Presence::Sometimes
+            } else {
+                Presence::Never
             };
+            let members = Members { nonempty: !column.values().is_empty(), null, empty };
             (cmp, members, error)
         }
         other => {
@@ -711,8 +715,9 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             let set = Evaluation::new(ty, null, false, Values::Listed(values.clone()));
             let cmp = comparison_evals(state, value, op, set);
             let error = cmp.error || error;
-            let empty =
-                if values.is_empty() && !null { RowsEmpty::Always } else { RowsEmpty::Never };
+            let empty = if values.is_empty() && !null { Presence::Always } else { Presence::Never };
+            // An element that is always `NULL` is in every member set.
+            let null = if null { Presence::Always } else { Presence::Never };
             let members = Members { nonempty: !values.is_empty(), null, empty };
             (cmp, members, error)
         }
@@ -734,7 +739,7 @@ fn quantified_outcomes(
     is_any: bool,
 ) -> Outcomes {
     // With no member at all, `ANY` is `FALSE` and `ALL` is `TRUE`.
-    if matches!(members.empty, RowsEmpty::Always) {
+    if matches!(members.empty, Presence::Always) {
         let outcomes = if is_any {
             Outcomes { truth: false, falsity: true, null: false }
         } else {
@@ -742,17 +747,18 @@ fn quantified_outcomes(
         };
         return outcomes;
     }
-    // A `NULL` member nulls its row's comparisons, so it kills both a
-    // certain `true` and a certain `false`. An empty result reads `FALSE`
-    // to `ANY` and `TRUE` to `ALL`, whatever the left side is.
-    let sometimes_empty = matches!(members.empty, RowsEmpty::Sometimes);
+    // A `NULL` member nulls its row's comparisons, so one in every member
+    // set kills both a certain `true` and a certain `false`. An empty result
+    // reads `FALSE` to `ANY` and `TRUE` to `ALL`, whatever the left side is.
+    let sometimes_empty = matches!(members.empty, Presence::Sometimes);
     let pair = value_has_values && members.nonempty;
+    let null_free = !matches!(members.null, Presence::Always);
     let (truth, falsity) = if is_any {
         // `ANY` over an empty set is `FALSE`, so a possibly-empty operand
         // is false on its empty rows.
-        (pair && rows.may_be_true(), sometimes_empty || pair && !members.null && rows.all_false)
+        (pair && rows.may_be_true(), sometimes_empty || pair && null_free && rows.all_false)
     } else {
-        (sometimes_empty || pair && !members.null && rows.all_true, pair && rows.may_be_false())
+        (sometimes_empty || pair && null_free && rows.all_true, pair && rows.may_be_false())
     };
     // `ANY` is `NULL` when some value compares false against every value
     // and a member is `NULL`; `ALL` is `NULL` when some value compares
@@ -763,8 +769,9 @@ fn quantified_outcomes(
     } else {
         rows.all_true || !members.nonempty
     };
-    let null = (value_null && (members.nonempty || members.null))
-        || (members.null && value_has_values && nulls);
+    let null_member = !matches!(members.null, Presence::Never);
+    let null = (value_null && (members.nonempty || null_member))
+        || (null_member && value_has_values && nulls);
     Outcomes { truth, falsity, null }
 }
 
@@ -772,19 +779,20 @@ fn quantified_outcomes(
 struct Members {
     /// A non-`NULL` member is possible.
     nonempty: bool,
-    /// A `NULL` member is possible.
-    null: bool,
-    /// Whether the members may be absent.
-    empty: RowsEmpty,
+    /// Whether a `NULL` member is among the members.
+    null: Presence,
+    /// Whether the members are absent.
+    empty: Presence,
 }
 
-/// Whether the rows an `ANY`/`ALL` operand may hold are absent.
-enum RowsEmpty {
-    /// Rows are present on every row.
+/// How often a fact about an `ANY`/`ALL` operand's members holds across the
+/// rows the condition is read on.
+enum Presence {
+    /// It holds on no row.
     Never,
-    /// Rows may be absent and may be present.
+    /// It may hold on a row and may not.
     Sometimes,
-    /// Rows are absent on every row.
+    /// It holds on every row.
     Always,
 }
 
@@ -1595,6 +1603,32 @@ mod tests {
             || ColumnContext::new().with_column("id", id.clone()).with_query(rows, column.clone());
         assert!(read(context(), "id = ANY(SELECT id FROM t)").may_be_false());
         assert!(read(context(), "id = ALL(SELECT id FROM t)").may_be_true());
+    }
+
+    /// A subquery column that may be `NULL` need not hold a `NULL` row, so an
+    /// `ANY` may still fail every row and an `ALL` may still satisfy every row.
+    #[test]
+    fn a_nullable_subquery_column_need_not_hold_a_null_row() {
+        let id = Evaluation::known(PgValue::Integer(3), int4());
+        let column = Evaluation::new(
+            int4(),
+            true,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),
+        );
+        let rows = Rows { none: false, one: true, many: true };
+        let context =
+            || ColumnContext::new().with_column("id", id.clone()).with_query(rows, column.clone());
+        assert!(read(context(), "id = ANY(SELECT id FROM t)").may_be_false());
+        assert!(read(context(), "id <> ALL(SELECT id FROM t)").may_be_true());
+        // A column holding only `NULL` reads `NULL` on every row set.
+        let nulls = Evaluation::null(int4());
+        let context = ColumnContext::new().with_column("id", id.clone()).with_query(rows, nulls);
+        assert!(read(context, "id = ANY(SELECT id FROM t)").is_always_null());
+        // An array's `NULL` element is in every member set.
+        let context = || ColumnContext::new().with_column("id", id.clone());
+        assert!(!read(context(), "id = ANY(ARRAY[1, NULL])").may_be_false());
+        assert!(!read(context(), "id <> ALL(ARRAY[1, NULL])").may_be_true());
     }
 
     /// `ANY` of an impossible value is impossible.
