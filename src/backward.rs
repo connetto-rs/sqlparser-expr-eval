@@ -113,27 +113,11 @@ fn node<D: EvalDialect, C: Context>(
     // depth.
     state.depth += 1;
     if !single_outcome(outcomes) {
-        let base = state.guarantees.clone();
-        let mut joined: Option<Guarantees<C::Reference>> = None;
+        let mut branches = Vec::with_capacity(3);
         for single in singles(outcomes).into_iter().flatten() {
-            let mut branch = base.clone();
-            let mut branch_state = State {
-                dialect: state.dialect,
-                options: state.options,
-                context: state.context,
-                guarantees: &mut branch,
-                budget: state.budget,
-                depth: state.depth,
-            };
-            node(&mut branch_state, expression, single)?;
-            if !branch.is_impossible() {
-                joined = Some(match joined {
-                    Some(joined) => joined.join(&branch),
-                    None => branch,
-                });
-            }
+            branches.push(branch(state, |s| node(s, expression, single))?);
         }
-        *state.guarantees = joined.unwrap_or_else(Guarantees::impossible);
+        merge(state, branches);
         state.depth -= 1;
         return Ok(());
     }
@@ -330,60 +314,15 @@ fn shape<D: EvalDialect, C: Context>(
             and_or(state, &support::and_or_terms(left, right, false), false, outcomes)
         }
         Expr::BinaryOp { left, op, right } => {
-            match op {
-                BinaryOperator::Eq => {
-                    if let Some(operand) =
-                        state.dialect.null_equals_operand(left, right, state.options)
-                    {
-                        return is_null_input(state, operand, outcomes);
-                    }
-                    comparison(state, left, right, CmpOp::Eq, Family::Single, outcomes)
-                }
-                BinaryOperator::Lt => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Less { strict: true },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::LtEq => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Less { strict: false },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::Gt => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Greater { strict: true },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::GtEq => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Greater { strict: false },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::NotEq => {
-                    comparison(state, left, right, CmpOp::NotEq, Family::Single, outcomes)
-                }
-                _ => Ok(()),
+            if *op == BinaryOperator::Eq
+                && let Some(operand) = state.dialect.null_equals_operand(left, right, state.options)
+            {
+                return is_null_input(state, operand, outcomes);
             }
+            let Some(op) = CmpOp::of(op) else {
+                return Ok(());
+            };
+            comparison(state, left, right, op, Family::Single, outcomes)
         }
         Expr::AnyOp { left, compare_op, right, .. } => {
             any_all(state, left, right, compare_op, Family::Any, outcomes)
@@ -682,19 +621,7 @@ fn in_list<D: EvalDialect, C: Context>(
         Values::Listed(constants)
     };
     let other = Evaluation::new(ScalarType::Unknown, any_null, false, values);
-    if outcomes.null {
-        let mut branches = Vec::new();
-        branches.push(side_null_branch(state, value)?);
-        if any_null {
-            branches.push(apart_branch(state, value, &other)?);
-        }
-        merge(state, branches);
-        return Ok(());
-    }
-    restrict_non_null(state, value)?;
-    let evaluation = forward_of(state, value)?;
-    let restriction = restriction(Family::Any, CmpOp::Eq, outcomes.truth, &other, &evaluation);
-    apply(state, value, &evaluation, &restriction)
+    comparison_with(state, value, &other, CmpOp::Eq, Family::Any, outcomes)
 }
 
 /// The inputs of `value IN (SELECT ...)` taking one outcome.
@@ -827,34 +754,19 @@ fn listed_union<D: EvalDialect, C: Context>(
     Ok((Values::Listed(union), null))
 }
 
-/// A branch in which `value` is non-`NULL` and apart from `other`'s values.
-fn apart_branch<D: EvalDialect, C: Context>(
+/// A branch in which `value` is non-`NULL` and restricted by `restrict` to
+/// `other`'s listed values, apart from them or among them.
+fn member_branch<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     value: &Expr,
     other: &Evaluation,
+    restrict: fn(BTreeSet<PgValue>) -> Restriction,
 ) -> Result<Guarantees<C::Reference>, C::Error> {
     branch(state, |s| {
         restrict_non_null(s, value)?;
         let evaluation = forward_of(s, value)?;
         let restriction = match other.values() {
-            Values::Listed(listed) if !listed.is_empty() => Restriction::Exclude(listed.clone()),
-            _ => Restriction::Skip,
-        };
-        apply(s, value, &evaluation, &restriction)
-    })
-}
-
-/// A branch in which `value` is non-`NULL` and among `other`'s values.
-fn keep_branch<D: EvalDialect, C: Context>(
-    state: &mut State<'_, D, C>,
-    value: &Expr,
-    other: &Evaluation,
-) -> Result<Guarantees<C::Reference>, C::Error> {
-    branch(state, |s| {
-        restrict_non_null(s, value)?;
-        let evaluation = forward_of(s, value)?;
-        let restriction = match other.values() {
-            Values::Listed(listed) if !listed.is_empty() => Restriction::Keep(listed.clone()),
+            Values::Listed(listed) if !listed.is_empty() => restrict(listed.clone()),
             _ => Restriction::Skip,
         };
         apply(s, value, &evaluation, &restriction)
@@ -885,31 +797,17 @@ fn call_input<D: EvalDialect, C: Context>(
     // every callee the call may reach is strict.
     let all_strict = !callees.is_empty()
         && callees.iter().all(|callee| matches!(callee.null_input, NullInput::Strict));
-    let mut positions: Vec<usize> = Vec::new();
+    // The arguments some reachable callee answers `NULL` for, each once.
+    let mut positions = BTreeSet::new();
     for callee in &callees {
-        match &callee.null_input {
-            NullInput::Strict if all_strict => {
-                for (index, argument) in arguments.iter().enumerate() {
-                    if argument.is_some() {
-                        positions.push(index);
-                    }
-                }
-            }
-            NullInput::CalledOnNull(list) => {
-                positions.extend(list.iter().copied());
-            }
-            NullInput::Strict => {}
+        if callee.null_input == NullInput::Strict && !all_strict {
+            continue;
         }
+        positions.extend((0..arguments.len()).filter(|&index| callee.null_input.nulls_at(index)));
     }
+    let nulling = positions.into_iter().filter_map(|position| arguments[position].as_ref());
     if outcomes.truth || outcomes.falsity {
-        let mut seen = BTreeSet::new();
-        for position in positions {
-            if !seen.insert(position) {
-                continue;
-            }
-            let Some(argument) = arguments.get(position).and_then(Option::as_ref) else {
-                continue;
-            };
+        for argument in nulling {
             restrict_non_null(state, argument)?;
         }
         return Ok(());
@@ -918,24 +816,16 @@ fn call_input<D: EvalDialect, C: Context>(
     // known to return `NULL` exactly on a `NULL` argument.
     let null_only_on_null_input =
         !callees.is_empty() && state.dialect.null_only_on_null_input(&callees, state.options);
-    if !null_only_on_null_input || positions.is_empty() {
+    if !null_only_on_null_input {
         return Ok(());
     }
     let mut branches: Vec<Guarantees<C::Reference>> = Vec::new();
-    let mut seen = BTreeSet::new();
-    for position in positions {
-        if !seen.insert(position) {
-            continue;
-        }
-        let Some(argument) = arguments.get(position).and_then(Option::as_ref) else {
-            continue;
-        };
+    for argument in nulling {
         branches.push(branch(state, |s| restrict_none(s, argument))?);
     }
-    if branches.is_empty() {
-        return Ok(());
+    if !branches.is_empty() {
+        merge(state, branches);
     }
-    merge(state, branches);
     Ok(())
 }
 
@@ -1111,10 +1001,10 @@ fn comparison_with<D: EvalDialect, C: Context>(
         if right.may_be_null() {
             let branch = match (family, op) {
                 (Family::Any, CmpOp::Eq) | (Family::All, CmpOp::NotEq) => {
-                    apart_branch(state, left, right)?
+                    member_branch(state, left, right, Restriction::Exclude)?
                 }
                 (Family::Any, CmpOp::NotEq) | (Family::All, CmpOp::Eq) => {
-                    keep_branch(state, left, right)?
+                    member_branch(state, left, right, Restriction::Keep)?
                 }
                 _ => branch(state, |s| restrict_non_null(s, left))?,
             };
@@ -1450,6 +1340,40 @@ fn mapped(bound: &Bound<PgNumeric>, kind: BoundKind) -> Option<Bound<PgNumeric>>
     }
 }
 
+/// An end of an interval or of a listed set.
+#[derive(Clone, Copy)]
+enum End {
+    Low,
+    High,
+}
+
+/// Where an ordering outcome bounds the left side from the right's values.
+struct OrderingBound {
+    /// The end of the right side that bounds the left.
+    from: End,
+    /// The end of the left side it bounds.
+    onto: End,
+    /// Whether the bound excludes the right's value itself.
+    strict: bool,
+    /// Whether the left must stand past every right value, as for `ANY`
+    /// taking `false` and `ALL` taking `true`, not past one of them.
+    every: bool,
+}
+
+/// The bound an ordering outcome sets, `x > right` when `greater` and
+/// `x < right` otherwise, strict when `strict`.
+fn ordering_bound(family: Family, greater: bool, strict: bool, is_true: bool) -> OrderingBound {
+    let every = matches!((family, is_true), (Family::Any, false) | (Family::All, true));
+    // A true `x > v` bounds `x` from below, a false one from above.
+    let onto_low = greater == is_true;
+    // One right value bounds the left at its near end, every right value at
+    // its far end.
+    let from_low = onto_low != every;
+    let end = |low: bool| if low { End::Low } else { End::High };
+    // A false outcome holds the negated comparison, whose strictness flips.
+    OrderingBound { from: end(from_low), onto: end(onto_low), strict: strict == is_true, every }
+}
+
 /// The interval a numeric ordering outcome restricts the left side to.
 fn ordering_numeric(
     family: Family,
@@ -1458,33 +1382,21 @@ fn ordering_numeric(
     is_true: bool,
     range: &Interval<PgNumeric>,
 ) -> Restriction {
-    let (lo, hi) = (&range.low, &range.high);
-    // `ANY` taking `false` is false against every value, so it is the
-    // right's far bound that constrains the left, and `ALL` taking `true`
-    // the same way.
-    let (low, high) = match (family, is_true) {
-        (Family::Single | Family::Any, true) => {
-            let kind = if strict { BoundKind::Strict } else { BoundKind::Follows };
-            if greater { (Some(mapped(lo, kind)), None) } else { (None, Some(mapped(hi, kind))) }
-        }
-        (Family::Single | Family::All, false) => {
-            let kind = if strict { BoundKind::Follows } else { BoundKind::Strict };
-            if greater { (None, Some(mapped(hi, kind))) } else { (Some(mapped(lo, kind)), None) }
-        }
-        (Family::Any, false) => {
-            let kind = if strict { BoundKind::AlwaysIn } else { BoundKind::Inverts };
-            if greater { (None, Some(mapped(lo, kind))) } else { (Some(mapped(hi, kind)), None) }
-        }
-        // `x < ALL` true is `x < min` and `x > ALL` true is `x > max`.
-        (Family::All, true) => {
-            let kind = if strict { BoundKind::Inverts } else { BoundKind::AlwaysIn };
-            if greater { (Some(mapped(hi, kind)), None) } else { (None, Some(mapped(lo, kind))) }
-        }
+    let bound = ordering_bound(family, greater, strict, is_true);
+    let from = match bound.from {
+        End::Low => &range.low,
+        End::High => &range.high,
     };
-    let (low, high) = (low.flatten(), high.flatten());
-    Restriction::Interval(Interval {
-        low: low.unwrap_or(Bound::Unbounded),
-        high: high.unwrap_or(Bound::Unbounded),
+    let kind = match (bound.every, bound.strict) {
+        (false, true) => BoundKind::Strict,
+        (false, false) => BoundKind::Follows,
+        (true, true) => BoundKind::Inverts,
+        (true, false) => BoundKind::AlwaysIn,
+    };
+    let mapped = mapped(from, kind).unwrap_or(Bound::Unbounded);
+    Restriction::Interval(match bound.onto {
+        End::Low => Interval { low: mapped, high: Bound::Unbounded },
+        End::High => Interval { low: Bound::Unbounded, high: mapped },
     })
 }
 
@@ -1497,39 +1409,16 @@ fn ordering_datum(
     min: &PgValue,
     max: &PgValue,
 ) -> Restriction {
-    let side = |value: &PgValue, strict: bool| Side { value: value.clone(), strict };
-    let (low, high): (Option<Side>, Option<Side>) = match (family, is_true) {
-        (Family::Single | Family::Any, true) => {
-            if greater {
-                (Some(side(min, strict)), None)
-            } else {
-                (None, Some(side(max, strict)))
-            }
-        }
-        (Family::Single | Family::All, false) => {
-            if greater {
-                (None, Some(side(max, !strict)))
-            } else {
-                (Some(side(min, !strict)), None)
-            }
-        }
-        (Family::Any, false) => {
-            if greater {
-                (None, Some(side(min, !strict)))
-            } else {
-                (Some(side(max, !strict)), None)
-            }
-        }
-        // `x < ALL` true is `x < min` and `x > ALL` true is `x > max`.
-        (Family::All, true) => {
-            if greater {
-                (Some(side(max, strict)), None)
-            } else {
-                (None, Some(side(min, strict)))
-            }
-        }
+    let bound = ordering_bound(family, greater, strict, is_true);
+    let value = match bound.from {
+        End::Low => min,
+        End::High => max,
     };
-    Restriction::Side { low, high }
+    let side = Some(Side { value: value.clone(), strict: bound.strict });
+    match bound.onto {
+        End::Low => Restriction::Side { low: side, high: None },
+        End::High => Restriction::Side { low: None, high: side },
+    }
 }
 
 /// Restricts `expression`'s subject by `restriction`, against its values.
