@@ -8,14 +8,14 @@ use sqlparser::ast::{Array, BinaryOperator, CaseWhen, Expr, Function, InTarget, 
 
 use super::{
     super::{
-        context::{Builtin, CalleeKind, Context, NullInput},
+        context::{Builtin, CalleeKind, Context, NullInput, Rows},
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
         scalar::{ScalarType, TextRules},
         support,
     },
     State,
-    fold::{RowKinds, comparison_evals},
+    fold::{Compared, RowKinds, comparison_evals},
     forward,
 };
 
@@ -65,17 +65,9 @@ pub(super) fn call<D: EvalDialect, C: Context>(
     // answers `NULL` for the `NULL` input.
     let mut forced_null = true;
     for callee in &callees {
-        let forced = match &callee.null_input {
-            NullInput::Strict => argument_evaluations.iter().any(Evaluation::is_always_null),
-            NullInput::CalledOnNull(positions) => {
-                positions
-                    .iter()
-                    .filter_map(|position| argument_evaluations.get(*position))
-                    .any(Evaluation::is_always_null)
-            }
-        };
-        forced_null &= forced;
-        null |= null_argument(&callee.null_input, &argument_evaluations);
+        let nulling = |test| nulling_argument(&callee.null_input, &argument_evaluations, test);
+        forced_null &= nulling(Evaluation::is_always_null);
+        null |= nulling(Evaluation::may_be_null);
         match callee.builtin {
             None => {
                 // An unknown routine may return `NULL` on non-`NULL` input.
@@ -110,8 +102,12 @@ pub(super) fn call<D: EvalDialect, C: Context>(
         if let Some(body) = state.context.evaluate_body(callee, &argument_evaluations)? {
             // The arguments raise before the body runs, and a `NULL` argument
             // the callee is strict in answers `NULL` without running it.
-            let null =
-                body.may_be_null() || null_argument(&callee.null_input, &argument_evaluations);
+            let null = body.may_be_null()
+                || nulling_argument(
+                    &callee.null_input,
+                    &argument_evaluations,
+                    Evaluation::may_be_null,
+                );
             refined = refined.meet(&body).with_null(null).with_error(body.may_raise() || error);
         }
         refinements.push(refined);
@@ -122,17 +118,16 @@ pub(super) fn call<D: EvalDialect, C: Context>(
         .unwrap_or(evaluation))
 }
 
-/// Whether an argument the callee answers `NULL` for may be `NULL`.
-fn null_argument(null_input: &NullInput, arguments: &[Evaluation]) -> bool {
-    match null_input {
-        NullInput::Strict => arguments.iter().any(Evaluation::may_be_null),
-        NullInput::CalledOnNull(positions) => {
-            positions
-                .iter()
-                .filter_map(|position| arguments.get(*position))
-                .any(Evaluation::may_be_null)
-        }
-    }
+/// Whether an argument the callee answers `NULL` for passes `test`.
+fn nulling_argument(
+    null_input: &NullInput,
+    arguments: &[Evaluation],
+    test: fn(&Evaluation) -> bool,
+) -> bool {
+    arguments
+        .iter()
+        .enumerate()
+        .any(|(position, argument)| null_input.nulls_at(position) && test(argument))
 }
 
 /// The folds of the builtins the core recognises, `None` where the values
@@ -491,42 +486,11 @@ pub(super) fn case<D: EvalDialect, C: Context>(
         // A branch no row reaches may still refuse its types when planned.
         error |= result.may_raise();
         if reachable {
-            values = join_values(values, &result);
+            values = values.join(result.values());
             null |= result.may_be_null();
         }
     }
     Ok(Evaluation::new(ty, null, error, values))
-}
-
-/// The union of two values sets, `NULL` and errors ignored.
-fn join_values(left: Values, right: &Evaluation) -> Values {
-    let right = right.values().clone();
-    match (left, right) {
-        (Values::Listed(left), Values::Listed(right)) => {
-            Values::Listed(left.union(&right).cloned().collect())
-        }
-        (Values::Listed(listed), Values::Unlisted(unlisted))
-        | (Values::Unlisted(unlisted), Values::Listed(listed)) => {
-            let mut unlisted = unlisted.clone();
-            unlisted.excluded.retain(|value| !listed.contains(value));
-            for value in &listed {
-                if let Some(number) = value.as_numeric() {
-                    unlisted.numbers = unlisted.numbers.hull(&Interval::point(number));
-                }
-                if let Some(length) = crate::scalar::text_length(value) {
-                    unlisted.length = unlisted.length.hull(&Interval::point(length));
-                }
-            }
-            Values::Unlisted(unlisted)
-        }
-        (Values::Unlisted(left), Values::Unlisted(right)) => {
-            Values::Unlisted(Unlisted {
-                excluded: left.excluded.intersection(&right.excluded).cloned().collect(),
-                numbers: left.numbers.hull(&right.numbers),
-                length: left.length.hull(&right.length),
-            })
-        }
-    }
 }
 
 /// The forward evaluation of `x IN target`.
@@ -571,33 +535,27 @@ pub(super) fn in_target<D: EvalDialect, C: Context>(
             (o, error)
         }
         InTarget::Subquery(subquery) => {
-            let qe = state.context.query(subquery, state.guarantees)?;
-            let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
-                return Ok(Evaluation::new(
-                    ScalarType::Boolean,
-                    true,
-                    qe.error || value.may_raise(),
-                    Values::Unlisted(Unlisted::any()),
-                ));
-            };
-            let cmp = comparison_evals(state, value, &BinaryOperator::Eq, column.clone());
-            let present = qe.rows.one || qe.rows.many;
-            let o = if present {
+            let SubqueryOperand { compared: cmp, rows, .. } =
+                match subquery_comparison(state, value, &BinaryOperator::Eq, subquery)? {
+                    Ok(operand) => operand,
+                    Err(unknown) => return Ok(unknown),
+                };
+            let o = if rows.one || rows.many {
                 // On the rows the subquery returns the comparison holds, and
                 // a possibly-empty subquery is `FALSE` on its empty rows.
                 let mut o = cmp.outcomes();
-                o.falsity = o.falsity || qe.rows.none;
+                o.falsity = o.falsity || rows.none;
                 o
             } else {
                 // A certainly-empty subquery: `x IN (…)` is `FALSE`.
                 Outcomes { truth: false, falsity: true, null: false }
             };
-            (o, cmp.error || qe.error)
+            (o, cmp.error)
         }
         InTarget::Unnest(_) | InTarget::Table { .. } => (Outcomes::ANY, value.may_raise()),
     };
     let o = if negated { support::not_outcomes(o) } else { o };
-    Ok(support::condition(o, error))
+    Ok(Evaluation::condition(o, error))
 }
 
 /// The forward evaluation of `LIKE`, `ILIKE` and `SIMILAR TO`; `NOT` keeps
@@ -622,7 +580,7 @@ pub(super) fn like<D: EvalDialect, C: Context>(
     // The evaluator does not match `LIKE` patterns, so the value stays
     // unknown.
     let o = Outcomes { truth: true, falsity: true, null };
-    Ok(support::condition(o, error))
+    Ok(Evaluation::condition(o, error))
 }
 
 /// The forward evaluation of `x op ANY/ALL (list | subquery)`.
@@ -643,26 +601,27 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
     let (value_null, value_has_values) = (value.may_be_null(), !value.values().is_empty());
     let (cmp, members, error) = match right {
         Expr::Subquery(subquery) => {
-            let qe = state.context.query(subquery, state.guarantees)?;
-            let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
-                return unknown(cmp_error(&value, qe.error));
-            };
-            let mut cmp = comparison_evals(state, value, op, column.clone());
-            // The rows hold any of the values the column may hold, so a left
-            // value meets any subset of them.
-            cmp.rows = cmp.rows.over_subsets();
-            let error = cmp.error || qe.error;
-            let rows_present = qe.rows.one || qe.rows.many;
-            let empty = if qe.rows.none {
-                if rows_present { RowsEmpty::Sometimes } else { RowsEmpty::Always }
+            let SubqueryOperand { compared: cmp, column, rows } =
+                match subquery_comparison(state, value, op, subquery)? {
+                    Ok(operand) => operand,
+                    Err(unknown) => return Ok(unknown),
+                };
+            let error = cmp.error;
+            let rows_present = rows.one || rows.many;
+            let empty = if rows.none {
+                if rows_present { Presence::Sometimes } else { Presence::Always }
             } else {
-                RowsEmpty::Never
+                Presence::Never
             };
-            let members = Members {
-                nonempty: !column.values().is_empty(),
-                null: column.may_be_null(),
-                empty,
+            // A row set may leave out the `NULL` rows a column may hold.
+            let null = if column.is_always_null() {
+                Presence::Always
+            } else if column.may_be_null() {
+                Presence::Sometimes
+            } else {
+                Presence::Never
             };
+            let members = Members { nonempty: !column.values().is_empty(), null, empty };
             (cmp, members, error)
         }
         other => {
@@ -711,13 +670,14 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             let set = Evaluation::new(ty, null, false, Values::Listed(values.clone()));
             let cmp = comparison_evals(state, value, op, set);
             let error = cmp.error || error;
-            let empty =
-                if values.is_empty() && !null { RowsEmpty::Always } else { RowsEmpty::Never };
+            let empty = if values.is_empty() && !null { Presence::Always } else { Presence::Never };
+            // An element that is always `NULL` is in every member set.
+            let null = if null { Presence::Always } else { Presence::Never };
             let members = Members { nonempty: !values.is_empty(), null, empty };
             (cmp, members, error)
         }
     };
-    Ok(support::condition(
+    Ok(Evaluation::condition(
         quantified_outcomes(cmp.rows, &members, value_null, value_has_values, is_any),
         error,
     ))
@@ -734,7 +694,7 @@ fn quantified_outcomes(
     is_any: bool,
 ) -> Outcomes {
     // With no member at all, `ANY` is `FALSE` and `ALL` is `TRUE`.
-    if matches!(members.empty, RowsEmpty::Always) {
+    if matches!(members.empty, Presence::Always) {
         let outcomes = if is_any {
             Outcomes { truth: false, falsity: true, null: false }
         } else {
@@ -742,17 +702,18 @@ fn quantified_outcomes(
         };
         return outcomes;
     }
-    // A `NULL` member nulls its row's comparisons, so it kills both a
-    // certain `true` and a certain `false`. An empty result reads `FALSE`
-    // to `ANY` and `TRUE` to `ALL`, whatever the left side is.
-    let sometimes_empty = matches!(members.empty, RowsEmpty::Sometimes);
+    // A `NULL` member nulls its row's comparisons, so one in every member
+    // set kills both a certain `true` and a certain `false`. An empty result
+    // reads `FALSE` to `ANY` and `TRUE` to `ALL`, whatever the left side is.
+    let sometimes_empty = matches!(members.empty, Presence::Sometimes);
     let pair = value_has_values && members.nonempty;
+    let null_free = !matches!(members.null, Presence::Always);
     let (truth, falsity) = if is_any {
         // `ANY` over an empty set is `FALSE`, so a possibly-empty operand
         // is false on its empty rows.
-        (pair && rows.may_be_true(), sometimes_empty || pair && !members.null && rows.all_false)
+        (pair && rows.may_be_true(), sometimes_empty || pair && null_free && rows.all_false)
     } else {
-        (sometimes_empty || pair && !members.null && rows.all_true, pair && rows.may_be_false())
+        (sometimes_empty || pair && null_free && rows.all_true, pair && rows.may_be_false())
     };
     // `ANY` is `NULL` when some value compares false against every value
     // and a member is `NULL`; `ALL` is `NULL` when some value compares
@@ -763,8 +724,9 @@ fn quantified_outcomes(
     } else {
         rows.all_true || !members.nonempty
     };
-    let null = (value_null && (members.nonempty || members.null))
-        || (members.null && value_has_values && nulls);
+    let null_member = !matches!(members.null, Presence::Never);
+    let null = (value_null && (members.nonempty || null_member))
+        || (null_member && value_has_values && nulls);
     Outcomes { truth, falsity, null }
 }
 
@@ -772,25 +734,52 @@ fn quantified_outcomes(
 struct Members {
     /// A non-`NULL` member is possible.
     nonempty: bool,
-    /// A `NULL` member is possible.
-    null: bool,
-    /// Whether the members may be absent.
-    empty: RowsEmpty,
+    /// Whether a `NULL` member is among the members.
+    null: Presence,
+    /// Whether the members are absent.
+    empty: Presence,
 }
 
-/// Whether the rows an `ANY`/`ALL` operand may hold are absent.
-enum RowsEmpty {
-    /// Rows are present on every row.
+/// How often a fact about an `ANY`/`ALL` operand's members holds across the
+/// rows the condition is read on.
+enum Presence {
+    /// It holds on no row.
     Never,
-    /// Rows may be absent and may be present.
+    /// It may hold on a row and may not.
     Sometimes,
-    /// Rows are absent on every row.
+    /// It holds on every row.
     Always,
 }
 
-/// The error flag a comparison against a lost value must carry.
-fn cmp_error(value: &Evaluation, query_error: bool) -> bool {
-    value.may_raise() || query_error
+/// A subquery operand of `IN` or `ANY`/`ALL` compared with the left value.
+struct SubqueryOperand {
+    /// The comparison, read over any subset of the column's values, as the
+    /// subquery's rows may hold any of them.
+    compared: Compared,
+    /// The values the subquery's first column may hold.
+    column: Evaluation,
+    /// The row counts the subquery may return.
+    rows: Rows,
+}
+
+/// `value` compared by `op` with a subquery's first column. `Err` holds the
+/// unknown condition when the subquery projects no known column.
+fn subquery_comparison<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    value: Evaluation,
+    op: &BinaryOperator,
+    subquery: &Query,
+) -> Result<Result<SubqueryOperand, Evaluation>, C::Error> {
+    let qe = state.context.query(subquery, state.guarantees)?;
+    let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
+        let error = value.may_raise() || qe.error;
+        let unknown = Values::Unlisted(Unlisted::any());
+        return Ok(Err(Evaluation::new(ScalarType::Boolean, true, error, unknown)));
+    };
+    let mut compared = comparison_evals(state, value, op, column.clone());
+    compared.rows = compared.rows.over_subsets();
+    compared.error |= qe.error;
+    Ok(Ok(SubqueryOperand { compared, column: column.clone(), rows: qe.rows }))
 }
 
 /// The forward evaluation of `EXISTS subquery`.
@@ -802,7 +791,7 @@ pub(super) fn exists<D: EvalDialect, C: Context>(
     let qe = state.context.query(subquery, state.guarantees)?;
     let o = Outcomes { truth: qe.rows.one || qe.rows.many, falsity: qe.rows.none, null: false };
     let o = if negated { support::not_outcomes(o) } else { o };
-    Ok(support::condition(o, qe.error))
+    Ok(Evaluation::condition(o, qe.error))
 }
 
 /// The forward evaluation of a scalar subquery.
@@ -840,7 +829,8 @@ pub(super) fn is_null<D: EvalDialect, C: Context>(
     expr: &Expr,
     negated: bool,
 ) -> Result<Evaluation, C::Error> {
-    is_is_null(state, expr, negated)
+    let inner = forward(state, expr)?;
+    Ok(null_test(&inner, negated))
 }
 
 /// The forward evaluation of `x IS UNKNOWN`, which reads as `x IS NULL`.
@@ -853,21 +843,12 @@ pub(super) fn is_unknown<D: EvalDialect, C: Context>(
     Ok(null_test(&inner, negated))
 }
 
-fn is_is_null<D: EvalDialect, C: Context>(
-    state: &mut State<'_, D, C>,
-    expr: &Expr,
-    negated: bool,
-) -> Result<Evaluation, C::Error> {
-    let inner = forward(state, expr)?;
-    Ok(null_test(&inner, negated))
-}
-
 /// The outcomes of `inner IS [NOT] NULL`.
 fn null_test(inner: &Evaluation, negated: bool) -> Evaluation {
     let o =
         Outcomes { truth: inner.may_be_null(), falsity: !inner.values().is_empty(), null: false };
     let o = if negated { support::not_outcomes(o) } else { o };
-    support::condition(o, inner.may_raise())
+    Evaluation::condition(o, inner.may_raise())
 }
 
 /// The forward evaluation of `x IS [NOT] TRUE/FALSE`.
@@ -890,7 +871,7 @@ pub(super) fn is_true_false<D: EvalDialect, C: Context>(
     } else {
         Outcomes { truth, falsity, null: false }
     };
-    Ok(support::condition(o, inner.may_raise()))
+    Ok(Evaluation::condition(o, inner.may_raise()))
 }
 
 /// The forward evaluation of `x IS [NOT] DISTINCT FROM y`, never `NULL`.
@@ -919,7 +900,7 @@ pub(super) fn is_distinct<D: EvalDialect, C: Context>(
     } else {
         (unequal || one_null, equal || both_null)
     };
-    Ok(support::condition(Outcomes { truth, falsity, null: false }, cmp.error))
+    Ok(Evaluation::condition(Outcomes { truth, falsity, null: false }, cmp.error))
 }
 
 #[cfg(test)]
@@ -928,31 +909,14 @@ mod tests {
     use core::ops::Bound;
 
     use sql_values::{IntegerType, PgNumeric, PgValue};
-    use sqlparser::{
-        ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart},
-        dialect::PostgreSqlDialect,
-    };
+    use sqlparser::ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart};
 
     use crate::{
         context::{Builtin, Callee, CalleeKind, NullInput, Rows, Volatility},
         domain::{Evaluation, Interval, Unlisted, Values},
-        evaluate,
-        guarantees::Guarantees,
-        postgres::PostgreSqlOptions,
         scalar::{ScalarType, TextRules},
-        test_context::{ColumnContext, builtin_callee, parse},
+        test_context::{ColumnContext, builtin_callee, parse, read},
     };
-
-    fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(
-            &parse(sql),
-            &PostgreSqlDialect {},
-            &PostgreSqlOptions::default(),
-            &mut context,
-            &Guarantees::new(),
-        )
-        .expect("the context resolves")
-    }
 
     fn int(value: i64) -> Evaluation {
         Evaluation::known(PgValue::Integer(value), ScalarType::Integer(IntegerType::Integer))
@@ -1236,37 +1200,6 @@ mod tests {
             )
             .is_some()
         );
-    }
-
-    /// `join_values` unions listed, unlisted and listed-unlisted values.
-    #[test]
-    fn join_values_unions_the_value_sets() {
-        let union = super::join_values(
-            Values::Listed(BTreeSet::from([PgValue::Text("a".to_string())])),
-            &text("b"),
-        );
-        assert_eq!(
-            union,
-            Values::Listed(BTreeSet::from([
-                PgValue::Text("a".to_string()),
-                PgValue::Text("b".to_string())
-            ]))
-        );
-        assert!(matches!(
-            super::join_values(Values::Listed(BTreeSet::from([PgValue::Integer(1)])), &int_col()),
-            Values::Unlisted(_)
-        ));
-        assert!(matches!(
-            super::join_values(
-                Values::Listed(BTreeSet::from([PgValue::Text("ab".to_string())])),
-                &text_len(Bound::Included(0), Bound::Unbounded)
-            ),
-            Values::Unlisted(_)
-        ));
-        assert!(matches!(
-            super::join_values(int_col().values().clone(), &int_col()),
-            Values::Unlisted(_)
-        ));
     }
 
     /// `call_arguments` gives `None` for wildcard arguments.
@@ -1595,6 +1528,32 @@ mod tests {
             || ColumnContext::new().with_column("id", id.clone()).with_query(rows, column.clone());
         assert!(read(context(), "id = ANY(SELECT id FROM t)").may_be_false());
         assert!(read(context(), "id = ALL(SELECT id FROM t)").may_be_true());
+    }
+
+    /// A subquery column that may be `NULL` need not hold a `NULL` row, so an
+    /// `ANY` may still fail every row and an `ALL` may still satisfy every row.
+    #[test]
+    fn a_nullable_subquery_column_need_not_hold_a_null_row() {
+        let id = Evaluation::known(PgValue::Integer(3), int4());
+        let column = Evaluation::new(
+            int4(),
+            true,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),
+        );
+        let rows = Rows { none: false, one: true, many: true };
+        let context =
+            || ColumnContext::new().with_column("id", id.clone()).with_query(rows, column.clone());
+        assert!(read(context(), "id = ANY(SELECT id FROM t)").may_be_false());
+        assert!(read(context(), "id <> ALL(SELECT id FROM t)").may_be_true());
+        // A column holding only `NULL` reads `NULL` on every row set.
+        let nulls = Evaluation::null(int4());
+        let context = ColumnContext::new().with_column("id", id.clone()).with_query(rows, nulls);
+        assert!(read(context, "id = ANY(SELECT id FROM t)").is_always_null());
+        // An array's `NULL` element is in every member set.
+        let context = || ColumnContext::new().with_column("id", id.clone());
+        assert!(!read(context(), "id = ANY(ARRAY[1, NULL])").may_be_false());
+        assert!(!read(context(), "id <> ALL(ARRAY[1, NULL])").may_be_true());
     }
 
     /// `ANY` of an impossible value is impossible.

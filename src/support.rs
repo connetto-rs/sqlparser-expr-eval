@@ -277,12 +277,6 @@ fn product_outcomes(
     out
 }
 
-/// A condition taking exactly the outcomes `outcomes` and raising `error`.
-#[must_use]
-pub(crate) fn condition(outcomes: Outcomes, error: bool) -> Evaluation {
-    Evaluation::condition(outcomes, error)
-}
-
 /// Whether two numeric intervals admit no common value.
 #[must_use]
 pub(crate) fn intervals_disjoint(a: &Interval<PgNumeric>, b: &Interval<PgNumeric>) -> bool {

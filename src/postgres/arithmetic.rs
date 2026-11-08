@@ -411,6 +411,19 @@ fn interval_mul(
     right: &Interval<PgNumeric>,
     error: &mut bool,
 ) -> Interval<PgNumeric> {
+    corner_interval(left, right, error, |a, b| a.checked_mul(b).ok())
+}
+
+/// The interval of a binary operation whose extremes over two bounded
+/// intervals lie at their corners, widened to the unbounded when a side is
+/// unbounded at either end. A corner whose result overflows widens the end
+/// its sign falls on, which is the sign of a product or a quotient.
+fn corner_interval(
+    left: &Interval<PgNumeric>,
+    right: &Interval<PgNumeric>,
+    error: &mut bool,
+    operation: impl Fn(&PgNumeric, &PgNumeric) -> Option<PgNumeric>,
+) -> Interval<PgNumeric> {
     if reaches_unbounded(left) || reaches_unbounded(right) {
         return Interval::unbounded();
     }
@@ -426,16 +439,16 @@ fn interval_mul(
     for (a, b) in corners {
         let (first, first_open) = unbind(a);
         let (second, second_open) = unbind(b);
-        if let Ok(product) = first.checked_mul(&second) {
+        if let Some(result) = operation(&first, &second) {
             let open = first_open || second_open;
-            if low.as_ref().is_none_or(|(min, _)| product < *min) {
-                low = Some((product.clone(), open));
+            if low.as_ref().is_none_or(|(min, _)| result < *min) {
+                low = Some((result.clone(), open));
             }
-            if high.as_ref().is_none_or(|(max, _)| product > *max) {
-                high = Some((product, open));
+            if high.as_ref().is_none_or(|(max, _)| result > *max) {
+                high = Some((result, open));
             }
         } else {
-            // The corner's product overflows; its sign is still known, so
+            // The corner's result overflows, and its sign is still known, so
             // widen the end that holds it.
             *error = true;
             if (first < PgNumeric::from(0_i64)) == (second < PgNumeric::from(0_i64)) {
@@ -477,68 +490,14 @@ fn unbind(bound: Bound<PgNumeric>) -> (PgNumeric, bool) {
     }
 }
 
-/// The interval of `left / right`, `right` known not to contain zero;
+/// The interval of `left / right`, `right` known not to contain zero,
 /// widened to the unbounded when a side is unbounded at either end.
 fn interval_div(
     left: &Interval<PgNumeric>,
     right: &Interval<PgNumeric>,
     error: &mut bool,
 ) -> Interval<PgNumeric> {
-    if reaches_unbounded(left) || reaches_unbounded(right) {
-        return Interval::unbounded();
-    }
-    let corners = [
-        (left.low.clone(), right.low.clone()),
-        (left.low.clone(), right.high.clone()),
-        (left.high.clone(), right.low.clone()),
-        (left.high.clone(), right.high.clone()),
-    ];
-    let mut low: Option<(PgNumeric, bool)> = None;
-    let mut high: Option<(PgNumeric, bool)> = None;
-    let (mut low_overflow, mut high_overflow) = (false, false);
-    for (a, b) in corners {
-        let (first, first_open) = unbind(a);
-        let (second, second_open) = unbind(b);
-        if let Ok(quotient) = first.checked_div(&second) {
-            let open = first_open || second_open;
-            if low.as_ref().is_none_or(|(min, _)| quotient < *min) {
-                low = Some((quotient.clone(), open));
-            }
-            if high.as_ref().is_none_or(|(max, _)| quotient > *max) {
-                high = Some((quotient, open));
-            }
-        } else {
-            // The corner's quotient overflows; its sign is still known, so
-            // widen the end that holds it.
-            *error = true;
-            if (first < PgNumeric::from(0_i64)) == (second < PgNumeric::from(0_i64)) {
-                high_overflow = true;
-            } else {
-                low_overflow = true;
-            }
-        }
-    }
-    match (low, high) {
-        (Some((low, open)), Some((high, high_open))) => {
-            Interval {
-                low: if low_overflow {
-                    Bound::Unbounded
-                } else if open {
-                    Bound::Excluded(low)
-                } else {
-                    Bound::Included(low)
-                },
-                high: if high_overflow {
-                    Bound::Unbounded
-                } else if high_open {
-                    Bound::Excluded(high)
-                } else {
-                    Bound::Included(high)
-                },
-            }
-        }
-        _ => Interval::unbounded(),
-    }
+    corner_interval(left, right, error, |a, b| a.checked_div(b).ok())
 }
 
 /// The interval widened to hold the integer results of the division over

@@ -113,27 +113,11 @@ fn node<D: EvalDialect, C: Context>(
     // depth.
     state.depth += 1;
     if !single_outcome(outcomes) {
-        let base = state.guarantees.clone();
-        let mut joined: Option<Guarantees<C::Reference>> = None;
+        let mut branches = Vec::with_capacity(3);
         for single in singles(outcomes).into_iter().flatten() {
-            let mut branch = base.clone();
-            let mut branch_state = State {
-                dialect: state.dialect,
-                options: state.options,
-                context: state.context,
-                guarantees: &mut branch,
-                budget: state.budget,
-                depth: state.depth,
-            };
-            node(&mut branch_state, expression, single)?;
-            if !branch.is_impossible() {
-                joined = Some(match joined {
-                    Some(joined) => joined.join(&branch),
-                    None => branch,
-                });
-            }
+            branches.push(branch(state, |s| node(s, expression, single))?);
         }
-        *state.guarantees = joined.unwrap_or_else(Guarantees::impossible);
+        merge(state, branches);
         state.depth -= 1;
         return Ok(());
     }
@@ -330,60 +314,15 @@ fn shape<D: EvalDialect, C: Context>(
             and_or(state, &support::and_or_terms(left, right, false), false, outcomes)
         }
         Expr::BinaryOp { left, op, right } => {
-            match op {
-                BinaryOperator::Eq => {
-                    if let Some(operand) =
-                        state.dialect.null_equals_operand(left, right, state.options)
-                    {
-                        return is_null_input(state, operand, outcomes);
-                    }
-                    comparison(state, left, right, CmpOp::Eq, Family::Single, outcomes)
-                }
-                BinaryOperator::Lt => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Less { strict: true },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::LtEq => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Less { strict: false },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::Gt => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Greater { strict: true },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::GtEq => {
-                    comparison(
-                        state,
-                        left,
-                        right,
-                        CmpOp::Greater { strict: false },
-                        Family::Single,
-                        outcomes,
-                    )
-                }
-                BinaryOperator::NotEq => {
-                    comparison(state, left, right, CmpOp::NotEq, Family::Single, outcomes)
-                }
-                _ => Ok(()),
+            if *op == BinaryOperator::Eq
+                && let Some(operand) = state.dialect.null_equals_operand(left, right, state.options)
+            {
+                return is_null_input(state, operand, outcomes);
             }
+            let Some(op) = CmpOp::of(op) else {
+                return Ok(());
+            };
+            comparison(state, left, right, op, Family::Single, outcomes)
         }
         Expr::AnyOp { left, compare_op, right, .. } => {
             any_all(state, left, right, compare_op, Family::Any, outcomes)
@@ -666,21 +605,23 @@ fn in_list<D: EvalDialect, C: Context>(
             all_listed = false;
         }
     }
-    let values = if all_listed { Values::Listed(union) } else { Values::Unlisted(Unlisted::any()) };
+    // A constant member is present on every row, but a member that is not
+    // a constant holds one of its values on each row. Its values settle a
+    // `TRUE` reading, while only the constants keep `x` apart otherwise.
+    let constants: BTreeSet<PgValue> =
+        member_evaluations.iter().filter_map(Evaluation::constant).cloned().collect();
+    let exact = member_evaluations
+        .iter()
+        .all(|member| member.constant().is_some() || member.is_always_null());
+    let values = if exact || outcomes.truth {
+        if all_listed { Values::Listed(union) } else { Values::Unlisted(Unlisted::any()) }
+    } else if constants.is_empty() {
+        Values::Unlisted(Unlisted::any())
+    } else {
+        Values::Listed(constants)
+    };
     let other = Evaluation::new(ScalarType::Unknown, any_null, false, values);
-    if outcomes.null {
-        let mut branches = Vec::new();
-        branches.push(side_null_branch(state, value)?);
-        if any_null {
-            branches.push(apart_branch(state, value, &other)?);
-        }
-        merge(state, branches);
-        return Ok(());
-    }
-    restrict_non_null(state, value)?;
-    let evaluation = forward_of(state, value)?;
-    let restriction = restriction(Family::Any, CmpOp::Eq, outcomes.truth, &other, &evaluation);
-    apply(state, value, &evaluation, &restriction)
+    comparison_with(state, value, &other, CmpOp::Eq, Family::Any, outcomes)
 }
 
 /// The inputs of `value IN (SELECT ...)` taking one outcome.
@@ -690,29 +631,33 @@ fn in_subquery<D: EvalDialect, C: Context>(
     subquery: &Query,
     outcomes: Outcomes,
 ) -> Result<(), C::Error> {
-    let qe = state.context.query(subquery, state.guarantees)?;
-    let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
+    let Some(column) = subquery_column(state, subquery, Family::Any, outcomes)? else {
         return Ok(());
     };
-    let rows_present = qe.rows.one || qe.rows.many;
-    if !rows_present {
-        // The empty-set outcome is decided by the forward pass, so no value
-        // narrows here.
-        return Ok(());
+    // A row set holds any of the column's values, so the condition reads
+    // against one row.
+    comparison_with(state, value, &column, CmpOp::Eq, Family::Single, outcomes)
+}
+
+/// The column a quantified subquery operand compares against, `None` where
+/// the subquery narrows nothing. A possibly empty row set reads `FALSE` to
+/// `ANY` and `TRUE` to `ALL` whatever the left side is, so those outcomes
+/// carry no input value.
+fn subquery_column<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    subquery: &Query,
+    family: Family,
+    outcomes: Outcomes,
+) -> Result<Option<Evaluation>, C::Error> {
+    let qe = state.context.query(subquery, state.guarantees)?;
+    let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
+        return Ok(None);
+    };
+    let empty_reading = if family == Family::All { outcomes.truth } else { outcomes.falsity };
+    if !(qe.rows.one || qe.rows.many) || qe.rows.none && empty_reading {
+        return Ok(None);
     }
-    let other = column.clone().with_error(qe.error);
-    if outcomes.null {
-        // A zero-row outcome is `FALSE`, so the `NULL` outcome arises only
-        // on the non-empty rows, where the usual branches stand.
-        let mut branches = Vec::new();
-        branches.push(side_null_branch(state, value)?);
-        if other.may_be_null() {
-            branches.push(apart_branch(state, value, &other)?);
-        }
-        merge(state, branches);
-        return Ok(());
-    }
-    comparison_with(state, value, &other, CmpOp::Eq, Family::Any, outcomes)
+    Ok(Some(column.clone().with_error(qe.error)))
 }
 
 /// The inputs of `left op ANY/ALL (right)` taking one outcome.
@@ -731,23 +676,12 @@ fn any_all<D: EvalDialect, C: Context>(
     };
     let other = match right {
         Expr::Subquery(subquery) => {
-            let qe = state.context.query(subquery, state.guarantees)?;
-            let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
+            let Some(column) = subquery_column(state, subquery, family, outcomes)? else {
                 return Ok(());
             };
-            let rows_present = qe.rows.one || qe.rows.many;
-            if qe.rows.none && !rows_present {
-                // The empty-set outcome is decided by the forward pass, so no
-                // value narrows here.
-                return Ok(());
-            }
-            if qe.rows.none && family == Family::All && outcomes.truth {
-                // An `ALL` reading true on its empty rows carries no
-                // input value; an `ANY` takes every outcome on its
-                // non-empty rows only.
-                return Ok(());
-            }
-            column.clone().with_error(qe.error)
+            // A row set holds any of the column's values, so the condition
+            // reads against one row.
+            return comparison_with(state, left, &column, op, Family::Single, outcomes);
         }
         Expr::Array(Array { elem, .. }) => {
             let (values, null) = listed_union(state, elem)?;
@@ -820,34 +754,19 @@ fn listed_union<D: EvalDialect, C: Context>(
     Ok((Values::Listed(union), null))
 }
 
-/// A branch in which `value` is non-`NULL` and apart from `other`'s values.
-fn apart_branch<D: EvalDialect, C: Context>(
+/// A branch in which `value` is non-`NULL` and restricted by `restrict` to
+/// `other`'s listed values, apart from them or among them.
+fn member_branch<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     value: &Expr,
     other: &Evaluation,
+    restrict: fn(BTreeSet<PgValue>) -> Restriction,
 ) -> Result<Guarantees<C::Reference>, C::Error> {
     branch(state, |s| {
         restrict_non_null(s, value)?;
         let evaluation = forward_of(s, value)?;
         let restriction = match other.values() {
-            Values::Listed(listed) if !listed.is_empty() => Restriction::Exclude(listed.clone()),
-            _ => Restriction::Skip,
-        };
-        apply(s, value, &evaluation, &restriction)
-    })
-}
-
-/// A branch in which `value` is non-`NULL` and among `other`'s values.
-fn keep_branch<D: EvalDialect, C: Context>(
-    state: &mut State<'_, D, C>,
-    value: &Expr,
-    other: &Evaluation,
-) -> Result<Guarantees<C::Reference>, C::Error> {
-    branch(state, |s| {
-        restrict_non_null(s, value)?;
-        let evaluation = forward_of(s, value)?;
-        let restriction = match other.values() {
-            Values::Listed(listed) if !listed.is_empty() => Restriction::Keep(listed.clone()),
+            Values::Listed(listed) if !listed.is_empty() => restrict(listed.clone()),
             _ => Restriction::Skip,
         };
         apply(s, value, &evaluation, &restriction)
@@ -878,31 +797,17 @@ fn call_input<D: EvalDialect, C: Context>(
     // every callee the call may reach is strict.
     let all_strict = !callees.is_empty()
         && callees.iter().all(|callee| matches!(callee.null_input, NullInput::Strict));
-    let mut positions: Vec<usize> = Vec::new();
+    // The arguments some reachable callee answers `NULL` for, each once.
+    let mut positions = BTreeSet::new();
     for callee in &callees {
-        match &callee.null_input {
-            NullInput::Strict if all_strict => {
-                for (index, argument) in arguments.iter().enumerate() {
-                    if argument.is_some() {
-                        positions.push(index);
-                    }
-                }
-            }
-            NullInput::CalledOnNull(list) => {
-                positions.extend(list.iter().copied());
-            }
-            NullInput::Strict => {}
+        if callee.null_input == NullInput::Strict && !all_strict {
+            continue;
         }
+        positions.extend((0..arguments.len()).filter(|&index| callee.null_input.nulls_at(index)));
     }
+    let nulling = positions.into_iter().filter_map(|position| arguments[position].as_ref());
     if outcomes.truth || outcomes.falsity {
-        let mut seen = BTreeSet::new();
-        for position in positions {
-            if !seen.insert(position) {
-                continue;
-            }
-            let Some(argument) = arguments.get(position).and_then(Option::as_ref) else {
-                continue;
-            };
+        for argument in nulling {
             restrict_non_null(state, argument)?;
         }
         return Ok(());
@@ -911,24 +816,16 @@ fn call_input<D: EvalDialect, C: Context>(
     // known to return `NULL` exactly on a `NULL` argument.
     let null_only_on_null_input =
         !callees.is_empty() && state.dialect.null_only_on_null_input(&callees, state.options);
-    if !null_only_on_null_input || positions.is_empty() {
+    if !null_only_on_null_input {
         return Ok(());
     }
     let mut branches: Vec<Guarantees<C::Reference>> = Vec::new();
-    let mut seen = BTreeSet::new();
-    for position in positions {
-        if !seen.insert(position) {
-            continue;
-        }
-        let Some(argument) = arguments.get(position).and_then(Option::as_ref) else {
-            continue;
-        };
+    for argument in nulling {
         branches.push(branch(state, |s| restrict_none(s, argument))?);
     }
-    if branches.is_empty() {
-        return Ok(());
+    if !branches.is_empty() {
+        merge(state, branches);
     }
-    merge(state, branches);
     Ok(())
 }
 
@@ -1104,10 +1001,10 @@ fn comparison_with<D: EvalDialect, C: Context>(
         if right.may_be_null() {
             let branch = match (family, op) {
                 (Family::Any, CmpOp::Eq) | (Family::All, CmpOp::NotEq) => {
-                    apart_branch(state, left, right)?
+                    member_branch(state, left, right, Restriction::Exclude)?
                 }
                 (Family::Any, CmpOp::NotEq) | (Family::All, CmpOp::Eq) => {
-                    keep_branch(state, left, right)?
+                    member_branch(state, left, right, Restriction::Keep)?
                 }
                 _ => branch(state, |s| restrict_non_null(s, left))?,
             };
@@ -1443,6 +1340,40 @@ fn mapped(bound: &Bound<PgNumeric>, kind: BoundKind) -> Option<Bound<PgNumeric>>
     }
 }
 
+/// An end of an interval or of a listed set.
+#[derive(Clone, Copy)]
+enum End {
+    Low,
+    High,
+}
+
+/// Where an ordering outcome bounds the left side from the right's values.
+struct OrderingBound {
+    /// The end of the right side that bounds the left.
+    from: End,
+    /// The end of the left side it bounds.
+    onto: End,
+    /// Whether the bound excludes the right's value itself.
+    strict: bool,
+    /// Whether the left must stand past every right value, as for `ANY`
+    /// taking `false` and `ALL` taking `true`, not past one of them.
+    every: bool,
+}
+
+/// The bound an ordering outcome sets, `x > right` when `greater` and
+/// `x < right` otherwise, strict when `strict`.
+fn ordering_bound(family: Family, greater: bool, strict: bool, is_true: bool) -> OrderingBound {
+    let every = matches!((family, is_true), (Family::Any, false) | (Family::All, true));
+    // A true `x > v` bounds `x` from below, a false one from above.
+    let onto_low = greater == is_true;
+    // One right value bounds the left at its near end, every right value at
+    // its far end.
+    let from_low = onto_low != every;
+    let end = |low: bool| if low { End::Low } else { End::High };
+    // A false outcome holds the negated comparison, whose strictness flips.
+    OrderingBound { from: end(from_low), onto: end(onto_low), strict: strict == is_true, every }
+}
+
 /// The interval a numeric ordering outcome restricts the left side to.
 fn ordering_numeric(
     family: Family,
@@ -1451,52 +1382,21 @@ fn ordering_numeric(
     is_true: bool,
     range: &Interval<PgNumeric>,
 ) -> Restriction {
-    let (lo, hi) = (&range.low, &range.high);
-    // `ANY` taking `false` is false against every value, so it is the
-    // right's far bound that constrains the left, and `ALL` taking `true`
-    // the same way; an unbound far bound leaves no value at all.
-    let (low, high, dead) = match (family, is_true) {
-        (Family::Single | Family::Any, true) => {
-            let kind = if strict { BoundKind::Strict } else { BoundKind::Follows };
-            if greater {
-                (Some(mapped(lo, kind)), None, false)
-            } else {
-                (None, Some(mapped(hi, kind)), false)
-            }
-        }
-        (Family::Single | Family::All, false) => {
-            let kind = if strict { BoundKind::Follows } else { BoundKind::Strict };
-            if greater {
-                (None, Some(mapped(hi, kind)), false)
-            } else {
-                (Some(mapped(lo, kind)), None, false)
-            }
-        }
-        (Family::Any, false) => {
-            let kind = if strict { BoundKind::AlwaysIn } else { BoundKind::Inverts };
-            if greater {
-                (None, Some(mapped(lo, kind)), matches!(lo, Bound::Unbounded))
-            } else {
-                (Some(mapped(hi, kind)), None, matches!(hi, Bound::Unbounded))
-            }
-        }
-        // `x < ALL` true is `x < min` and `x > ALL` true is `x > max`.
-        (Family::All, true) => {
-            let kind = if strict { BoundKind::Inverts } else { BoundKind::AlwaysIn };
-            if greater {
-                (Some(mapped(hi, kind)), None, matches!(hi, Bound::Unbounded))
-            } else {
-                (None, Some(mapped(lo, kind)), matches!(lo, Bound::Unbounded))
-            }
-        }
+    let bound = ordering_bound(family, greater, strict, is_true);
+    let from = match bound.from {
+        End::Low => &range.low,
+        End::High => &range.high,
     };
-    let (low, high) = (low.flatten(), high.flatten());
-    if dead {
-        return Restriction::Dead;
-    }
-    Restriction::Interval(Interval {
-        low: low.unwrap_or(Bound::Unbounded),
-        high: high.unwrap_or(Bound::Unbounded),
+    let kind = match (bound.every, bound.strict) {
+        (false, true) => BoundKind::Strict,
+        (false, false) => BoundKind::Follows,
+        (true, true) => BoundKind::Inverts,
+        (true, false) => BoundKind::AlwaysIn,
+    };
+    let mapped = mapped(from, kind).unwrap_or(Bound::Unbounded);
+    Restriction::Interval(match bound.onto {
+        End::Low => Interval { low: mapped, high: Bound::Unbounded },
+        End::High => Interval { low: Bound::Unbounded, high: mapped },
     })
 }
 
@@ -1509,39 +1409,16 @@ fn ordering_datum(
     min: &PgValue,
     max: &PgValue,
 ) -> Restriction {
-    let side = |value: &PgValue, strict: bool| Side { value: value.clone(), strict };
-    let (low, high): (Option<Side>, Option<Side>) = match (family, is_true) {
-        (Family::Single | Family::Any, true) => {
-            if greater {
-                (Some(side(min, strict)), None)
-            } else {
-                (None, Some(side(max, strict)))
-            }
-        }
-        (Family::Single | Family::All, false) => {
-            if greater {
-                (None, Some(side(max, !strict)))
-            } else {
-                (Some(side(min, !strict)), None)
-            }
-        }
-        (Family::Any, false) => {
-            if greater {
-                (None, Some(side(min, !strict)))
-            } else {
-                (Some(side(max, !strict)), None)
-            }
-        }
-        // `x < ALL` true is `x < min` and `x > ALL` true is `x > max`.
-        (Family::All, true) => {
-            if greater {
-                (Some(side(max, strict)), None)
-            } else {
-                (None, Some(side(min, strict)))
-            }
-        }
+    let bound = ordering_bound(family, greater, strict, is_true);
+    let value = match bound.from {
+        End::Low => min,
+        End::High => max,
     };
-    Restriction::Side { low, high }
+    let side = Some(Side { value: value.clone(), strict: bound.strict });
+    match bound.onto {
+        End::Low => Restriction::Side { low: side, high: None },
+        End::High => Restriction::Side { low: None, high: side },
+    }
 }
 
 /// Restricts `expression`'s subject by `restriction`, against its values.
@@ -1800,6 +1677,20 @@ mod tests {
         Evaluation::new(ty, false, false, Values::Unlisted(Unlisted::any()))
     }
 
+    /// A boolean routine that runs on `NULL` input and returns `NULL` for a
+    /// `NULL` at one of `positions`.
+    fn called_on_null(positions: Vec<usize>) -> crate::Callee {
+        crate::context::Callee {
+            builtin: None,
+            null_input: crate::context::NullInput::CalledOnNull(positions),
+            volatility: crate::context::Volatility::Immutable,
+            kind: crate::context::CalleeKind::Normal,
+            returns: ScalarType::Boolean,
+            returns_set: false,
+            token: 1,
+        }
+    }
+
     /// PostgreSQL's `length(text)`.
     fn length_callee() -> crate::Callee {
         let mut callee = crate::test_context::strict_callee(ScalarType::Integer(
@@ -1880,15 +1771,7 @@ mod tests {
 
     #[test]
     fn a_called_on_null_callee_keeps_the_argument_null() {
-        let other = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(Vec::new()),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let other = called_on_null(Vec::new());
         let expression = parse("f(x)");
         let guarantees = implied_with(
             ColumnContext::new()
@@ -2180,21 +2063,31 @@ mod tests {
         let exc = |n: i64| Bound::Excluded(PgNumeric::from(n));
         let expected: &[(&str, Outcomes, Bound<PgNumeric>, Bound<PgNumeric>)] = &[
             ("x < ANY (SELECT v FROM q)", Outcomes::TRUE, open(), exc(5)),
-            ("x < ANY (SELECT v FROM q)", Outcomes::FALSE, inc(5), open()),
+            ("x < ANY (SELECT v FROM q)", Outcomes::FALSE, inc(3), open()),
             ("x <= ANY (SELECT v FROM q)", Outcomes::TRUE, open(), inc(5)),
-            ("x <= ANY (SELECT v FROM q)", Outcomes::FALSE, exc(5), open()),
+            ("x <= ANY (SELECT v FROM q)", Outcomes::FALSE, exc(3), open()),
             ("x > ANY (SELECT v FROM q)", Outcomes::TRUE, exc(3), open()),
-            ("x > ANY (SELECT v FROM q)", Outcomes::FALSE, open(), inc(3)),
+            ("x > ANY (SELECT v FROM q)", Outcomes::FALSE, open(), inc(5)),
             ("x >= ANY (SELECT v FROM q)", Outcomes::TRUE, inc(3), open()),
-            ("x >= ANY (SELECT v FROM q)", Outcomes::FALSE, open(), exc(3)),
-            ("x < ALL (SELECT v FROM q)", Outcomes::TRUE, open(), exc(3)),
+            ("x >= ANY (SELECT v FROM q)", Outcomes::FALSE, open(), exc(5)),
+            ("x < ALL (SELECT v FROM q)", Outcomes::TRUE, open(), exc(5)),
             ("x < ALL (SELECT v FROM q)", Outcomes::FALSE, inc(3), open()),
-            ("x <= ALL (SELECT v FROM q)", Outcomes::TRUE, open(), inc(3)),
+            ("x <= ALL (SELECT v FROM q)", Outcomes::TRUE, open(), inc(5)),
             ("x <= ALL (SELECT v FROM q)", Outcomes::FALSE, exc(3), open()),
-            ("x > ALL (SELECT v FROM q)", Outcomes::TRUE, exc(5), open()),
+            ("x > ALL (SELECT v FROM q)", Outcomes::TRUE, exc(3), open()),
             ("x > ALL (SELECT v FROM q)", Outcomes::FALSE, open(), inc(5)),
-            ("x >= ALL (SELECT v FROM q)", Outcomes::TRUE, inc(5), open()),
+            ("x >= ALL (SELECT v FROM q)", Outcomes::TRUE, inc(3), open()),
             ("x >= ALL (SELECT v FROM q)", Outcomes::FALSE, open(), exc(5)),
+            // An array holds every member on every row, so the readings
+            // against every member bound `x` at the far member.
+            ("x < ANY (ARRAY[3, 5])", Outcomes::FALSE, inc(5), open()),
+            ("x <= ANY (ARRAY[3, 5])", Outcomes::FALSE, exc(5), open()),
+            ("x > ANY (ARRAY[3, 5])", Outcomes::FALSE, open(), inc(3)),
+            ("x >= ANY (ARRAY[3, 5])", Outcomes::FALSE, open(), exc(3)),
+            ("x < ALL (ARRAY[3, 5])", Outcomes::TRUE, open(), exc(3)),
+            ("x <= ALL (ARRAY[3, 5])", Outcomes::TRUE, open(), inc(3)),
+            ("x > ALL (ARRAY[3, 5])", Outcomes::TRUE, exc(5), open()),
+            ("x >= ALL (ARRAY[3, 5])", Outcomes::TRUE, inc(5), open()),
         ];
         for (sql, outcomes, low, high) in expected {
             let guarantees = quantified(x.clone(), v.clone(), sql, *outcomes);
@@ -2206,10 +2099,10 @@ mod tests {
         }
     }
 
-    /// `IN` over an all-`NULL` projection reads `FALSE` on its empty rows
-    /// alone, and no value takes that outcome on its rows.
+    /// `IN` over an all-`NULL` projection reads `FALSE` on its empty rows,
+    /// whatever `x` holds.
     #[test]
-    fn an_in_subquery_over_an_always_null_column_reads_false_only_on_empty_rows() {
+    fn an_in_subquery_over_an_always_null_column_reads_false_on_empty_rows() {
         let v =
             Evaluation::new(ScalarType::Integer(IntegerType::Integer), true, false, Values::none());
         let guarantees = quantified_over(
@@ -2219,13 +2112,94 @@ mod tests {
             "x IN (SELECT v FROM q)",
             Outcomes::FALSE,
         );
+        assert!(!guarantees.is_impossible());
+    }
+
+    /// `IN` over an all-`NULL` projection never reads `TRUE`, and `= ALL`
+    /// over two distinct cast members never does either.
+    #[test]
+    fn a_member_set_no_value_can_satisfy_is_impossible_to_read_true() {
+        let v =
+            Evaluation::new(ScalarType::Integer(IntegerType::Integer), true, false, Values::none());
+        let guarantees = quantified_over(
+            Rows { none: false, one: true, many: true },
+            unknown_column(ScalarType::Integer(IntegerType::Integer)),
+            v,
+            "x IN (SELECT v FROM q)",
+            Outcomes::TRUE,
+        );
+        assert!(guarantees.is_impossible());
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("x", unknown_column(ScalarType::Numeric)),
+            &parse("x = ALL (ARRAY[1, 2]::numeric[])"),
+            Outcomes::TRUE,
+        );
         assert!(guarantees.is_impossible());
     }
 
-    /// `<> ANY` over two values reads `FALSE` when `x` equals every
-    /// member, which no value does.
+    /// A member that is not a constant holds one of its values on each row,
+    /// so `IN` reads its values as a possibility, not as members all at once.
     #[test]
-    fn an_any_over_two_values_reading_false_is_impossible() {
+    fn an_in_list_member_that_is_not_a_constant_reads_one_value() {
+        let listed = Evaluation::new(
+            ScalarType::Integer(IntegerType::Integer),
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),
+        );
+        let context = || {
+            ColumnContext::new().with_column("x", listed.clone()).with_column("y", listed.clone())
+        };
+        for (sql, outcomes) in [("x IN (y)", Outcomes::FALSE), ("x NOT IN (y)", Outcomes::TRUE)] {
+            let guarantees = implied_with(context(), &parse(sql), outcomes);
+            assert!(!guarantees.is_impossible(), "{sql}");
+            assert!(column(&guarantees, "x").may_be(&PgValue::Integer(1)), "{sql}");
+        }
+        // A nullable member reads `NULL` for any non-`NULL` `x` on its
+        // `NULL` rows.
+        let context = || context().with_column("z", listed.clone().with_null(true));
+        let guarantees = implied_with(context(), &parse("x IN (z)"), Outcomes::NULL);
+        assert!(column(&guarantees, "x").may_be(&PgValue::Integer(1)));
+        // Constant members are all present on every row.
+        let guarantees = implied_with(context(), &parse("x IN (1, 3)"), Outcomes::FALSE);
+        assert!(!column(&guarantees, "x").may_be(&PgValue::Integer(1)));
+    }
+
+    /// A value-less other side reads `NULL` everywhere, so no input takes an
+    /// equality outcome.
+    #[test]
+    fn a_value_less_side_admits_no_equality_outcome() {
+        let nothing = Evaluation::null(ScalarType::Integer(IntegerType::Integer));
+        for is_true in [true, false] {
+            let restriction = super::equality(Family::Single, CmpOp::Eq, is_true, &nothing);
+            assert!(matches!(restriction, Restriction::Dead));
+        }
+    }
+
+    /// An ordering against listed text leaves an unlisted side's values
+    /// open.
+    #[test]
+    fn an_ordering_against_listed_text_keeps_an_unlisted_side_open() {
+        let byte = |text: &str| PgValue::Text(text.to_string());
+        let v = Evaluation::new(
+            ScalarType::Text(TextRules::BYTEWISE),
+            false,
+            false,
+            Values::Listed(BTreeSet::from([byte("a"), byte("e")])),
+        );
+        let guarantees = quantified(
+            plain_column(ScalarType::Text(TextRules::BYTEWISE)),
+            v,
+            "x < ANY (SELECT v FROM q)",
+            Outcomes::TRUE,
+        );
+        assert!(!guarantees.is_impossible());
+        assert!(matches!(column(&guarantees, "x").values(), Values::Unlisted(_)));
+    }
+
+    /// `<> ANY` reads `FALSE` on an empty row set whatever `x` holds.
+    #[test]
+    fn an_any_reading_false_over_possibly_empty_rows_admits_every_value() {
         let v = Evaluation::new(
             ScalarType::Integer(IntegerType::Integer),
             false,
@@ -2239,13 +2213,12 @@ mod tests {
             "x <> ANY (SELECT v FROM q)",
             Outcomes::FALSE,
         );
-        assert!(guarantees.is_impossible());
+        assert!(!guarantees.is_impossible());
     }
 
-    /// `< ANY` over a value unbounded above reads `FALSE` when `x` meets
-    /// every member, which no value does.
+    /// `< ANY` reads `FALSE` on an empty row set whatever `x` holds.
     #[test]
-    fn a_less_any_over_an_unbounded_value_reading_false_is_impossible() {
+    fn a_less_any_reading_false_over_possibly_empty_rows_admits_every_value() {
         let v = Evaluation::new(
             ScalarType::Numeric,
             false,
@@ -2266,13 +2239,13 @@ mod tests {
             "x < ANY (SELECT v FROM q)",
             Outcomes::FALSE,
         );
-        assert!(guarantees.is_impossible());
+        assert!(!guarantees.is_impossible());
     }
 
     /// A listed date `> ALL` reading true keeps the values past the
-    /// maximum.
+    /// minimum, since a row set may hold the minimum alone.
     #[test]
-    fn a_listed_date_all_reading_true_keeps_the_values_past_the_max() {
+    fn a_listed_date_all_reading_true_keeps_the_values_past_the_min() {
         let day = |text: &str| PgValue::Date(sql_values::parse_date(text).expect("a date"));
         let v = Evaluation::new(
             ScalarType::Date,
@@ -2295,7 +2268,7 @@ mod tests {
         );
         let x = column(&guarantees, "x");
         let Values::Listed(listed) = x.values() else { panic!("x stays listed") };
-        let expected = BTreeSet::from([day("2025-01-01")]);
+        let expected = BTreeSet::from([day("2024-03-01"), day("2025-01-01")]);
         assert_eq!(listed, &expected);
     }
 
@@ -2483,35 +2456,30 @@ mod tests {
         );
         let keeps: BTreeSet<PgValue> = [byte("`"), byte("b")].into();
         let only_b: BTreeSet<PgValue> = [byte("b")].into();
-        let only_backtick: BTreeSet<PgValue> = [byte("`")].into();
-        let expected: &[(&str, Outcomes, Option<&BTreeSet<PgValue>>)] = &[
-            ("x < ANY (SELECT v FROM q)", Outcomes::TRUE, Some(&keeps)),
-            ("x < ANY (SELECT v FROM q)", Outcomes::FALSE, None),
-            ("x <= ANY (SELECT v FROM q)", Outcomes::TRUE, Some(&keeps)),
-            ("x <= ANY (SELECT v FROM q)", Outcomes::FALSE, None),
-            ("x > ANY (SELECT v FROM q)", Outcomes::TRUE, Some(&only_b)),
-            ("x > ANY (SELECT v FROM q)", Outcomes::FALSE, Some(&only_backtick)),
-            ("x >= ANY (SELECT v FROM q)", Outcomes::TRUE, Some(&only_b)),
-            ("x >= ANY (SELECT v FROM q)", Outcomes::FALSE, Some(&only_backtick)),
-            ("x < ALL (SELECT v FROM q)", Outcomes::TRUE, Some(&only_backtick)),
-            ("x < ALL (SELECT v FROM q)", Outcomes::FALSE, Some(&only_b)),
-            ("x <= ALL (SELECT v FROM q)", Outcomes::TRUE, Some(&only_backtick)),
-            ("x <= ALL (SELECT v FROM q)", Outcomes::FALSE, Some(&only_b)),
-            ("x > ALL (SELECT v FROM q)", Outcomes::TRUE, None),
-            ("x > ALL (SELECT v FROM q)", Outcomes::FALSE, Some(&keeps)),
-            ("x >= ALL (SELECT v FROM q)", Outcomes::TRUE, None),
-            ("x >= ALL (SELECT v FROM q)", Outcomes::FALSE, Some(&keeps)),
+        let expected: &[(&str, Outcomes, &BTreeSet<PgValue>)] = &[
+            ("x < ANY (SELECT v FROM q)", Outcomes::TRUE, &keeps),
+            ("x < ANY (SELECT v FROM q)", Outcomes::FALSE, &only_b),
+            ("x <= ANY (SELECT v FROM q)", Outcomes::TRUE, &keeps),
+            ("x <= ANY (SELECT v FROM q)", Outcomes::FALSE, &only_b),
+            ("x > ANY (SELECT v FROM q)", Outcomes::TRUE, &only_b),
+            ("x > ANY (SELECT v FROM q)", Outcomes::FALSE, &keeps),
+            ("x >= ANY (SELECT v FROM q)", Outcomes::TRUE, &only_b),
+            ("x >= ANY (SELECT v FROM q)", Outcomes::FALSE, &keeps),
+            ("x < ALL (SELECT v FROM q)", Outcomes::TRUE, &keeps),
+            ("x < ALL (SELECT v FROM q)", Outcomes::FALSE, &only_b),
+            ("x <= ALL (SELECT v FROM q)", Outcomes::TRUE, &keeps),
+            ("x <= ALL (SELECT v FROM q)", Outcomes::FALSE, &only_b),
+            ("x > ALL (SELECT v FROM q)", Outcomes::TRUE, &only_b),
+            ("x > ALL (SELECT v FROM q)", Outcomes::FALSE, &keeps),
+            ("x >= ALL (SELECT v FROM q)", Outcomes::TRUE, &only_b),
+            ("x >= ALL (SELECT v FROM q)", Outcomes::FALSE, &keeps),
         ];
         for (sql, outcomes, listed) in expected {
             let guarantees = quantified(x.clone(), v.clone(), sql, *outcomes);
-            if listed.is_none() {
-                assert!(guarantees.is_impossible(), "{sql} {outcomes:?}");
-                continue;
-            }
             assert!(!guarantees.is_impossible(), "{sql} {outcomes:?}");
             let x = column(&guarantees, "x");
             let Values::Listed(values) = x.values() else { panic!("{sql} {outcomes:?}") };
-            assert_eq!(values, listed.unwrap(), "{sql} {outcomes:?}");
+            assert_eq!(values, *listed, "{sql} {outcomes:?}");
         }
     }
 
@@ -2620,6 +2588,43 @@ mod tests {
     ) -> Guarantees<String> {
         let context = ColumnContext::new().with_column("x", x).with_query(rows, v);
         implied_with(context, &parse(sql), outcomes)
+    }
+
+    /// A subquery's rows may hold any of the values its column may hold, so
+    /// a condition read against every row reads against one row backward.
+    #[test]
+    fn a_subquery_condition_reads_any_row_backward() {
+        let int4 = ScalarType::Integer(sql_values::IntegerType::Integer);
+        let listed = Evaluation::new(
+            int4,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),
+        );
+        let rows = Rows { none: false, one: true, many: true };
+        for (sql, outcomes) in [
+            ("x = ANY (SELECT y FROM t)", Outcomes::FALSE),
+            ("x IN (SELECT y FROM t)", Outcomes::FALSE),
+            ("x <> ALL (SELECT y FROM t)", Outcomes::TRUE),
+            ("x < ALL (SELECT y FROM t)", Outcomes::TRUE),
+        ] {
+            let guarantees = quantified_over(rows, listed.clone(), listed.clone(), sql, outcomes);
+            assert!(!guarantees.is_impossible(), "{sql}");
+            let x = guarantees.reference(&"x".to_string());
+            assert!(x.is_none_or(|x| x.may_be(&PgValue::Integer(1))), "{sql}");
+        }
+        // An empty row set reads `FALSE` to `ANY` whatever `x` holds.
+        let one = Evaluation::known(PgValue::Integer(1), int4);
+        let rows = Rows { none: true, one: true, many: false };
+        let guarantees = quantified_over(
+            rows,
+            listed.clone(),
+            one,
+            "x = ANY (SELECT y FROM t)",
+            Outcomes::FALSE,
+        );
+        let x = guarantees.reference(&"x".to_string());
+        assert!(x.is_none_or(|x| x.may_be(&PgValue::Integer(1))));
     }
 
     #[test]
@@ -3480,7 +3485,8 @@ mod tests {
         let expected: BTreeSet<PgValue> = [value("a"), value("b"), value("c")].into();
         assert_eq!(listed, &expected);
 
-        // `NOT IN` true keeps every value apart from the union.
+        // `NOT IN` true keeps every value apart from the constant members,
+        // and `a` too, which `y` may not hold on its row.
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -3490,7 +3496,7 @@ mod tests {
         );
         let x = column(&guarantees, "x");
         assert!(!x.may_be_null());
-        assert!(!x.may_be(&value("a")));
+        assert!(x.may_be(&value("a")));
         assert!(!x.may_be(&value("c")));
         assert!(x.may_be(&value("d")));
 
@@ -3626,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn an_in_subquery_null_outcome_keeps_a_null_or_an_apart_side() {
+    fn an_in_subquery_null_outcome_admits_any_side() {
         let many = Rows { none: false, one: false, many: true };
         let value = |text: &str| PgValue::Text(text.to_string());
         let v = Evaluation::new(
@@ -3645,7 +3651,8 @@ mod tests {
         let x = column(&guarantees, "x");
         assert!(x.may_be_null());
         assert!(x.may_be(&value("b")));
-        assert!(!x.may_be(&value("a")));
+        // A row set holding only the `NULL` row reads `NULL` for `a` too.
+        assert!(x.may_be(&value("a")));
     }
 
     #[test]
@@ -3915,12 +3922,12 @@ mod tests {
     }
 
     #[test]
-    fn a_quantified_outcome_with_no_admitted_value_is_impossible() {
+    fn a_quantified_outcome_over_an_unbounded_column_admits_every_value() {
         let many = Rows { none: false, one: false, many: true };
         let v =
             Evaluation::new(ScalarType::Numeric, false, false, Values::Unlisted(Unlisted::any()));
-        // `x < ANY` false needs `x` at least every `v`, which no finite
-        // `x` holds over an unbounded `v`; the other quantifications around.
+        // A row set may hold one value of an unbounded `v`, and every `x`
+        // finds one on the side each reading needs.
         let guarantees = quantified_over(
             many,
             unknown_column(ScalarType::Numeric),
@@ -3928,7 +3935,7 @@ mod tests {
             "x < ANY (SELECT v FROM q)",
             Outcomes::FALSE,
         );
-        assert!(guarantees.is_impossible());
+        assert!(!guarantees.is_impossible());
         let guarantees = quantified_over(
             many,
             unknown_column(ScalarType::Numeric),
@@ -3936,7 +3943,7 @@ mod tests {
             "x > ANY (SELECT v FROM q)",
             Outcomes::FALSE,
         );
-        assert!(guarantees.is_impossible());
+        assert!(!guarantees.is_impossible());
         let guarantees = quantified_over(
             many,
             unknown_column(ScalarType::Numeric),
@@ -3944,7 +3951,7 @@ mod tests {
             "x < ALL (SELECT v FROM q)",
             Outcomes::TRUE,
         );
-        assert!(guarantees.is_impossible());
+        assert!(!guarantees.is_impossible());
         let guarantees = quantified_over(
             many,
             unknown_column(ScalarType::Numeric),
@@ -3952,7 +3959,7 @@ mod tests {
             "x > ALL (SELECT v FROM q)",
             Outcomes::TRUE,
         );
-        assert!(guarantees.is_impossible());
+        assert!(!guarantees.is_impossible());
     }
 
     #[test]
@@ -3983,7 +3990,8 @@ mod tests {
             Outcomes::FALSE,
         );
         let x = column(&guarantees, "x");
-        assert!(!x.may_be(&value("a")));
+        // A row set holding only `b` reads `a` as false.
+        assert!(x.may_be(&value("a")));
         assert!(x.may_be(&value("c")));
         let guarantees = quantified_over(
             many,
@@ -3998,9 +4006,9 @@ mod tests {
     }
 
     #[test]
-    fn a_never_null_side_under_a_quantified_null_outcome_stays_apart() {
-        // `x = ANY (SELECT v)` is `NULL` when `x` is `NULL`, or non-`NULL`
-        // and apart from every non-`NULL` member with a `NULL` member.
+    fn a_quantified_null_outcome_admits_any_non_null_side() {
+        // `x = ANY (SELECT v)` is `NULL` when `x` is `NULL`, or when a row
+        // set holds only `NULL` rows, which any `x` meets.
         let many = Rows { none: false, one: false, many: true };
         let guarantees = quantified_over(
             many,
@@ -4017,7 +4025,7 @@ mod tests {
         let x = column(&guarantees, "x");
         assert!(x.may_be_null());
         assert!(x.may_be(&PgValue::Numeric(PgNumeric::from(2))));
-        assert!(!x.may_be(&PgValue::Numeric(PgNumeric::from(1))));
+        assert!(x.may_be(&PgValue::Numeric(PgNumeric::from(1))));
     }
 
     #[test]
@@ -4193,15 +4201,7 @@ mod tests {
 
     #[test]
     fn a_call_making_several_routines_keeps_the_argument_when_each_routine_nulls_it() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4247,15 +4247,7 @@ mod tests {
 
     #[test]
     fn a_called_on_null_callee_null_points_at_the_argument_under_a_null_on_null_input_dialect() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_null_on_null(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4270,15 +4262,7 @@ mod tests {
     fn a_called_on_null_callee_null_under_postgres_points_at_nothing() {
         // PostgreSQL's `NULL` result may come from non-`NULL` input, so no
         // argument is constrained.
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4294,15 +4278,7 @@ mod tests {
     fn a_call_null_over_no_argument_keeps_nothing() {
         // The routine may answer `NULL` however it likes, so no argument is
         // pointed at.
-        let no_position = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(Vec::new()),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let no_position = called_on_null(Vec::new());
         let guarantees = implied_null_on_null(
             ColumnContext::new().with_callee("g", no_position),
             &parse("g()"),
@@ -4355,15 +4331,7 @@ mod tests {
     #[test]
     fn a_out_of_range_called_on_null_position_keeps_no_subject() {
         // The routine nulls its second argument, which the call holds no.
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![1]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![1]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4710,15 +4678,7 @@ mod tests {
     /// Two routines nulling the same argument still point at it once.
     #[test]
     fn two_routines_nulling_one_argument_keep_it_non_null() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4733,15 +4693,7 @@ mod tests {
     /// Two routines nulling the same argument point a `NULL` result at it once.
     #[test]
     fn two_routines_nulling_one_argument_keep_the_null_subject() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_null_on_null(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4757,15 +4709,7 @@ mod tests {
     /// at nothing.
     #[test]
     fn an_out_of_range_null_position_keeps_no_subject() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![5]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![5]);
         let guarantees = implied_null_on_null(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4905,16 +4849,17 @@ mod tests {
         assert!(guarantees.is_impossible());
     }
 
-    /// `> ANY` over an unbounded value, reading false, is impossible.
+    /// `> ANY` reading false over an unbounded value needs `x` at most one
+    /// row's value, which every `x` finds.
     #[test]
-    fn a_greater_any_over_an_unbounded_value_reading_false_is_impossible() {
+    fn a_greater_any_reading_false_over_an_unbounded_value_admits_every_value() {
         let guarantees = quantified(
             unknown_column(ScalarType::Numeric),
             unknown_column(ScalarType::Numeric),
             "x > ANY (SELECT v FROM q)",
             Outcomes::FALSE,
         );
-        assert!(guarantees.is_impossible());
+        assert!(!guarantees.is_impossible());
     }
 
     /// A text ordering under a non-byte collation admits no value restriction.

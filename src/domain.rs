@@ -203,7 +203,7 @@ impl Values {
         }
     }
 
-    fn join(&self, other: &Self) -> Self {
+    pub(crate) fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Listed(left), Self::Listed(right)) => {
                 Self::Listed(left.union(right).cloned().collect())

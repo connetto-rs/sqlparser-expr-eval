@@ -1,7 +1,7 @@
 //! Operators, forward: comparisons, arithmetic and string concatenation.
 
 use alloc::collections::BTreeSet;
-use core::ops::Bound;
+use core::{cmp::Ordering, ops::Bound};
 
 use sql_values::{PgNumeric, PgValue};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
@@ -332,16 +332,18 @@ fn number_pairs(left: &Values, right: &Values, op: &BinaryOperator) -> RowKinds 
     // strictly past the open bound, or at the closed one.
     let below_open = match &rlo {
         Bound::Unbounded => false,
-        Bound::Included(value) => has_below(left.values, value, true),
-        Bound::Excluded(value) => has_below(left.values, value, false),
+        Bound::Included(value) => has_beyond(left.values, value, Ordering::Less, true),
+        Bound::Excluded(value) => has_beyond(left.values, value, Ordering::Less, false),
     };
-    let below_any = bound_value(&rlo).is_some_and(|value| has_below(left.values, value, false));
+    let below_any = bound_value(&rlo)
+        .is_some_and(|value| has_beyond(left.values, value, Ordering::Less, false));
     let above_open = match &rhi {
         Bound::Unbounded => false,
-        Bound::Included(value) => has_above(left.values, value, true),
-        Bound::Excluded(value) => has_above(left.values, value, false),
+        Bound::Included(value) => has_beyond(left.values, value, Ordering::Greater, true),
+        Bound::Excluded(value) => has_beyond(left.values, value, Ordering::Greater, false),
     };
-    let above_any = bound_value(&rhi).is_some_and(|value| has_above(left.values, value, false));
+    let above_any = bound_value(&rhi)
+        .is_some_and(|value| has_beyond(left.values, value, Ordering::Greater, false));
     let eq_match = number_eq_match(left.values, right.values);
     let eq_absent = number_eq_absent(left.values, right.values);
     let (every_satisfies, every_fails, row_satisfies, row_fails) = match op {
@@ -373,53 +375,24 @@ fn bound_value(bound: &Bound<PgNumeric>) -> Option<&PgNumeric> {
     }
 }
 
-/// Whether some value of `left` is below `right`, strictly when `strict`,
-/// which decides for an unlisted `left` by its lower bound.
-fn has_below(left: &Values, right: &PgNumeric, strict: bool) -> bool {
+/// Whether some value of `left` lies on the `side` of `right`, `Less` for
+/// below and `Greater` for above, strictly when `strict`. An unlisted `left`
+/// decides by its bound on that side.
+fn has_beyond(left: &Values, right: &PgNumeric, side: Ordering, strict: bool) -> bool {
+    let beyond = |value: &PgNumeric| {
+        let order = value.cmp(right);
+        order == side || (!strict && order == Ordering::Equal)
+    };
     match left {
-        Values::Listed(listed) => {
-            listed
-                .iter()
-                .filter_map(PgValue::as_numeric)
-                .any(|value| if strict { value < *right } else { value <= *right })
-        }
+        Values::Listed(listed) => listed.iter().filter_map(PgValue::as_numeric).any(|v| beyond(&v)),
         Values::Unlisted(unlisted) => {
-            match &unlisted.numbers.low {
+            let bound =
+                if side == Ordering::Less { &unlisted.numbers.low } else { &unlisted.numbers.high };
+            match bound {
                 Bound::Unbounded => true,
-                Bound::Included(value) => {
-                    if strict {
-                        value < right
-                    } else {
-                        value <= right
-                    }
-                }
-                Bound::Excluded(value) => value < right,
-            }
-        }
-    }
-}
-
-/// Whether some value of `left` is above `right`, strictly when `strict`,
-/// which decides for an unlisted `left` by its upper bound.
-fn has_above(left: &Values, right: &PgNumeric, strict: bool) -> bool {
-    match left {
-        Values::Listed(listed) => {
-            listed
-                .iter()
-                .filter_map(PgValue::as_numeric)
-                .any(|value| if strict { value > *right } else { value >= *right })
-        }
-        Values::Unlisted(unlisted) => {
-            match &unlisted.numbers.high {
-                Bound::Unbounded => true,
-                Bound::Included(value) => {
-                    if strict {
-                        value > right
-                    } else {
-                        value >= right
-                    }
-                }
-                Bound::Excluded(value) => value > right,
+                Bound::Included(value) => beyond(value),
+                // An excluded bound holds values strictly past it.
+                Bound::Excluded(value) => value.cmp(right) == side,
             }
         }
     }
@@ -475,13 +448,13 @@ fn number_eq_absent(left: &Values, right: &Values) -> bool {
                     let (low, high) = (&right.numbers.low, &right.numbers.high);
                     let below = match low {
                         Bound::Unbounded => false,
-                        Bound::Included(value) => has_below(left, value, true),
-                        Bound::Excluded(value) => has_below(left, value, false),
+                        Bound::Included(value) => has_beyond(left, value, Ordering::Less, true),
+                        Bound::Excluded(value) => has_beyond(left, value, Ordering::Less, false),
                     };
                     let above = match high {
                         Bound::Unbounded => false,
-                        Bound::Included(value) => has_above(left, value, true),
-                        Bound::Excluded(value) => has_above(left, value, false),
+                        Bound::Included(value) => has_beyond(left, value, Ordering::Greater, true),
+                        Bound::Excluded(value) => has_beyond(left, value, Ordering::Greater, false),
                     };
                     below || above
                 }
@@ -622,7 +595,7 @@ pub(super) fn comparison<D: EvalDialect, C: Context>(
     let left = forward(state, left)?;
     let right = forward(state, right)?;
     let comparison = comparison_evals(state, left, op, right);
-    Ok(support::condition(comparison.outcomes(), comparison.error))
+    Ok(Evaluation::condition(comparison.outcomes(), comparison.error))
 }
 
 /// `[ NOT ] BETWEEN`, forward.
@@ -640,7 +613,7 @@ pub(super) fn between<D: EvalDialect, C: Context>(
     let high_cmp = comparison_evals(state, x, &BinaryOperator::LtEq, high);
     let outcomes = support::and_outcomes(low_cmp.outcomes(), high_cmp.outcomes());
     let outcomes = if negated { support::not_outcomes(outcomes) } else { outcomes };
-    Ok(support::condition(outcomes, low_cmp.error || high_cmp.error))
+    Ok(Evaluation::condition(outcomes, low_cmp.error || high_cmp.error))
 }
 
 /// The operator of a binary expression, forward.
@@ -821,7 +794,7 @@ pub(super) fn unary<D: EvalDialect, C: Context>(
                 return Ok(Evaluation::impossible(ScalarType::Boolean));
             }
             let outcomes = inner.outcomes();
-            Ok(support::condition(
+            Ok(Evaluation::condition(
                 Outcomes { truth: outcomes.falsity, falsity: outcomes.truth, null: outcomes.null },
                 inner.may_raise(),
             ))
@@ -1121,7 +1094,7 @@ mod tests {
     use sql_values::{IntegerType, PgNumeric, PgValue};
     use sqlparser::{
         ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan},
-        dialect::{GenericDialect, PostgreSqlDialect},
+        dialect::PostgreSqlDialect,
         tokenizer::Span,
     };
 
@@ -1135,24 +1108,8 @@ mod tests {
         guarantees::{Guarantees, Subject},
         postgres::PostgreSqlOptions,
         scalar::{ScalarType, TextRules},
-        test_context::{ColumnContext, parse},
+        test_context::{ColumnContext, parse, read, read_default},
     };
-
-    fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(
-            &parse(sql),
-            &PostgreSqlDialect {},
-            &PostgreSqlOptions::default(),
-            &mut context,
-            &Guarantees::new(),
-        )
-        .expect("resolves")
-    }
-
-    fn read_default(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(&parse(sql), &GenericDialect, &(), &mut context, &Guarantees::new())
-            .expect("resolves")
-    }
 
     fn read_guarantees(
         mut context: ColumnContext,

@@ -26,6 +26,16 @@ pub enum NullInput {
     CalledOnNull(Vec<usize>),
 }
 
+impl NullInput {
+    /// Whether a `NULL` argument at `position` makes the call `NULL`.
+    pub(crate) fn nulls_at(&self, position: usize) -> bool {
+        match self {
+            Self::Strict => true,
+            Self::CalledOnNull(positions) => positions.contains(&position),
+        }
+    }
+}
+
 /// How a function's result may change between calls with equal arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Volatility {

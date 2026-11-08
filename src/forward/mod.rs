@@ -185,40 +185,19 @@ mod tests {
     use alloc::collections::BTreeSet;
 
     use sql_values::{IntegerType, PgValue};
-    use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
+    use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{
         super::{
-            context::{Builtin, Callee, CalleeKind, NullInput, Rows, Volatility},
+            context::{Builtin, Callee, NullInput, Rows},
             domain::{Evaluation, Unlisted, Values},
             guarantees::Guarantees,
             postgres::PostgreSqlOptions,
             scalar::{ScalarType, TextRules},
-            test_context::{self, ColumnContext, parse},
+            test_context::{self, ColumnContext, read, read_default},
         },
         evaluate,
     };
-
-    fn read(context: ColumnContext, sql: &str) -> Evaluation {
-        let expression = parse(sql);
-        let mut context = context;
-        evaluate(
-            &expression,
-            &PostgreSqlDialect {},
-            &PostgreSqlOptions::default(),
-            &mut context,
-            &Guarantees::new(),
-        )
-        .expect("the context resolves")
-    }
-
-    /// Reads `sql` under the conservative default dialect, with no settings.
-    fn read_default(context: ColumnContext, sql: &str) -> Evaluation {
-        let expression = parse(sql);
-        let mut context = context;
-        evaluate(&expression, &GenericDialect {}, &(), &mut context, &Guarantees::new())
-            .expect("the context resolves")
-    }
 
     #[test]
     fn integer_overflow_always_raises() {
@@ -334,15 +313,9 @@ mod tests {
 
     #[test]
     fn concat_call_skips_nulls() {
-        let callee = Callee {
-            builtin: Some(Builtin::Concat),
-            null_input: NullInput::CalledOnNull(Vec::new()),
-            volatility: super::super::context::Volatility::Immutable,
-            kind: CalleeKind::Normal,
-            returns: ScalarType::Text(TextRules::DEFAULT),
-            returns_set: false,
-            token: 0,
-        };
+        let mut callee =
+            test_context::builtin_callee(Builtin::Concat, ScalarType::Text(TextRules::DEFAULT));
+        callee.null_input = NullInput::CalledOnNull(Vec::new());
         let evaluation =
             read(ColumnContext::new().with_callee("concat", callee), "concat('a', NULL)");
         assert_eq!(evaluation.constant(), Some(&PgValue::Text("a".to_string())));
@@ -376,71 +349,34 @@ mod tests {
         assert_eq!(evaluation.constant(), Some(&PgValue::Integer(2)));
     }
 
+    /// A context with an integer `id`, nullable when `null`.
+    fn id_column(null: bool) -> ColumnContext {
+        let id = ScalarType::Integer(IntegerType::Integer);
+        let values = Values::Unlisted(super::super::domain::Unlisted::any());
+        ColumnContext::new().with_column("id", Evaluation::new(id, null, false, values))
+    }
+
     #[test]
     fn not_in_a_null_member_never_true() {
-        let evaluation = read(
-            ColumnContext::new().with_column(
-                "id",
-                Evaluation::new(
-                    ScalarType::Integer(IntegerType::Integer),
-                    true,
-                    false,
-                    Values::Unlisted(super::super::domain::Unlisted::any()),
-                ),
-            ),
-            "id NOT IN (1, NULL)",
-        );
+        let evaluation = read(id_column(true), "id NOT IN (1, NULL)");
         assert!(!evaluation.may_be_true());
     }
 
     #[test]
     fn in_a_null_member_never_true() {
-        let evaluation = read(
-            ColumnContext::new().with_column(
-                "id",
-                Evaluation::new(
-                    ScalarType::Integer(IntegerType::Integer),
-                    true,
-                    false,
-                    Values::Unlisted(super::super::domain::Unlisted::any()),
-                ),
-            ),
-            "id IN (NULL)",
-        );
+        let evaluation = read(id_column(true), "id IN (NULL)");
         assert!(!evaluation.may_be_true());
     }
 
     #[test]
     fn equality_with_null_is_always_null() {
-        let evaluation = read(
-            ColumnContext::new().with_column(
-                "id",
-                Evaluation::new(
-                    ScalarType::Integer(IntegerType::Integer),
-                    true,
-                    false,
-                    Values::Unlisted(super::super::domain::Unlisted::any()),
-                ),
-            ),
-            "id = NULL",
-        );
+        let evaluation = read(id_column(true), "id = NULL");
         assert!(evaluation.is_always_null());
     }
 
     #[test]
     fn is_null_of_a_never_null_column_is_false() {
-        let evaluation = read(
-            ColumnContext::new().with_column(
-                "id",
-                Evaluation::new(
-                    ScalarType::Integer(IntegerType::Integer),
-                    false,
-                    false,
-                    Values::Unlisted(super::super::domain::Unlisted::any()),
-                ),
-            ),
-            "id IS NULL",
-        );
+        let evaluation = read(id_column(false), "id IS NULL");
         assert!(evaluation.may_be_false());
         assert!(!evaluation.may_be_true());
     }
@@ -552,24 +488,9 @@ mod tests {
 
     #[test]
     fn a_called_on_null_callee_keeps_the_values() {
-        let strict = Callee {
-            builtin: None,
-            null_input: NullInput::Strict,
-            volatility: Volatility::Immutable,
-            kind: CalleeKind::Normal,
-            returns: ScalarType::Text(TextRules::DEFAULT),
-            returns_set: false,
-            token: 0,
-        };
-        let called_on_null = Callee {
-            builtin: None,
-            null_input: NullInput::CalledOnNull(Vec::new()),
-            volatility: Volatility::Immutable,
-            kind: CalleeKind::Normal,
-            returns: ScalarType::Text(TextRules::DEFAULT),
-            returns_set: false,
-            token: 1,
-        };
+        let strict = test_context::strict_callee(ScalarType::Text(TextRules::DEFAULT));
+        let called_on_null =
+            Callee { null_input: NullInput::CalledOnNull(Vec::new()), token: 1, ..strict.clone() };
         let context =
             ColumnContext::new().with_callee("f", strict).with_callee("f", called_on_null);
         let evaluation = read(context, "f(NULL)");
@@ -637,8 +558,10 @@ mod tests {
         assert!(!evaluation.may_be_true());
     }
 
+    /// A possibly empty subquery reads `FALSE` to `ANY` and `TRUE` to `ALL`
+    /// on its empty rows, past what the rows it returns read.
     #[test]
-    fn an_any_over_a_sometimes_empty_result_may_be_false() {
+    fn a_quantifier_over_a_sometimes_empty_result_takes_its_empty_reading() {
         let column = |value: i64| {
             Evaluation::new(
                 ScalarType::Integer(IntegerType::Integer),
@@ -647,32 +570,17 @@ mod tests {
                 Values::Listed(BTreeSet::from([PgValue::Integer(value)])),
             )
         };
-        let context = ColumnContext::new()
-            .with_column("x", column(1))
-            .with_query(Rows { none: true, one: true, many: true }, column(1));
-        let evaluation = read(context, "x = ANY (SELECT v FROM q)");
-        assert!(evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
-        assert!(!evaluation.may_be_null());
-    }
-
-    #[test]
-    fn an_all_over_a_sometimes_empty_result_may_be_true() {
-        let column = |value: i64| {
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                false,
-                false,
-                Values::Listed(BTreeSet::from([PgValue::Integer(value)])),
-            )
-        };
-        let context = ColumnContext::new()
-            .with_column("x", column(2))
-            .with_query(Rows { none: true, one: true, many: true }, column(1));
-        let evaluation = read(context, "x = ALL (SELECT v FROM q)");
-        assert!(evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
-        assert!(!evaluation.may_be_null());
+        // `1 = ANY` and `2 = ALL` over the member `1` alone read the
+        // opposite of the empty reading.
+        for (x, sql) in [(1, "x = ANY (SELECT v FROM q)"), (2, "x = ALL (SELECT v FROM q)")] {
+            let context = ColumnContext::new()
+                .with_column("x", column(x))
+                .with_query(Rows { none: true, one: true, many: true }, column(1));
+            let evaluation = read(context, sql);
+            assert!(evaluation.may_be_true(), "{sql}");
+            assert!(evaluation.may_be_false(), "{sql}");
+            assert!(!evaluation.may_be_null(), "{sql}");
+        }
     }
 
     #[test]
@@ -693,15 +601,7 @@ mod tests {
     #[test]
     fn alternative_callee_bodies_join_their_answers() {
         let callee = test_context::strict_callee(ScalarType::Text(TextRules::DEFAULT));
-        let other = Callee {
-            builtin: None,
-            null_input: NullInput::Strict,
-            volatility: Volatility::Immutable,
-            kind: CalleeKind::Normal,
-            returns: ScalarType::Text(TextRules::DEFAULT),
-            returns_set: false,
-            token: 1,
-        };
+        let other = Callee { token: 1, ..callee.clone() };
         let context = ColumnContext::new()
             .with_callee("f", callee)
             .with_callee("f", other)
@@ -872,45 +772,26 @@ mod tests {
     }
 
     #[test]
-    fn a_5_672_term_and_chain_evaluates_on_a_small_stack() {
-        let terms = DEPTH;
-        let mut expression = column("c0");
-        for i in 1..terms {
-            expression = Expr::BinaryOp {
-                left: Box::new(expression),
-                op: BinaryOperator::And,
-                right: Box::new(column(&format!("c{i}"))),
-            };
+    fn a_5_672_term_and_or_or_chain_evaluates_on_a_small_stack() {
+        for op in [BinaryOperator::And, BinaryOperator::Or] {
+            let terms = DEPTH;
+            let mut expression = column("c0");
+            for i in 1..terms {
+                expression = Expr::BinaryOp {
+                    left: Box::new(expression),
+                    op: op.clone(),
+                    right: Box::new(column(&format!("c{i}"))),
+                };
+            }
+            let mut context = ColumnContext::new();
+            for i in 0..terms {
+                context = context.with_column(&format!("c{i}"), boolean_unknown());
+            }
+            let evaluation = on_small_stack(expression, context);
+            assert!(evaluation.may_be_true(), "{op}");
+            assert!(evaluation.may_be_false(), "{op}");
+            assert!(evaluation.may_be_null(), "{op}");
         }
-        let mut context = ColumnContext::new();
-        for i in 0..terms {
-            context = context.with_column(&format!("c{i}"), boolean_unknown());
-        }
-        let evaluation = on_small_stack(expression, context);
-        assert!(evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
-        assert!(evaluation.may_be_null());
-    }
-
-    #[test]
-    fn a_5_672_term_or_chain_evaluates_on_a_small_stack() {
-        let terms = DEPTH;
-        let mut expression = column("c0");
-        for i in 1..terms {
-            expression = Expr::BinaryOp {
-                left: Box::new(expression),
-                op: BinaryOperator::Or,
-                right: Box::new(column(&format!("c{i}"))),
-            };
-        }
-        let mut context = ColumnContext::new();
-        for i in 0..terms {
-            context = context.with_column(&format!("c{i}"), boolean_unknown());
-        }
-        let evaluation = on_small_stack(expression, context);
-        assert!(evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
-        assert!(evaluation.may_be_null());
     }
 
     #[test]
