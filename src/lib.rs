@@ -12,6 +12,7 @@ mod dialect;
 mod domain;
 mod forward;
 mod guarantees;
+mod postgres;
 mod scalar;
 mod support;
 #[cfg(test)]
@@ -28,5 +29,6 @@ pub use forward::{
     fold::{Comparison, RowKinds},
 };
 pub use guarantees::{Guarantees, Subject};
+pub use postgres::PostgreSqlOptions;
 pub use scalar::{ScalarType, TextRules};
 pub use sql_values;

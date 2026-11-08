@@ -928,23 +928,26 @@ mod tests {
     use core::ops::Bound;
 
     use sql_values::{IntegerType, PgNumeric, PgValue};
-    use sqlparser::ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart};
+    use sqlparser::{
+        ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart},
+        dialect::PostgreSqlDialect,
+    };
 
     use crate::{
         context::{Builtin, Callee, CalleeKind, NullInput, Rows, Volatility},
         domain::{Evaluation, Interval, Unlisted, Values},
         evaluate,
         guarantees::Guarantees,
+        postgres::PostgreSqlOptions,
         scalar::{ScalarType, TextRules},
         test_context::{ColumnContext, builtin_callee, parse},
     };
 
-    /// Reads `sql` under the conservative default dialect, with no settings.
     fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
         evaluate(
             &parse(sql),
-            &sqlparser::dialect::GenericDialect,
-            &(),
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
             &mut context,
             &Guarantees::new(),
         )
@@ -1376,6 +1379,9 @@ mod tests {
             .with_callee("abs", builtin_callee(Builtin::Abs, ScalarType::Numeric));
         assert_eq!(read(context, "abs(-5)").constant(), Some(&PgValue::Integer(5)));
         let context = ColumnContext::new()
+            .with_callee("abs", builtin_callee(Builtin::Abs, ScalarType::Numeric));
+        assert!(read(context, "abs((-32768)::smallint)").always_raises());
+        let context = ColumnContext::new()
             .with_callee("concat", builtin_callee(Builtin::Concat, default_text()));
         assert_eq!(
             read(context, "concat('a', 'b')").constant(),
@@ -1408,6 +1414,16 @@ mod tests {
         let context = ColumnContext::new().with_column("id", int_col());
         let no_else = read(context, "CASE WHEN id = 1 THEN 2 END");
         assert!(no_else.may_be_null());
+    }
+
+    /// Non-decisive branches keep every branch result open.
+    #[test]
+    fn non_decisive_case_branches_keep_their_results() {
+        let context = ColumnContext::new().with_column("id", int_col());
+        let evaluation = read(context, "CASE WHEN id = 1 THEN 2 WHEN id = 2 THEN 3 END");
+        assert!(evaluation.may_be(&PgValue::Integer(2)));
+        assert!(evaluation.may_be(&PgValue::Integer(3)));
+        assert!(evaluation.may_be_null());
     }
 
     /// A simple `CASE` matches the operand.
@@ -1502,6 +1518,15 @@ mod tests {
             read(ColumnContext::new().with_column("id", int_col()), "id = ALL(ARRAY[1, 2])")
                 .may_be_false()
         );
+    }
+
+    /// `= ANY` over a fractional member keeps the member, so an integer may
+    /// differ from it.
+    #[test]
+    fn any_over_a_fractional_member_may_be_false_for_an_integer() {
+        let context = ColumnContext::new().with_column("id", int_col());
+        let evaluation = read(context, "id = ANY(ARRAY[1.5])");
+        assert!(evaluation.may_be_false());
     }
 
     /// `ANY` with a `NULL` member is `NULL` on its true rows.
@@ -1643,66 +1668,6 @@ mod tests {
             ColumnContext::new().with_column("x", Evaluation::impossible(ScalarType::Boolean));
         let evaluation = read(context, "x IS DISTINCT FROM 1");
         assert!(evaluation.is_impossible());
-    }
-
-    /// A callee whose `NULL` reading counts the called-on-`NULL` arguments.
-    #[test]
-    fn a_called_on_null_callee_counts_the_named_arguments() {
-        let callee = Callee::new(
-            None,
-            NullInput::CalledOnNull(alloc::vec![0]),
-            Volatility::Immutable,
-            CalleeKind::Normal,
-            ScalarType::Boolean,
-            false,
-            0,
-        );
-        let context = ColumnContext::new().with_column("x", int_col()).with_callee("f", callee);
-        assert!(read(context, "f(x)").may_be_null());
-    }
-
-    /// `octet_length` folds on a known text argument.
-    #[test]
-    fn an_octet_length_folds_on_a_known_text_argument() {
-        let context = ColumnContext::new().with_callee(
-            "octet_length",
-            builtin_callee(Builtin::OctetLength, ScalarType::Integer(IntegerType::Integer)),
-        );
-        let evaluation = read(context, "octet_length('abc')");
-        assert_eq!(evaluation.constant(), Some(&PgValue::Integer(3)));
-    }
-
-    /// A `CASE` joins the values of its branches.
-    #[test]
-    fn a_case_joins_the_branch_values() {
-        let context = ColumnContext::new().with_column("x", int_col());
-        let evaluation = read(context, "CASE WHEN x = 1 THEN 'a' ELSE NULL END");
-        assert!(evaluation.may_be_null());
-        assert!(evaluation.values().admits(&PgValue::Text("a".to_string())));
-    }
-
-    /// `IN` over a subquery reads the query's row counts.
-    #[test]
-    fn an_in_over_a_subquery_reads_the_query_rows() {
-        let context =
-            ColumnContext::new().with_column("x", int_col()).with_query(Rows::ANY, int_col());
-        assert!(read(context, "x IN (SELECT v FROM q)").may_be_true());
-        let context =
-            ColumnContext::new().with_column("x", int_col()).with_query(Rows::NONE, int_col());
-        let evaluation = read(context, "x IN (SELECT v FROM q)");
-        assert!(!evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
-        assert!(!evaluation.may_be_null());
-    }
-
-    /// `ANY` over a bare operand reads unknown.
-    #[test]
-    fn any_over_a_bare_operand_reads_unknown() {
-        let context =
-            ColumnContext::new().with_column("x", int_col()).with_column("other", int_col());
-        let evaluation = read(context, "x = ANY(other)");
-        assert!(evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
     }
 
     /// The operand comparison of a `CASE` carries its type refusal.

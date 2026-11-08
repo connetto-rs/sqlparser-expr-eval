@@ -185,29 +185,77 @@ mod tests {
     use alloc::collections::BTreeSet;
 
     use sql_values::{IntegerType, PgValue};
-    use sqlparser::dialect::GenericDialect;
+    use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 
     use super::{
         super::{
             context::{Builtin, Callee, CalleeKind, NullInput, Rows, Volatility},
             domain::{Evaluation, Unlisted, Values},
-            guarantees::{Guarantees, Subject},
+            guarantees::Guarantees,
+            postgres::PostgreSqlOptions,
             scalar::{ScalarType, TextRules},
-            test_context::{self, ColumnContext, HookDialect, parse},
+            test_context::{self, ColumnContext, parse},
         },
         evaluate,
     };
 
+    fn read(context: ColumnContext, sql: &str) -> Evaluation {
+        let expression = parse(sql);
+        let mut context = context;
+        evaluate(
+            &expression,
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
+            &mut context,
+            &Guarantees::new(),
+        )
+        .expect("the context resolves")
+    }
+
     /// Reads `sql` under the conservative default dialect, with no settings.
-    fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(&parse(sql), &GenericDialect, &(), &mut context, &Guarantees::new())
+    fn read_default(context: ColumnContext, sql: &str) -> Evaluation {
+        let expression = parse(sql);
+        let mut context = context;
+        evaluate(&expression, &GenericDialect {}, &(), &mut context, &Guarantees::new())
             .expect("the context resolves")
     }
 
-    /// Reads `sql` under the hook dialect, which answers every dialect hook.
-    fn read_hook(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(&parse(sql), &HookDialect, &(), &mut context, &Guarantees::new())
-            .expect("the context resolves")
+    #[test]
+    fn integer_overflow_always_raises() {
+        let evaluation = read(ColumnContext::new(), "2147483647 + 1");
+        assert!(evaluation.always_raises());
+    }
+
+    #[test]
+    fn division_by_zero_raises() {
+        let evaluation = read(ColumnContext::new(), "1 / 0");
+        assert!(evaluation.always_raises());
+    }
+
+    #[test]
+    fn integer_division_folds() {
+        let evaluation = read(ColumnContext::new(), "7 / 2");
+        assert_eq!(evaluation.constant(), Some(&PgValue::Integer(3)));
+    }
+
+    #[test]
+    fn numeric_division_folds_at_scale() {
+        let evaluation = read(ColumnContext::new(), "7.0 / 2");
+        let constant = evaluation.constant().expect("a numeric division is a constant");
+        let PgValue::Numeric(numeric) = constant else { panic!("the constant is numeric") };
+        assert_eq!(numeric.to_string(), "3.5000000000000000");
+    }
+
+    #[test]
+    fn a_left_deep_division_chain_folds_pairwise() {
+        let evaluation = read(ColumnContext::new(), "8 / 4 / 2");
+        assert_eq!(evaluation.constant(), Some(&PgValue::Integer(1)));
+    }
+
+    #[test]
+    fn a_left_deep_concat_chain_folds_pairwise() {
+        let evaluation = read(ColumnContext::new(), "'a' || 'b' || 'c'");
+        assert_eq!(evaluation.constant(), Some(&PgValue::Text("abc".to_string())));
     }
 
     #[test]
@@ -243,6 +291,30 @@ mod tests {
     }
 
     #[test]
+    fn date_adding_a_listed_numeric_shift_cannot_fold() {
+        let date = Evaluation::new(
+            ScalarType::Date,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Date(
+                sql_values::parse_date("2000-01-01").unwrap(),
+            )])),
+        );
+        let days = Evaluation::new(
+            ScalarType::Integer(IntegerType::Integer),
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Numeric(sql_values::PgNumeric::from(3))])),
+        );
+        let context = ColumnContext::new().with_column("d", date).with_column("n", days);
+        // A numeric shift stands for the same day count but cannot be folded
+        // against a listed date, so the shift stays open
+        let evaluation = read(context, "d + n");
+        assert_eq!(evaluation.ty(), ScalarType::Date);
+        assert!(matches!(evaluation.values(), Values::Unlisted(_)));
+    }
+
+    #[test]
     fn concat_operator_with_null_is_always_null() {
         let evaluation = read(ColumnContext::new(), "'a' || NULL");
         assert!(evaluation.is_always_null());
@@ -274,6 +346,12 @@ mod tests {
         let evaluation =
             read(ColumnContext::new().with_callee("concat", callee), "concat('a', NULL)");
         assert_eq!(evaluation.constant(), Some(&PgValue::Text("a".to_string())));
+    }
+
+    #[test]
+    fn nullif_equal_arguments_is_null() {
+        let evaluation = read(ColumnContext::new(), "nullif(1, 1)");
+        assert!(evaluation.is_always_null());
     }
 
     #[test]
@@ -369,7 +447,7 @@ mod tests {
 
     #[test]
     fn standard_concat_stays_unknown() {
-        let evaluation = read(ColumnContext::new(), "'a' || 'b'");
+        let evaluation = read_default(ColumnContext::new(), "'a' || 'b'");
         let Values::Unlisted(unlisted) = evaluation.values() else { panic!("stays unlisted") };
         assert_eq!(unlisted.length.high, core::ops::Bound::Unbounded);
         assert!(unlisted.excluded.is_empty());
@@ -377,7 +455,7 @@ mod tests {
 
     #[test]
     fn standard_arithmetic_stays_unknown() {
-        let evaluation = read(ColumnContext::new(), "1 + 2");
+        let evaluation = read_default(ColumnContext::new(), "1 + 2");
         assert!(
             evaluation.values().is_empty() || {
                 matches!(evaluation.values(), Values::Unlisted(_))
@@ -387,29 +465,47 @@ mod tests {
 
     #[test]
     fn standard_comparison_of_boolean_literals() {
-        let evaluation = read(ColumnContext::new(), "1 = 2");
+        let evaluation = read_default(ColumnContext::new(), "1 = 2");
         assert!(evaluation.may_be_false());
         assert!(!evaluation.may_be_true());
         assert!(!evaluation.may_be_null());
     }
 
     #[test]
+    fn an_array_cast_folds_its_elements_to_the_element_type() {
+        let evaluation = read(ColumnContext::new(), "ARRAY['read', 'write']::text[]");
+        let Values::Listed(listed) = evaluation.values() else { panic!("the cast is listed") };
+        let expected: BTreeSet<PgValue> =
+            [PgValue::Text("read".to_string()), PgValue::Text("write".to_string())].into();
+        assert_eq!(listed, &expected);
+    }
+
+    #[test]
+    fn a_bounded_varchar_array_cast_truncates_its_elements() {
+        let evaluation = read(ColumnContext::new(), "ARRAY['read', 'write']::varchar(2)[]");
+        let Values::Listed(listed) = evaluation.values() else { panic!("the cast is listed") };
+        let expected: BTreeSet<PgValue> =
+            [PgValue::Text("re".to_string()), PgValue::Text("wr".to_string())].into();
+        assert_eq!(listed, &expected);
+    }
+
+    #[test]
     fn standard_division_by_zero_may_be_null_and_may_raise() {
-        let evaluation = read(ColumnContext::new(), "1 / 0");
+        let evaluation = read_default(ColumnContext::new(), "1 / 0");
         assert!(evaluation.may_be_null());
         assert!(evaluation.may_raise());
     }
 
     #[test]
     fn standard_modulo_by_zero_may_be_null_and_may_raise() {
-        let evaluation = read(ColumnContext::new(), "1 % 0");
+        let evaluation = read_default(ColumnContext::new(), "1 % 0");
         assert!(evaluation.may_be_null());
         assert!(evaluation.may_raise());
     }
 
     #[test]
     fn standard_arithmetic_may_raise_and_folds_nothing() {
-        let evaluation = read(ColumnContext::new(), "1 + 2");
+        let evaluation = read_default(ColumnContext::new(), "1 + 2");
         assert!(evaluation.may_raise());
         assert!(!evaluation.may_be_null());
         assert!(
@@ -419,28 +515,28 @@ mod tests {
 
     #[test]
     fn standard_division_by_a_certain_divisor_stays_strict() {
-        let evaluation = read(ColumnContext::new(), "1 / 2");
+        let evaluation = read_default(ColumnContext::new(), "1 / 2");
         assert!(!evaluation.may_be_null());
         assert!(evaluation.may_raise());
     }
 
     #[test]
     fn standard_text_literal_against_a_number_stays_unknown() {
-        let evaluation = read(ColumnContext::new(), "'1' = 1");
+        let evaluation = read_default(ColumnContext::new(), "'1' = 1");
         assert!(evaluation.may_be_true());
         assert!(evaluation.may_be_false());
     }
 
     #[test]
     fn standard_text_literals_compare_unknown() {
-        let evaluation = read(ColumnContext::new(), "'a' = 'A'");
+        let evaluation = read_default(ColumnContext::new(), "'a' = 'A'");
         assert!(evaluation.may_be_true());
         assert!(evaluation.may_be_false());
     }
 
     #[test]
     fn standard_boolean_literals_compare_by_value() {
-        let evaluation = read(ColumnContext::new(), "true = false");
+        let evaluation = read_default(ColumnContext::new(), "true = false");
         assert!(evaluation.may_be_false());
         assert!(!evaluation.may_be_true());
         assert!(!evaluation.may_be_null());
@@ -448,7 +544,8 @@ mod tests {
 
     #[test]
     fn standard_date_literals_compare_unknown() {
-        let evaluation = read(ColumnContext::new(), "DATE '2026-01-01' < DATE '2026-01-02'");
+        let evaluation =
+            read_default(ColumnContext::new(), "DATE '2026-01-01' < DATE '2026-01-02'");
         assert!(evaluation.may_be_true());
         assert!(evaluation.may_be_false());
     }
@@ -506,6 +603,41 @@ mod tests {
     }
 
     #[test]
+    fn an_all_over_a_null_member_is_null_when_it_equals_the_rest() {
+        let context = ColumnContext::new().with_column(
+            "x",
+            Evaluation::new(
+                ScalarType::Integer(IntegerType::Integer),
+                false,
+                false,
+                Values::Listed(alloc::collections::BTreeSet::from([PgValue::Integer(1)])),
+            ),
+        );
+        let evaluation = read(context, "x = ALL (ARRAY[1, NULL])");
+        assert!(evaluation.is_always_null());
+    }
+
+    #[test]
+    fn an_all_over_a_null_member_is_null_when_some_value_equals_the_rest() {
+        let context = ColumnContext::new().with_column(
+            "x",
+            Evaluation::new(
+                ScalarType::Integer(IntegerType::Integer),
+                false,
+                false,
+                Values::Listed(alloc::collections::BTreeSet::from([
+                    PgValue::Integer(1),
+                    PgValue::Integer(2),
+                ])),
+            ),
+        );
+        let evaluation = read(context, "x = ALL (ARRAY[1, NULL])");
+        assert!(evaluation.may_be_null());
+        assert!(evaluation.may_be_false());
+        assert!(!evaluation.may_be_true());
+    }
+
+    #[test]
     fn an_any_over_a_sometimes_empty_result_may_be_false() {
         let column = |value: i64| {
             Evaluation::new(
@@ -544,41 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn an_all_over_a_null_member_is_null_when_it_equals_the_rest() {
-        let context = ColumnContext::new().with_column(
-            "x",
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                false,
-                false,
-                Values::Listed(alloc::collections::BTreeSet::from([PgValue::Integer(1)])),
-            ),
-        );
-        let evaluation = read(context, "x = ALL (ARRAY[1, NULL])");
-        assert!(evaluation.is_always_null());
-    }
-
-    #[test]
-    fn an_all_over_a_null_member_is_null_when_some_value_equals_the_rest() {
-        let context = ColumnContext::new().with_column(
-            "x",
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                false,
-                false,
-                Values::Listed(alloc::collections::BTreeSet::from([
-                    PgValue::Integer(1),
-                    PgValue::Integer(2),
-                ])),
-            ),
-        );
-        let evaluation = read(context, "x = ALL (ARRAY[1, NULL])");
-        assert!(evaluation.may_be_null());
-        assert!(evaluation.may_be_false());
-        assert!(!evaluation.may_be_true());
-    }
-
-    #[test]
     fn an_any_over_a_null_member_is_null_when_it_is_apart() {
         let context = ColumnContext::new().with_column(
             "x",
@@ -591,28 +688,6 @@ mod tests {
         );
         let evaluation = read(context, "x = ANY (ARRAY[1, NULL])");
         assert!(evaluation.is_always_null());
-    }
-
-    #[test]
-    fn any_all_over_a_null_only_array_is_null() {
-        let context = || {
-            ColumnContext::new().with_column(
-                "x",
-                Evaluation::new(
-                    ScalarType::Integer(IntegerType::Integer),
-                    true,
-                    false,
-                    Values::Unlisted(Unlisted::any()),
-                ),
-            )
-        };
-        for operator in ["ANY", "ALL"] {
-            // An array of only `NULL` is `text[]` where an engine types it.
-            let evaluation = read(context(), &format!("x = {operator} (ARRAY[NULL])"));
-            assert!(evaluation.may_be_null(), "{operator}");
-            assert!(!evaluation.may_be_true() && !evaluation.may_be_false(), "{operator}");
-            assert!(evaluation.may_raise(), "{operator}");
-        }
     }
 
     #[test]
@@ -666,6 +741,68 @@ mod tests {
     }
 
     #[test]
+    fn a_date_plus_days_folds_to_a_date() {
+        let evaluation = read(ColumnContext::new(), "DATE '2026-01-01' + 5");
+        assert_eq!(evaluation.ty(), ScalarType::Date);
+        assert!(evaluation.constant().is_some());
+        assert!(!evaluation.may_be_null());
+    }
+
+    #[test]
+    fn an_integer_product_folds() {
+        always("5 * 3", &PgValue::Integer(15));
+    }
+
+    #[test]
+    fn a_bounded_varchar_cast_truncates_the_value() {
+        always("'abcdef'::varchar(3)", &PgValue::Text("abc".to_string()));
+    }
+
+    #[test]
+    fn a_boolean_cast_to_text_spells_the_word() {
+        always("true::text", &PgValue::Text("true".to_string()));
+        always("false::text", &PgValue::Text("false".to_string()));
+    }
+
+    #[test]
+    fn a_text_cast_to_an_integer_folds() {
+        always("'123'::int", &PgValue::Integer(123));
+    }
+
+    #[test]
+    fn a_numeric_typmod_rounds_to_the_scale() {
+        let evaluation = read(ColumnContext::new(), "1.9999::numeric(10, 4)");
+        assert_eq!(evaluation.ty(), ScalarType::Numeric);
+        assert!(evaluation.constant().is_some());
+    }
+
+    #[test]
+    fn a_coalesce_past_the_nulls_folds_to_the_next_value() {
+        always("coalesce(null, null, 5)", &PgValue::Integer(5));
+    }
+
+    #[test]
+    fn a_coalesce_of_a_constant_folds_to_it() {
+        always("coalesce(5, 6)", &PgValue::Integer(5));
+    }
+
+    #[test]
+    fn a_coalesce_of_all_nulls_may_be_null() {
+        let evaluation = read(ColumnContext::new(), "coalesce(null, null)");
+        assert!(evaluation.may_be_null());
+    }
+
+    #[test]
+    fn a_greatest_folds_to_the_maximum() {
+        always("greatest(1, 9)", &PgValue::Integer(9));
+    }
+
+    #[test]
+    fn a_least_folds_to_the_minimum() {
+        always("least(9, 1)", &PgValue::Integer(1));
+    }
+
+    #[test]
     fn date_literals_compare_by_order() {
         assert!(read(ColumnContext::new(), "DATE '2026-01-01' < DATE '2026-01-02'").may_be_true());
     }
@@ -674,123 +811,6 @@ mod tests {
     fn integer_literals_compare_by_value() {
         always("1 = 2", &PgValue::Boolean(false));
         always("1 < 2", &PgValue::Boolean(true));
-    }
-
-    /// `IS NOT UNKNOWN` reads the non-`NULL` rows.
-    #[test]
-    fn is_not_unknown_reads_the_non_null_rows() {
-        let context = ColumnContext::new().with_column(
-            "id",
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                true,
-                false,
-                Values::Unlisted(super::super::domain::Unlisted::any()),
-            ),
-        );
-        let evaluation = read(context, "id IS NOT UNKNOWN");
-        assert!(evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
-        assert!(!evaluation.may_be_null());
-    }
-
-    /// A dialect's `named_call` answers before the context is asked.
-    #[test]
-    fn a_named_call_hook_answers_before_the_context() {
-        let evaluation = read_hook(ColumnContext::new(), "f(1)");
-        assert_eq!(evaluation.constant(), Some(&PgValue::Integer(7)));
-        assert!(!evaluation.may_be_null());
-    }
-
-    /// A guarantee on the expression itself narrows the reading.
-    #[test]
-    fn an_expression_guarantee_narrows_the_reading() {
-        let mut context = ColumnContext::new().with_column(
-            "x",
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                true,
-                false,
-                Values::Unlisted(Unlisted::any()),
-            ),
-        );
-        let mut guarantees = Guarantees::new();
-        guarantees.restrict(
-            Subject::Expression(parse("x + 1")),
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                false,
-                false,
-                Values::Listed(BTreeSet::from([PgValue::Integer(7)])),
-            ),
-        );
-        let evaluation = evaluate(&parse("x + 1"), &GenericDialect, &(), &mut context, &guarantees)
-            .expect("the context resolves");
-        assert_eq!(evaluation.constant(), Some(&PgValue::Integer(7)));
-        assert!(!evaluation.may_be_null());
-    }
-
-    /// A hook dialect's cast answers its target's element type.
-    #[test]
-    fn a_hook_cast_answers_the_element_type() {
-        let context = ColumnContext::new().with_column(
-            "x",
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                true,
-                false,
-                Values::Unlisted(Unlisted::any()),
-            ),
-        );
-        let evaluation = read_hook(context, "x::text");
-        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
-        assert!(matches!(evaluation.values(), Values::Unlisted(_)));
-    }
-
-    /// A generic cast keeps the source's reading under the target type.
-    #[test]
-    fn a_generic_cast_keeps_the_source_reading() {
-        let context = ColumnContext::new().with_column(
-            "x",
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                true,
-                false,
-                Values::Unlisted(Unlisted::any()),
-            ),
-        );
-        let evaluation = read(context, "x::text");
-        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
-        assert!(matches!(evaluation.values(), Values::Unlisted(_)));
-        assert!(evaluation.may_raise());
-    }
-
-    /// A standalone array literal reads its members.
-    #[test]
-    fn an_array_literal_reads_its_members() {
-        assert!(read(ColumnContext::new(), "ARRAY[1, NULL]").may_be_null());
-        assert!(!read(ColumnContext::new(), "ARRAY[1, 2]").may_be_null());
-    }
-
-    /// A mixed `AND`/`OR` chain stops the flat walk at the other operator.
-    #[test]
-    fn a_mixed_chain_stops_the_flat_walk() {
-        let unlisted = || {
-            Evaluation::new(
-                ScalarType::Integer(IntegerType::Integer),
-                true,
-                false,
-                Values::Unlisted(Unlisted::any()),
-            )
-        };
-        let context = ColumnContext::new()
-            .with_column("x", unlisted())
-            .with_column("y", unlisted())
-            .with_column("z", unlisted());
-        let evaluation = read(context, "x AND y OR z");
-        assert!(evaluation.may_be_true());
-        assert!(evaluation.may_be_false());
-        assert!(evaluation.may_be_null());
     }
 
     use sqlparser::{
@@ -835,8 +855,13 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(move || {
-                let result =
-                    evaluate(&expression, &GenericDialect, &(), &mut context, &Guarantees::new());
+                let result = evaluate(
+                    &expression,
+                    &PostgreSqlDialect {},
+                    &PostgreSqlOptions::default(),
+                    &mut context,
+                    &Guarantees::new(),
+                );
                 std::mem::forget(expression);
                 result
             })

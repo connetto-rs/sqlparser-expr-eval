@@ -52,7 +52,7 @@ impl ColumnContext {
     /// The context whose nested query projects `column` over `rows`.
     #[must_use]
     pub fn with_query(mut self, rows: Rows, column: Evaluation) -> Self {
-        self.query = Some(QueryEvaluation::new(rows, Some(vec![column]), false));
+        self.query = Some(QueryEvaluation { rows, columns: Some(vec![column]), error: false });
         self
     }
 
@@ -140,103 +140,28 @@ pub fn parse_statement(statement: &str) -> Expr {
 
 /// A callee that returns `returns` and is strict.
 pub fn strict_callee(returns: ScalarType) -> Callee {
-    Callee::new(
-        None,
-        super::context::NullInput::Strict,
-        Volatility::Immutable,
-        super::context::CalleeKind::Normal,
+    Callee {
+        builtin: None,
+        null_input: super::context::NullInput::Strict,
+        volatility: Volatility::Immutable,
+        kind: super::context::CalleeKind::Normal,
         returns,
-        false,
-        0,
-    )
-}
-
-/// A dialect that answers the dialect's hooks with fixed readings, so a
-/// test can stand the dialect's answers instead of the default bodies.
-pub struct HookDialect;
-
-impl crate::dialect::EvalDialect for HookDialect {
-    type Options = ();
-
-    fn concat(
-        &self,
-        _left: &crate::domain::Evaluation,
-        _right: &crate::domain::Evaluation,
-        _options: &(),
-    ) -> Option<crate::domain::Evaluation> {
-        Some(crate::domain::Evaluation::known(
-            sql_values::PgValue::Text("folded".to_string()),
-            crate::scalar::ScalarType::Text(crate::scalar::TextRules::DEFAULT),
-        ))
-    }
-
-    fn unary_plus_preserves(&self, _inner: &crate::domain::Evaluation, _options: &()) -> bool {
-        true
-    }
-
-    fn named_call(
-        &self,
-        _name: &str,
-        _arguments: &[crate::domain::Evaluation],
-        _options: &(),
-    ) -> Option<crate::domain::Evaluation> {
-        Some(crate::domain::Evaluation::known(
-            sql_values::PgValue::Integer(7),
-            crate::scalar::ScalarType::Integer(sql_values::IntegerType::Integer),
-        ))
-    }
-
-    fn cast(
-        &self,
-        source: crate::domain::Evaluation,
-        _kind: &sqlparser::ast::CastKind,
-        data_type: &sqlparser::ast::DataType,
-        to: crate::scalar::ScalarType,
-        element_type: impl Fn(&sqlparser::ast::DataType) -> crate::scalar::ScalarType,
-        _options: &(),
-    ) -> crate::domain::Evaluation {
-        let _element = element_type(data_type);
-        let error = source.may_raise() || to != source.ty();
-        source
-            .with_type(to)
-            .with_values(crate::domain::Values::Unlisted(crate::domain::Unlisted::any()))
-            .with_error(error)
-    }
-
-    fn null_equals_operand<'a>(
-        &self,
-        left: &'a sqlparser::ast::Expr,
-        right: &'a sqlparser::ast::Expr,
-        _options: &(),
-    ) -> Option<&'a sqlparser::ast::Expr> {
-        let is_null_literal = |expression: &sqlparser::ast::Expr| {
-            matches!(
-                expression,
-                sqlparser::ast::Expr::Value(value)
-                    if matches!(value.value, sqlparser::ast::Value::Null)
-            )
-        };
-        if is_null_literal(right) {
-            Some(left)
-        } else if is_null_literal(left) {
-            Some(right)
-        } else {
-            None
-        }
+        returns_set: false,
+        token: 0,
     }
 }
 
 /// A callee that folds the built-in `builtin` and returns `returns`.
 pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
-    Callee::new(
-        Some(builtin),
-        super::context::NullInput::Strict,
-        Volatility::Immutable,
-        super::context::CalleeKind::Normal,
+    Callee {
+        builtin: Some(builtin),
+        null_input: super::context::NullInput::Strict,
+        volatility: Volatility::Immutable,
+        kind: super::context::CalleeKind::Normal,
         returns,
-        false,
-        0,
-    )
+        returns_set: false,
+        token: 0,
+    }
 }
 
 #[cfg(test)]
@@ -247,7 +172,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{dialect::EvalDialect, domain::Values};
+    use crate::domain::Values;
 
     fn expect_panic(statement: &str, message: &str) {
         let result = std::panic::catch_unwind(|| parse_statement(statement));
@@ -354,16 +279,5 @@ mod tests {
             builtin_callee(Builtin::Upper, ScalarType::Text(crate::TextRules::DEFAULT)).builtin,
             Some(Builtin::Upper)
         );
-    }
-
-    #[test]
-    fn the_null_equals_hook_reads_either_side() {
-        let dialect = HookDialect;
-        let x = Expr::Identifier(sqlparser::ast::Ident::new("x"));
-        let null = Expr::Value(sqlparser::ast::Value::Null.into());
-        assert!(matches!(dialect.null_equals_operand(&x, &null, &()), Some(&Expr::Identifier(_))));
-        assert!(matches!(dialect.null_equals_operand(&null, &x, &()), Some(&Expr::Identifier(_))));
-        let y = Expr::Identifier(sqlparser::ast::Ident::new("y"));
-        assert!(dialect.null_equals_operand(&x, &y, &()).is_none());
     }
 }

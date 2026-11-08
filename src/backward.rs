@@ -1781,11 +1781,12 @@ fn numeric_bound(bound: &Bound<PgNumeric>) -> Bound<u64> {
 #[cfg(test)]
 mod tests {
     use sql_values::IntegerType;
-    use sqlparser::dialect::GenericDialect;
+    use sqlparser::dialect::PostgreSqlDialect;
 
     use super::*;
     use crate::{
         Builtin, Guarantees, Outcomes, Rows, ScalarType, TextRules, Values,
+        postgres::PostgreSqlOptions,
         test_context::{ColumnContext, parse, strict_callee},
     };
 
@@ -1814,8 +1815,15 @@ mod tests {
         outcomes: Outcomes,
     ) -> Guarantees<String> {
         let mut context = context;
-        implied(expression, outcomes, &GenericDialect, &(), &mut context, &Guarantees::new())
-            .expect("the context resolves")
+        implied(
+            expression,
+            outcomes,
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
+            &mut context,
+            &Guarantees::new(),
+        )
+        .expect("the context resolves")
     }
 
     fn column<'a>(guarantees: &'a Guarantees<String>, name: &str) -> &'a Evaluation {
@@ -1828,81 +1836,6 @@ mod tests {
     /// nullable.
     fn nullable(guarantees: &Guarantees<String>, name: &str) -> bool {
         guarantees.reference(&name.to_string()).is_none_or(Evaluation::may_be_null)
-    }
-
-    /// A dialect that reads `= NULL` as `IS NULL` on either side.
-    struct ReadsNullEquals;
-
-    impl EvalDialect for ReadsNullEquals {
-        type Options = ();
-
-        fn null_equals_operand<'a>(
-            &self,
-            left: &'a Expr,
-            right: &'a Expr,
-            _options: &Self::Options,
-        ) -> Option<&'a Expr> {
-            let null_literal = |expr: &Expr| {
-                matches!(
-                    support::unnest(expr),
-                    Expr::Value(value) if matches!(value.value, Value::Null)
-                )
-            };
-            if null_literal(right) {
-                Some(left)
-            } else if null_literal(left) {
-                Some(right)
-            } else {
-                None
-            }
-        }
-    }
-
-    /// The guarantees `expression` takes `outcomes` under with a dialect
-    /// that reads `= NULL` as `IS NULL`.
-    fn implied_null_equals(
-        context: ColumnContext,
-        expression: &Expr,
-        outcomes: Outcomes,
-    ) -> Guarantees<String> {
-        let mut context = context;
-        implied(expression, outcomes, &ReadsNullEquals, &(), &mut context, &Guarantees::new())
-            .expect("the context resolves")
-    }
-
-    /// A dialect that reads a cast of an array as the array's own members.
-    struct FoldsArrayCasts;
-
-    impl EvalDialect for FoldsArrayCasts {
-        type Options = ();
-
-        fn cast(
-            &self,
-            source: Evaluation,
-            _kind: &CastKind,
-            _data_type: &DataType,
-            _to: ScalarType,
-            _element_type: impl Fn(&DataType) -> ScalarType,
-            _options: &Self::Options,
-        ) -> Evaluation {
-            let Values::Listed(listed) = source.values() else {
-                return source;
-            };
-            // An array cast is the folded members, never a `NULL` array.
-            Evaluation::new(source.ty(), false, source.may_raise(), Values::Listed(listed.clone()))
-        }
-    }
-
-    /// The guarantees `expression` takes `outcomes` under with a dialect
-    /// that folds a cast of an array to the array's own members.
-    fn implied_folding_casts(
-        context: ColumnContext,
-        expression: &Expr,
-        outcomes: Outcomes,
-    ) -> Guarantees<String> {
-        let mut context = context;
-        implied(expression, outcomes, &FoldsArrayCasts, &(), &mut context, &Guarantees::new())
-            .expect("the context resolves")
     }
 
     #[test]
@@ -1971,7 +1904,7 @@ mod tests {
     #[test]
     fn length_not_false_bounds_the_length() {
         let expression = parse("length(x) <= 10");
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("length", length_callee()),
@@ -1988,7 +1921,7 @@ mod tests {
     #[test]
     fn length_bounds_not_false_is_impossible_for_never_null() {
         let expression = parse("length(x) < 3 AND length(x) > 10");
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", plain_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("length", length_callee()),
@@ -1997,7 +1930,7 @@ mod tests {
         );
         assert!(guarantees.is_impossible());
 
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("length", length_callee()),
@@ -2144,6 +2077,39 @@ mod tests {
         );
         let x = column(&guarantees, "x");
         assert!(!x.may_be_null());
+    }
+
+    #[test]
+    fn a_text_cast_passes_the_restriction_to_the_column() {
+        let expression = parse("(v)::text = 'read'::text");
+        let guarantees = implied_with(
+            ColumnContext::new()
+                .with_column("v", unknown_column(ScalarType::Text(TextRules::DEFAULT))),
+            &expression,
+            Outcomes::TRUE,
+        );
+        let v = column(&guarantees, "v");
+        assert!(!v.may_be_null());
+        let Values::Listed(listed) = v.values() else { panic!("v is listed") };
+        let expected: BTreeSet<PgValue> = [PgValue::Text("read".to_string())].into();
+        assert_eq!(listed, &expected);
+    }
+
+    #[test]
+    fn a_cast_array_lists_its_folded_members() {
+        let expression = parse("v = ANY ((ARRAY['read', 'write'])::varchar(2)[])");
+        let guarantees = implied_with(
+            ColumnContext::new()
+                .with_column("v", unknown_column(ScalarType::Text(TextRules::DEFAULT))),
+            &expression,
+            Outcomes::TRUE,
+        );
+        let v = column(&guarantees, "v");
+        assert!(!v.may_be_null());
+        let Values::Listed(listed) = v.values() else { panic!("v is listed") };
+        let expected: BTreeSet<PgValue> =
+            [PgValue::Text("re".to_string()), PgValue::Text("wr".to_string())].into();
+        assert_eq!(listed, &expected);
     }
 
     #[test]
@@ -2624,6 +2590,25 @@ mod tests {
             .expect("the context resolves")
     }
 
+    /// The guarantees `expression` takes `outcomes` under with
+    /// `transform_null_equals` on.
+    fn implied_null_equals(
+        context: ColumnContext,
+        expression: &Expr,
+        outcomes: Outcomes,
+    ) -> Guarantees<String> {
+        let mut context = context;
+        implied(
+            expression,
+            outcomes,
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions { transform_null_equals: true },
+            &mut context,
+            &Guarantees::new(),
+        )
+        .expect("the context resolves")
+    }
+
     /// The guarantees `sql` takes `outcomes` under over `x` and a query
     /// projecting `v` over `rows`.
     fn quantified_over(
@@ -2749,6 +2734,17 @@ mod tests {
 
     /// PostgreSQL has no `+` for booleans, so the pair raises and the
     /// outcome is ruled out.
+    #[test]
+    fn an_operator_less_binary_op_rules_out_the_outcome() {
+        let guarantees = implied_with(
+            ColumnContext::new()
+                .with_column("x", unknown_column(ScalarType::Boolean))
+                .with_column("y", unknown_column(ScalarType::Boolean)),
+            &parse("x + y"),
+            Outcomes::TRUE,
+        );
+        assert!(guarantees.is_impossible());
+    }
 
     #[test]
     fn a_true_conjunction_makes_both_sides_true() {
@@ -3083,11 +3079,10 @@ mod tests {
         assert!(!column(&guarantees, "x").may_be_null());
     }
 
-    /// The default dialect reads `x = NULL` as `NULL` everywhere, and a
-    /// dialect that reads the form as `x IS NULL` narrows to the null
-    /// subject.
     #[test]
-    fn a_null_equality_reads_the_reading_its_dialect_gives() {
+    fn a_null_equality_reads_as_an_is_null_under_transform_null_equals() {
+        // `x = NULL` is `NULL` everywhere in default PostgreSQL, so `TRUE`
+        // admits nothing.
         let expression = parse("x = NULL");
         let guarantees = implied_with(
             ColumnContext::new().with_column("x", unknown_column(ScalarType::Unknown)),
@@ -3095,6 +3090,7 @@ mod tests {
             Outcomes::TRUE,
         );
         assert!(guarantees.is_impossible());
+        // Under `transform_null_equals` the form reads as `x IS NULL`.
         let guarantees = implied_null_equals(
             ColumnContext::new().with_column("x", unknown_column(ScalarType::Unknown)),
             &expression,
@@ -3107,20 +3103,6 @@ mod tests {
             Outcomes::FALSE,
         );
         assert!(!column(&guarantees, "x").may_be_null());
-        // The dialect reads either side of the equality as the `IS NULL`
-        // subject, and an equality with no `NULL` side as a comparison.
-        let guarantees = implied_null_equals(
-            ColumnContext::new().with_column("x", unknown_column(ScalarType::Unknown)),
-            &parse("NULL = x"),
-            Outcomes::TRUE,
-        );
-        assert!(column(&guarantees, "x").is_always_null());
-        let guarantees = implied_null_equals(
-            ColumnContext::new().with_column("x", unknown_column(ScalarType::Unknown)),
-            &parse("x = y"),
-            Outcomes::TRUE,
-        );
-        assert!(!guarantees.is_impossible());
     }
 
     #[test]
@@ -3779,6 +3761,20 @@ mod tests {
     }
 
     #[test]
+    fn a_cast_array_keeps_the_members_the_cast_folds() {
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("x", unknown_column(ScalarType::Numeric)),
+            &parse("x = ANY ((ARRAY[1])::int[])"),
+            Outcomes::TRUE,
+        );
+        let x = column(&guarantees, "x");
+        assert!(!x.may_be_null());
+        let Values::Listed(listed) = x.values() else { panic!("x is listed") };
+        let expected: BTreeSet<PgValue> = [PgValue::Numeric(PgNumeric::from(1))].into();
+        assert_eq!(listed, &expected);
+    }
+
+    #[test]
     fn a_valueless_cast_array_keeps_only_its_null_outcome() {
         // `(ARRAY[NULL])::text[]` holds no non-`NULL` member.
         let guarantees = implied_with(
@@ -3796,69 +3792,6 @@ mod tests {
         );
         assert!(!guarantees.is_impossible());
         assert!(guarantees.reference(&"x".to_string()).is_none());
-    }
-
-    /// A fold of a cast of an array keeps its members as the subject's
-    /// values, and an empty, non-`NULL` fold reads the empty-set outcomes.
-    #[test]
-    fn a_folded_cast_array_restricts_its_subject() {
-        let context = || {
-            ColumnContext::new()
-                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
-        };
-        let guarantees = implied_folding_casts(
-            context(),
-            &parse("x = ANY ((ARRAY['a', 'b'])::text[])"),
-            Outcomes::TRUE,
-        );
-        let x = column(&guarantees, "x");
-        assert!(!x.may_be_null());
-        let Values::Listed(listed) = x.values() else { panic!("x is listed") };
-        let expected: BTreeSet<PgValue> =
-            [PgValue::Text("a".to_string()), PgValue::Text("b".to_string())].into();
-        assert_eq!(listed, &expected);
-        let guarantees = implied_folding_casts(
-            context(),
-            &parse("x = ANY ((ARRAY[NULL])::text[])"),
-            Outcomes::FALSE,
-        );
-        assert!(!guarantees.is_impossible());
-        assert!(guarantees.reference(&"x".to_string()).is_none());
-        let guarantees = implied_folding_casts(
-            context(),
-            &parse("x = ALL ((ARRAY[NULL])::text[])"),
-            Outcomes::TRUE,
-        );
-        assert!(!guarantees.is_impossible());
-        assert!(guarantees.reference(&"x".to_string()).is_none());
-        let guarantees = implied_folding_casts(
-            context(),
-            &parse("x = ANY ((ARRAY[NULL])::text[])"),
-            Outcomes::TRUE,
-        );
-        assert!(guarantees.is_impossible());
-        let guarantees = implied_folding_casts(
-            context(),
-            &parse("x = ALL ((ARRAY[NULL])::text[])"),
-            Outcomes::FALSE,
-        );
-        assert!(guarantees.is_impossible());
-    }
-
-    /// A cast whose source admits no listed value reads the source itself.
-    #[test]
-    fn a_folding_cast_over_unlisted_values_reads_the_source() {
-        let source = unknown_column(ScalarType::Text(TextRules::DEFAULT));
-        let folded = FoldsArrayCasts.cast(
-            source.clone(),
-            &CastKind::Cast,
-            &DataType::Text,
-            ScalarType::Text(TextRules::DEFAULT),
-            |_| ScalarType::Unknown,
-            &(),
-        );
-        assert!(folded.may_be_null());
-        let Values::Unlisted(_) = folded.values() else { panic!("the source is read as itself") };
     }
 
     #[test]
@@ -3881,6 +3814,20 @@ mod tests {
         );
         assert!(!guarantees.is_impossible());
         assert!(guarantees.reference(&"x".to_string()).is_none());
+    }
+
+    #[test]
+    fn a_pattern_any_reads_as_unsupported() {
+        // PostgreSQL: the pattern `'a'` matches only `'a'`; the crate
+        // models `LIKE` comparison as unsupported, so every outcome reads
+        // as impossible.
+        let guarantees = implied_with(
+            ColumnContext::new()
+                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT))),
+            &parse("x ~~ ANY (ARRAY['a'])"),
+            Outcomes::TRUE,
+        );
+        assert!(guarantees.is_impossible());
     }
 
     /// `~~` is not a value comparison, so the `NULL` outcome of `~~ ANY`
@@ -4458,7 +4405,7 @@ mod tests {
 
     #[test]
     fn a_length_call_null_equality_points_at_the_argument() {
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("length", length_callee()),
@@ -4497,7 +4444,7 @@ mod tests {
             false,
             Values::Listed(BTreeSet::from([value("a"), value("bb")])),
         );
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new().with_column("x", x).with_callee("length", length_callee()),
             &parse("length(x) = 2"),
             Outcomes::TRUE,
@@ -4525,21 +4472,6 @@ mod tests {
         assert!(guarantees.reference(&"x".to_string()).is_none());
     }
 
-    /// A counting dialect's `<>` length admits no single interval, so the
-    /// argument stays unconstrained.
-    #[test]
-    fn a_counting_length_inequality_keeps_no_argument_restriction() {
-        let guarantees = implied_counting(
-            ColumnContext::new()
-                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
-                .with_callee("length", length_callee()),
-            &parse("length(x) <> 5"),
-            Outcomes::TRUE,
-        );
-        assert!(!guarantees.is_impossible());
-        assert!(guarantees.reference(&"x".to_string()).is_none());
-    }
-
     #[test]
     fn a_length_bound_meets_the_known_length_range() {
         let long = Unlisted {
@@ -4553,7 +4485,7 @@ mod tests {
             false,
             Values::Unlisted(long),
         );
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new().with_column("x", x).with_callee("length", length_callee()),
             &parse("length(x) < 10"),
             Outcomes::TRUE,
@@ -4579,7 +4511,7 @@ mod tests {
             false,
             Values::Unlisted(huge),
         );
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new().with_column("x", x).with_callee("length", length_callee()),
             &parse("length(x) <= 10"),
             Outcomes::TRUE,
@@ -4611,7 +4543,7 @@ mod tests {
         // PostgreSQL: a character length below `5.5` is at most `5`; the
         // crate reads a non-integral bound as no character count, keeping
         // the sound open end, while a length is never negative.
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("length", length_callee()),
@@ -4724,6 +4656,30 @@ mod tests {
         );
         assert!(!guarantees.is_impossible());
         assert!(guarantees.reference(&"x".to_string()).is_none());
+    }
+
+    /// An empty cast array reads `FALSE` to `ANY` and `TRUE` to `ALL`, for
+    /// every input.
+    #[test]
+    fn an_empty_cast_array_reads_the_empty_set_outcomes() {
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("x", unknown_column(ScalarType::Numeric)),
+            &parse("x = ANY ((ARRAY[])::numeric[])"),
+            Outcomes::FALSE,
+        );
+        assert!(!guarantees.is_impossible());
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("x", unknown_column(ScalarType::Numeric)),
+            &parse("x = ALL ((ARRAY[])::numeric[])"),
+            Outcomes::TRUE,
+        );
+        assert!(!guarantees.is_impossible());
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("x", unknown_column(ScalarType::Numeric)),
+            &parse("x = ANY ((ARRAY[])::numeric[])"),
+            Outcomes::TRUE,
+        );
+        assert!(guarantees.is_impossible());
     }
 
     /// A `NULL` `IN` with a non-listed member admits a `NULL` subject.
@@ -4896,7 +4852,7 @@ mod tests {
     /// argument.
     #[test]
     fn a_length_on_the_right_bounds_its_argument() {
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("char_length", length_callee()),
@@ -5094,7 +5050,7 @@ mod tests {
     /// A length over a non-text value is impossible to satisfy.
     #[test]
     fn a_length_over_a_non_text_value_is_impossible() {
-        let guarantees = implied_counting(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column(
                     "x",
@@ -5107,8 +5063,89 @@ mod tests {
         assert!(guarantees.is_impossible());
     }
 
+    /// A context that names a text column `x` and reads a `text` cast as
+    /// unknown, like the forward pass does.
+    #[derive(Default)]
+    struct RemappedText;
+
+    impl Context for RemappedText {
+        type Reference = String;
+        type Error = core::convert::Infallible;
+
+        fn reference(
+            &mut self,
+            expression: &Expr,
+        ) -> Result<Option<crate::context::Resolved<String>>, Self::Error> {
+            let Expr::Identifier(sqlparser::ast::Ident { value, .. }) = expression else {
+                return Ok(None);
+            };
+            Ok((value.as_str() == "x").then(|| {
+                crate::context::Resolved {
+                    reference: "x".to_string(),
+                    evaluation: unknown_column(ScalarType::Text(TextRules::DEFAULT)),
+                }
+            }))
+        }
+
+        fn callees(
+            &mut self,
+            _call: &sqlparser::ast::Function,
+        ) -> Result<alloc::vec::Vec<crate::Callee>, Self::Error> {
+            Ok(alloc::vec::Vec::new())
+        }
+
+        fn data_type(&self, data_type: &sqlparser::ast::DataType) -> ScalarType {
+            if matches!(data_type, sqlparser::ast::DataType::Text) {
+                ScalarType::Unknown
+            } else {
+                ScalarType::of(data_type)
+            }
+        }
+    }
+
     /// A cast's backward narrowing reads its target type from the context's
     /// `data_type`, the way the forward pass does.
+    #[test]
+    fn a_cast_reads_its_target_type_from_the_context() {
+        let mut context = RemappedText;
+        let guarantees = implied(
+            &parse("x::text"),
+            Outcomes::TRUE,
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
+            &mut context,
+            &Guarantees::new(),
+        )
+        .expect("the context resolves");
+        assert!(!guarantees.is_impossible());
+        let x = column(&guarantees, "x");
+        assert!(!x.may_be_null());
+        assert!(context.reference(&number("1")).unwrap().is_none());
+        assert!(
+            context
+                .callees(&sqlparser::ast::Function {
+                    name: sqlparser::ast::ObjectName(vec![
+                        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
+                            "length"
+                        ),)
+                    ]),
+                    uses_odbc_syntax: false,
+                    parameters: sqlparser::ast::FunctionArguments::None,
+                    args: sqlparser::ast::FunctionArguments::None,
+                    within_group: vec![],
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            context.data_type(&sqlparser::ast::DataType::Integer(None)),
+            ScalarType::Integer(sql_values::IntegerType::Integer)
+        );
+    }
+
     use sqlparser::{
         ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value, ValueWithSpan},
         tokenizer::Span,
@@ -5142,8 +5179,8 @@ mod tests {
                 let result = implied(
                     &expression,
                     Outcomes::NOT_FALSE,
-                    &GenericDialect,
-                    &(),
+                    &PostgreSqlDialect {},
+                    &PostgreSqlOptions::default(),
                     &mut context,
                     &Guarantees::new(),
                 );

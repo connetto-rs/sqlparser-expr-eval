@@ -393,6 +393,34 @@ pub(crate) fn filter_listed_by_interval(
         .collect()
 }
 
+/// Whether two value sets could hold a common value on one row.
+#[must_use]
+pub(crate) fn values_share(left: &Evaluation, right: &Evaluation) -> bool {
+    match (left.values(), right.values()) {
+        (Values::Listed(l), Values::Listed(r)) => {
+            if l.is_empty() || r.is_empty() {
+                return false;
+            }
+            l.iter().any(|value| r.contains(value))
+        }
+        (Values::Listed(l), Values::Unlisted(u)) | (Values::Unlisted(u), Values::Listed(l)) => {
+            if l.is_empty() {
+                return false;
+            }
+            l.iter().any(|value| u.admits(value))
+        }
+        (Values::Unlisted(l), Values::Unlisted(r)) => {
+            if left.ty().is_number() && right.ty().is_number() {
+                !intervals_disjoint(&l.numbers, &r.numbers)
+            } else if left.ty().is_text() && right.ty().is_text() {
+                !l.length.is_empty() && !r.length.is_empty()
+            } else {
+                !left.values().is_empty() && !right.values().is_empty()
+            }
+        }
+    }
+}
+
 /// Whether the type could stand for a condition.
 #[must_use]
 pub(crate) fn could_be_boolean(ty: ScalarType) -> bool {
@@ -440,7 +468,7 @@ mod tests {
 
     use super::{
         and_outcomes, intervals_disjoint, is_reference, not_outcomes, number_bounds, or_outcomes,
-        prune, subject, unnest,
+        prune, subject, unnest, values_share,
     };
     use crate::{
         context::{Callee, CalleeKind, Context, NullInput, Resolved, Volatility},
@@ -479,6 +507,10 @@ mod tests {
             returns_set: false,
             token: 0,
         }
+    }
+
+    fn listed(ty: ScalarType, values: &[PgValue]) -> Evaluation {
+        Evaluation::new(ty, false, false, Values::Listed(values.iter().cloned().collect()))
     }
 
     fn integers(values: &[i64]) -> Vec<PgValue> {
@@ -699,6 +731,77 @@ mod tests {
             Interval { low: Bound::Excluded(PgNumeric::from(1)), high: Bound::Unbounded };
         let unlisted = Values::Unlisted(Unlisted { numbers: interval.clone(), ..Unlisted::any() });
         assert_eq!(number_bounds(&unlisted), interval);
+    }
+
+    #[test]
+    fn values_share_matches_the_common_value() {
+        let int4 = ScalarType::Integer(IntegerType::Integer);
+        assert!(values_share(&listed(int4, &integers(&[1, 2])), &listed(int4, &integers(&[2, 3]))));
+        assert!(!values_share(
+            &listed(int4, &integers(&[1, 2])),
+            &listed(int4, &integers(&[3, 4]))
+        ));
+        let empty = listed(int4, &[]);
+        assert!(!values_share(&empty, &listed(int4, &integers(&[1]))));
+        // a listed value is admitted by an unlisted set only inside its
+        // interval, not at an excluded bound
+        let interval = |low: i64, high: i64| {
+            Interval {
+                low: Bound::Included(PgNumeric::from(low)),
+                high: Bound::Included(PgNumeric::from(high)),
+            }
+        };
+        let unlisted = Evaluation::new(
+            ScalarType::Numeric,
+            false,
+            false,
+            Values::Unlisted(Unlisted { numbers: interval(2, 3), ..Unlisted::any() }),
+        );
+        assert!(values_share(&listed(int4, &integers(&[1, 2])), &unlisted));
+        let excluded = Evaluation::new(
+            ScalarType::Numeric,
+            false,
+            false,
+            Values::Unlisted(Unlisted {
+                numbers: Interval {
+                    low: Bound::Excluded(PgNumeric::from(2)),
+                    high: Bound::Unbounded,
+                },
+                ..Unlisted::any()
+            }),
+        );
+        assert!(!values_share(&listed(int4, &integers(&[1, 2])), &excluded));
+        // two unlisted number sets share a value when their intervals meet
+        let number = |low: i64, high: i64| {
+            Evaluation::new(
+                ScalarType::Numeric,
+                false,
+                false,
+                Values::Unlisted(Unlisted { numbers: interval(low, high), ..Unlisted::any() }),
+            )
+        };
+        assert!(values_share(&number(1, 3), &number(3, 5)));
+        assert!(!values_share(&number(1, 2), &number(3, 5)));
+        // two unlisted text sets share a value when both may hold some text
+        let text = ScalarType::Text(TextRules::DEFAULT);
+        let text_set = Evaluation::new(text, false, false, Values::Unlisted(Unlisted::any()));
+        let empty_text = Evaluation::new(
+            text,
+            false,
+            false,
+            Values::Unlisted(Unlisted {
+                length: Interval { low: Bound::Included(5), high: Bound::Included(3) },
+                ..Unlisted::any()
+            }),
+        );
+        assert!(values_share(&text_set, &text_set));
+        assert!(!values_share(&text_set, &empty_text));
+        // two unlisted date sets share a value when neither is empty
+        let date =
+            Evaluation::new(ScalarType::Date, false, false, Values::Unlisted(Unlisted::any()));
+        assert!(values_share(&date, &date));
+        let empty_date = Evaluation::impossible(ScalarType::Date);
+        assert!(!values_share(&date, &empty_date));
     }
 
     fn call(sql: &str) -> Function {

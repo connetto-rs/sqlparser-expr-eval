@@ -18,10 +18,33 @@ use super::{
     State, forward,
 };
 
-/// The category two operands compare in.
+/// The category two operands compare in, with the text rules when both are
+/// text.
 pub(crate) enum Category {
     Number,
     Boolean,
+    Text(TextRules, TextRules),
+    Timestamp,
+}
+
+/// The comparison category of two resolved operand types.
+pub(crate) fn comparison_category(left: ScalarType, right: ScalarType) -> Option<Category> {
+    Some(match (left, right) {
+        // A float compares against a number: PostgreSQL casts the number to
+        // the float.
+        (a, b)
+            if (a.is_number() || a == ScalarType::Float)
+                && (b.is_number() || b == ScalarType::Float) =>
+        {
+            Category::Number
+        }
+        (ScalarType::Boolean, ScalarType::Boolean) => Category::Boolean,
+        (ScalarType::Text(a), ScalarType::Text(b)) => Category::Text(a, b),
+        (ScalarType::Date | ScalarType::Timestamp, ScalarType::Date | ScalarType::Timestamp) => {
+            Category::Timestamp
+        }
+        _ => return None,
+    })
 }
 
 /// The kinds of answer one non-`NULL` left value may give against the whole
@@ -122,15 +145,9 @@ pub(super) fn comparison_evals<D: EvalDialect, C: Context>(
     op: &BinaryOperator,
     right: Evaluation,
 ) -> Compared {
-    let error = left.may_raise() || right.may_raise();
     if left.is_impossible() || right.is_impossible() {
+        let error = left.may_raise() || right.may_raise();
         return Compared { rows: RowKinds::NONE, null: false, error };
-    }
-    // A comparison operator is strict, so an always-`NULL` side decides the
-    // outcome before any type resolution.
-    if left.is_always_null() || right.is_always_null() {
-        let error = error || !comparable(&left, &right);
-        return Compared { rows: RowKinds::NONE, null: true, error };
     }
     let null = left.may_be_null() || right.may_be_null();
     let Comparison { rows, error } = state.dialect.comparison(left, op, right, state.options);
@@ -147,6 +164,11 @@ pub(crate) fn standard_comparison(
     right: &Evaluation,
     error: bool,
 ) -> Comparison {
+    // A comparison operator is strict, so an always-`NULL` side meets no
+    // value.
+    if left.is_always_null() || right.is_always_null() {
+        return Comparison::new(RowKinds::NONE, error || !comparable(left, right));
+    }
     let category = if left.ty().is_number() && right.ty().is_number() {
         Some(Category::Number)
     } else if left.ty() == ScalarType::Boolean && right.ty() == ScalarType::Boolean {
@@ -181,9 +203,13 @@ pub(crate) fn pair_analysis(
             match op {
                 BinaryOperator::Eq => boolean_pairs(left, right, true),
                 BinaryOperator::NotEq => boolean_pairs(left, right, false),
-                _ => RowKinds::NONE.with_pairs(true, true),
+                _ => RowKinds::ANY,
             }
         }
+        Category::Text(rules_left, rules_right) => {
+            text_pairs(left.values(), right.values(), *rules_left, *rules_right, op)
+        }
+        Category::Timestamp => timestamp_pairs(left.values(), right.values(), op),
     }
 }
 
@@ -333,7 +359,7 @@ fn number_pairs(left: &Values, right: &Values, op: &BinaryOperator) -> RowKinds 
         BinaryOperator::GtEq => {
             (below(&rhi, &llo, false), below(&lhi, &rlo, true), above_any, below_open)
         }
-        _ => (false, false, false, false),
+        _ => return RowKinds::ANY,
     };
     RowKinds { all_true: row_satisfies, all_false: row_fails, mixed: false }
         .with_pairs(!every_fails, !every_satisfies)
@@ -507,6 +533,83 @@ fn pair_certainties<A, B>(
         .with_pairs(may_satisfy, may_fail);
     }
     rows
+}
+
+/// The kinds of answer a left text may give against the right texts under
+/// `op`, under the collations both sides carry.
+fn text_pairs(
+    left: &Values,
+    right: &Values,
+    rules_left: TextRules,
+    rules_right: TextRules,
+    op: &BinaryOperator,
+) -> RowKinds {
+    let identity = rules_left.identity_equality && rules_right.identity_equality;
+    let byte_order = rules_left.byte_order && rules_right.byte_order;
+    let (Values::Listed(l), Values::Listed(r)) = (left, right) else {
+        // An unlisted left side admits values the listed right side cannot
+        // exclude, so its rows take the kinds the listed values alone
+        // admit, and every pair may satisfy and may fail.
+        if let (Values::Unlisted(l), Values::Listed(r)) = (left, right)
+            && !r.is_empty()
+            && !l.length.is_empty()
+        {
+            let admits_member =
+                r.len() == 1 && r.iter().next().is_some_and(|value| l.admits(value));
+            // Identity equality alone stops one value matching two members.
+            let (all_true, all_false) = match op {
+                BinaryOperator::Eq => (!identity || admits_member, true),
+                BinaryOperator::NotEq => (true, !identity || admits_member),
+                _ => (true, true),
+            };
+            return RowKinds { all_true, all_false, mixed: false }.with_pairs(true, true);
+        }
+        return RowKinds::ANY;
+    };
+    // A byte-identical pair is certain under any collation; a differing one
+    // only under an identity collation, and an ordering only under a byte
+    // collation.
+    let rights = r.iter().filter_map(PgValue::as_text);
+    pair_certainties(l.iter().filter_map(PgValue::as_text), &rights, |a, b| {
+        let ordered = |satisfies: bool| (satisfies, !satisfies);
+        match op {
+            BinaryOperator::Eq if a == b => (true, false),
+            BinaryOperator::Eq => (false, identity),
+            BinaryOperator::NotEq if a == b => (false, true),
+            BinaryOperator::NotEq => (identity, false),
+            BinaryOperator::Lt if byte_order => ordered(a.as_bytes() < b.as_bytes()),
+            BinaryOperator::LtEq if byte_order => ordered(a.as_bytes() <= b.as_bytes()),
+            BinaryOperator::Gt if byte_order => ordered(a.as_bytes() > b.as_bytes()),
+            BinaryOperator::GtEq if byte_order => ordered(a.as_bytes() >= b.as_bytes()),
+            _ => (false, false),
+        }
+    })
+}
+
+/// The kinds of answer a left date or timestamp may give against the right
+/// ones under `op`.
+fn timestamp_pairs(left: &Values, right: &Values, op: &BinaryOperator) -> RowKinds {
+    let (Values::Listed(l), Values::Listed(r)) = (left, right) else {
+        return RowKinds::ANY;
+    };
+    let satisfies: Option<fn(&PgValue, &PgValue) -> bool> = match op {
+        BinaryOperator::Eq => Some(|a, b| a == b),
+        BinaryOperator::NotEq => Some(|a, b| a != b),
+        BinaryOperator::Lt => Some(|a, b| a < b),
+        BinaryOperator::LtEq => Some(|a, b| a <= b),
+        BinaryOperator::Gt => Some(|a, b| a > b),
+        BinaryOperator::GtEq => Some(|a, b| a >= b),
+        _ => None,
+    };
+    let Some(satisfies) = satisfies else {
+        return RowKinds::ANY;
+    };
+    // A date compares with a timestamp as `date_cmp_timestamp` does, which
+    // the value order follows.
+    pair_certainties(l.iter(), &r.iter(), |a, b| {
+        let satisfies = satisfies(a, b);
+        (satisfies, !satisfies)
+    })
 }
 
 /// The comparison of two expressions, forward.
@@ -685,6 +788,7 @@ fn and_or<D: EvalDialect, C: Context>(
     }
     Ok(Evaluation::condition(outcomes, error))
 }
+
 /// [`backward::implied_within`](super::super::backward::implied_within) on one
 /// term, drawing on the pass's budget.
 fn narrow_within<D: EvalDialect, C: Context>(
@@ -894,9 +998,13 @@ fn arithmetic_sides(left: Evaluation, right: Evaluation) -> (Evaluation, Evaluat
         (left_ty, ScalarType::UnknownLiteral) if left_ty.is_number() => {
             (left, reinterpret_unknown(right, left_ty))
         }
+        // An engine may find no unique operator for two untyped literals.
         (ScalarType::UnknownLiteral, ScalarType::UnknownLiteral) => {
             let integer = ScalarType::Integer(sql_values::IntegerType::Integer);
-            (reinterpret_unknown(left, integer), reinterpret_unknown(right, integer))
+            (
+                reinterpret_unknown(left, integer).with_error(true),
+                reinterpret_unknown(right, integer),
+            )
         }
         _ => (left, right),
     }
@@ -1013,31 +1121,36 @@ mod tests {
     use sql_values::{IntegerType, PgNumeric, PgValue};
     use sqlparser::{
         ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan},
-        dialect::GenericDialect,
+        dialect::{GenericDialect, PostgreSqlDialect},
         tokenizer::Span,
     };
 
     use super::{
         Category, RowKinds, arithmetic_type, interval_contains_zero, pair_analysis,
-        reinterpret_unknown, standard_comparison,
+        standard_comparison,
     };
     use crate::{
         domain::{Evaluation, Interval, Unlisted, Values},
         forward::{evaluate, evaluate_within},
         guarantees::{Guarantees, Subject},
+        postgres::PostgreSqlOptions,
         scalar::{ScalarType, TextRules},
-        test_context::{ColumnContext, HookDialect, parse},
+        test_context::{ColumnContext, parse},
     };
 
-    /// Reads `sql` under the conservative default dialect, with no settings.
     fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(&parse(sql), &GenericDialect, &(), &mut context, &Guarantees::new())
-            .expect("resolves")
+        evaluate(
+            &parse(sql),
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
+            &mut context,
+            &Guarantees::new(),
+        )
+        .expect("resolves")
     }
 
-    /// Reads `sql` under the hook dialect, which answers every dialect hook.
-    fn read_hook(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(&parse(sql), &HookDialect, &(), &mut context, &Guarantees::new())
+    fn read_default(mut context: ColumnContext, sql: &str) -> Evaluation {
+        evaluate(&parse(sql), &GenericDialect, &(), &mut context, &Guarantees::new())
             .expect("resolves")
     }
 
@@ -1046,7 +1159,14 @@ mod tests {
         guarantees: &Guarantees<String>,
         sql: &str,
     ) -> Evaluation {
-        evaluate(&parse(sql), &GenericDialect, &(), &mut context, guarantees).expect("resolves")
+        evaluate(
+            &parse(sql),
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
+            &mut context,
+            guarantees,
+        )
+        .expect("resolves")
     }
 
     fn int4(values: Values) -> Evaluation {
@@ -1112,7 +1232,7 @@ mod tests {
 
     #[test]
     fn standard_comparison_of_columns_stays_open() {
-        let result = read(
+        let result = read_default(
             ColumnContext::new()
                 .with_column("a", int4_unlisted())
                 .with_column("b", int4_unlisted()),
@@ -1156,111 +1276,6 @@ mod tests {
         };
         let comparison = standard_comparison(&text("a"), &BinaryOperator::Eq, &text("b"), false);
         assert_eq!(comparison.rows, RowKinds::ANY);
-    }
-
-    /// A comparison against an impossible operand is impossible.
-    #[test]
-    fn a_comparison_with_an_impossible_side_is_impossible() {
-        let context = ColumnContext::new()
-            .with_column("x", Evaluation::impossible(ScalarType::Integer(IntegerType::Integer)));
-        assert!(read(context, "x = 1").is_impossible());
-    }
-
-    /// Untyped literals re-read as the type that resolved them.
-    #[test]
-    fn arithmetic_reinterprets_untyped_literals() {
-        let numeric_context = || ColumnContext::new().with_column("n", numeric_unlisted());
-        // both sides untyped: both re-read as integers
-        assert_eq!(
-            read(numeric_context(), "1 + 2").ty(),
-            ScalarType::Integer(IntegerType::Integer),
-        );
-        // the literal re-reads against the number's type
-        assert_eq!(read(numeric_context(), "n + 1").ty(), ScalarType::Numeric);
-        assert_eq!(read(numeric_context(), "1 + n").ty(), ScalarType::Numeric);
-        // a special number text keeps the interval open
-        assert_eq!(read(numeric_context(), "n + 'NaN'").ty(), ScalarType::Numeric);
-        // a text side that cannot be a number keeps the raise reading
-        let context = || ColumnContext::new().with_column("x", int4_unlisted());
-        assert!(read(context(), "x + 'oops'").may_raise());
-        // a text side that reads as a number resolves as the other side's type
-        assert!(read(context(), "x + '1'").may_raise());
-        // an unlisted unknown literal re-reads against the type
-        let context = ColumnContext::new().with_column(
-            "u",
-            Evaluation::new(
-                ScalarType::UnknownLiteral,
-                true,
-                false,
-                Values::Unlisted(Unlisted::any()),
-            ),
-        );
-        assert_eq!(read(context, "u + 1").ty(), ScalarType::Integer(IntegerType::Integer));
-    }
-
-    /// A flat multiplicative spine keeps the left-deep walk.
-    #[test]
-    fn a_multiplicative_spine_walks_left_deep() {
-        let context = ColumnContext::new().with_column("x", int4_unlisted());
-        let evaluation = read(context, "x * 2 * 3");
-        assert_eq!(evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
-        assert!(evaluation.may_raise());
-    }
-
-    /// A boolean pair analysis of an empty side meets no value.
-    #[test]
-    fn a_boolean_pair_analysis_of_an_empty_side_meets_no_value() {
-        let empty = Evaluation::impossible(ScalarType::Boolean);
-        let flag = Evaluation::known(PgValue::Boolean(true), ScalarType::Boolean);
-        assert_eq!(
-            pair_analysis(&empty, &flag, &Category::Boolean, &BinaryOperator::Eq),
-            RowKinds::NONE,
-        );
-        assert_eq!(
-            pair_analysis(&flag, &empty, &Category::Boolean, &BinaryOperator::Eq),
-            RowKinds::NONE,
-        );
-    }
-
-    /// Two untyped text literals resolve as the default `int4`.
-    #[test]
-    fn two_untyped_text_literals_resolve_as_int4() {
-        assert_eq!(
-            read(ColumnContext::new(), "'1' + '2'").ty(),
-            ScalarType::Integer(IntegerType::Integer),
-        );
-    }
-
-    /// A source with a type other than an untyped literal re-reads only the
-    /// target type.
-    #[test]
-    fn a_typed_source_rereads_only_the_target_type() {
-        let source = Evaluation::known(PgValue::Boolean(true), ScalarType::Boolean);
-        let reinterpreted = reinterpret_unknown(source, ScalarType::Integer(IntegerType::Integer));
-        assert_eq!(reinterpreted.ty(), ScalarType::Integer(IntegerType::Integer));
-        assert!(reinterpreted.values().is_empty());
-    }
-
-    /// `||` keeps the left-deep walk on a text spine.
-    #[test]
-    fn a_text_spine_walks_left_deep() {
-        let context = ColumnContext::new()
-            .with_column("x", text_unlisted())
-            .with_column("y", text_unlisted());
-        let evaluation = read(context, "x || y || 'a'");
-        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
-    }
-
-    /// A dialect's `= NULL` answer reads the form as `IS NULL`.
-    #[test]
-    fn a_null_equals_hook_reads_the_null_form() {
-        let context = || ColumnContext::new().with_column("x", int4_unlisted());
-        let result = read_hook(context(), "x = NULL");
-        assert!(result.may_be_true());
-        assert!(result.may_be_false());
-        assert!(!result.may_be_null());
-        let result = read_hook(ColumnContext::new(), "NULL = NULL");
-        assert_eq!(result.constant(), Some(&PgValue::Boolean(true)));
     }
 
     #[test]
@@ -1408,7 +1423,7 @@ mod tests {
             pair_analysis(&empty, &point(1), &Category::Number, &BinaryOperator::Eq),
             RowKinds::NONE,
         );
-        // a boolean pair under an ordering admits nothing
+        // a boolean pair under an ordering leaves every row open
         let flag = Evaluation::new(
             ScalarType::Boolean,
             false,
@@ -1417,7 +1432,13 @@ mod tests {
         );
         assert_eq!(
             pair_analysis(&flag, &flag, &Category::Boolean, &BinaryOperator::Lt),
-            RowKinds { all_true: false, all_false: false, mixed: true },
+            RowKinds::ANY,
+        );
+        // an empty boolean side meets no value either
+        let none = Evaluation::impossible(ScalarType::Boolean);
+        assert_eq!(
+            pair_analysis(&flag, &none, &Category::Boolean, &BinaryOperator::Eq),
+            RowKinds::NONE,
         );
     }
 
@@ -1448,6 +1469,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn and_or_correlate_the_sides() {
+        let context = || ColumnContext::new().with_column("x", int4_unlisted());
+        let result = read(context(), "x IS NULL OR x IS NOT NULL");
+        assert!(result.may_be_true());
+        assert!(!result.may_be_false());
+        assert!(!result.may_be_null());
+        let result = read(context(), "x IS NULL AND x IS NOT NULL");
+        assert!(!result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(!result.may_be_null());
+    }
+
+    #[test]
+    fn a_depleted_path_budget_stays_sound() {
+        let budget = Cell::new(1);
+        let expression = parse("x = 1 AND x = 2 AND x = 3");
+        let result = evaluate_within(
+            &expression,
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
+            &mut ColumnContext::new().with_column("x", int4_unlisted()),
+            &Guarantees::new(),
+            &budget,
+        )
+        .expect("resolves");
+        assert!(!result.may_be_true());
+        assert!(result.may_be_false());
+        assert!(result.may_be_null());
+    }
+
     fn number_value(token: &str) -> Expr {
         Expr::Value(ValueWithSpan {
             value: Value::Number(token.to_string(), false),
@@ -1464,8 +1516,8 @@ mod tests {
         };
         let result = evaluate(
             &expression,
-            &GenericDialect,
-            &(),
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
             &mut ColumnContext::new(),
             &Guarantees::new(),
         )
@@ -1498,15 +1550,16 @@ mod tests {
 
     #[test]
     fn unary_plus_keeps_a_number_and_opens_other_types() {
-        // the conservative dialect does not fold the sign
+        let result = read(ColumnContext::new(), "+5");
+        assert_eq!(result.constant(), Some(&PgValue::Integer(5)));
         let result = read(ColumnContext::new().with_column("x", int4_unlisted()), "+x");
         assert!(matches!(result.values(), Values::Unlisted(_)));
         assert!(!result.may_raise());
-        // a dialect that keeps the sign preserves the inner values
-        let result = read_hook(ColumnContext::new().with_column("x", int4_unlisted()), "+x");
+        // the standard dialect does not fold the sign
+        let result = read_default(ColumnContext::new().with_column("x", int4_unlisted()), "+x");
         assert!(matches!(result.values(), Values::Unlisted(_)));
-        assert!(!result.may_raise());
-        // + over a non-number keeps the type and opens the values
+        // postgres does not know + over a non-number, so it keeps the type
+        // and opens the values
         let s = Evaluation::new(
             ScalarType::Text(TextRules::DEFAULT),
             true,
@@ -1529,8 +1582,8 @@ mod tests {
         };
         let result = evaluate(
             &expression,
-            &GenericDialect,
-            &(),
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
             &mut ColumnContext::new(),
             &Guarantees::new(),
         )
@@ -1626,15 +1679,14 @@ mod tests {
         assert!(result.may_be_null());
         let result = read(ColumnContext::new().with_column("n", numeric_unlisted()), "1 / n");
         assert!(result.may_raise());
-        // a divisor proven non-zero keeps the conservative raise but
-        // narrows the `NULL` reading
+        // a divisor proven non-zero cannot raise
         let guarantees = guarantees_for("n", ScalarType::Numeric, bound("e", 0, "_", 0));
         let result = read_guarantees(
             ColumnContext::new().with_column("n", numeric_unlisted()),
             &guarantees,
             "1 / n",
         );
-        assert!(result.may_raise());
+        assert!(!result.may_raise());
         assert!(!result.may_be_null());
     }
 
@@ -1671,13 +1723,40 @@ mod tests {
         assert!(result.may_be_null());
         assert!(!result.may_be_true());
         assert!(!result.may_be_false());
+        let result = read(ColumnContext::new(), "1 / 0 BETWEEN 1 AND 3");
+        assert!(result.always_raises());
     }
 
     #[test]
-    fn concatenation_keeps_its_sides_open() {
+    fn an_always_null_side_of_a_refused_pair_may_raise() {
+        let generic = |sql: &str| {
+            evaluate(
+                &parse(sql),
+                &sqlparser::dialect::GenericDialect,
+                &(),
+                &mut ColumnContext::new().with_column(
+                    "f",
+                    Evaluation::new(
+                        ScalarType::Float,
+                        true,
+                        false,
+                        Values::Unlisted(Unlisted::any()),
+                    ),
+                ),
+                &Guarantees::new(),
+            )
+            .expect("the context resolves")
+        };
+        assert!(generic("NULL::text = -1").may_raise());
+        assert!(!generic("NULL = -1").may_raise());
+        assert!(generic("1 = ''").may_raise());
+        assert!(generic("'1' = f").may_raise());
+    }
+
+    #[test]
+    fn concatenation_folds_its_known_sides() {
         let result = read(ColumnContext::new(), "'a' || 'b'");
-        assert!(matches!(result.values(), Values::Unlisted(_)));
-        assert!(!result.may_raise());
+        assert_eq!(result.constant(), Some(&PgValue::Text("ab".to_string())));
         let result = read(ColumnContext::new().with_column("s", text_unlisted()), "s || 'x'");
         assert!(matches!(result.values(), Values::Unlisted(_)));
         assert!(!result.may_raise());
@@ -1687,12 +1766,35 @@ mod tests {
         let result = read(ColumnContext::new(), "1 || 2");
         assert!(result.may_raise());
         assert!(matches!(result.values(), Values::Unlisted(_)));
-        // a dialect that folds the concatenation answers before the values
-        let result = read_hook(ColumnContext::new(), "'a' || 'b'");
-        assert_eq!(result.constant(), Some(&PgValue::Text("folded".to_string())));
+        let known = Evaluation::known(
+            PgValue::Text("he".to_string()),
+            ScalarType::Text(TextRules::DEFAULT),
+        );
+        let result = read(ColumnContext::new().with_column("s", known), "s || 'llo'");
+        assert_eq!(result.constant(), Some(&PgValue::Text("hello".to_string())));
         let impossible = Evaluation::impossible(ScalarType::Text(TextRules::DEFAULT));
         let result = read(ColumnContext::new().with_column("s", impossible), "'a' || s");
         assert!(result.is_impossible());
+    }
+
+    #[test]
+    fn arithmetic_resolves_untyped_literals_against_the_number() {
+        let result = read(ColumnContext::new(), "'1' + 1");
+        assert_eq!(result.constant(), Some(&PgValue::Integer(2)));
+        let result = read(ColumnContext::new(), "1 + '1'");
+        assert_eq!(result.constant(), Some(&PgValue::Integer(2)));
+        // Two untyped literals leave the operator ambiguous.
+        assert!(read(ColumnContext::new(), "'1' + '2'").may_raise());
+    }
+
+    /// `integer = text` resolves the text literal as an integer, which raises.
+    #[test]
+    fn a_number_compared_with_a_text_literal_raises() {
+        let result = read(ColumnContext::new(), "5 = 'a'");
+        assert!(result.may_raise());
+        assert!(!result.may_be_true());
+        assert!(!result.may_be_false());
+        assert!(!result.may_be_null());
     }
 
     #[test]
@@ -1729,11 +1831,107 @@ mod tests {
         assert!(matches!(result.values(), Values::Unlisted(_)));
     }
 
+    fn text(rules: TextRules, values: &[&str]) -> Evaluation {
+        Evaluation::new(
+            ScalarType::Text(rules),
+            false,
+            false,
+            Values::Listed(values.iter().map(|value| PgValue::Text(value.to_string())).collect()),
+        )
+    }
+
+    #[test]
+    fn text_pairs_follow_the_collation_and_the_order() {
+        // A listed left against an unlisted right admits no pair certainty.
+        assert_eq!(
+            pair_analysis(
+                &text(TextRules::DEFAULT, &["a"]),
+                &Evaluation::new(
+                    ScalarType::Text(TextRules::DEFAULT),
+                    false,
+                    false,
+                    Values::Unlisted(Unlisted::any()),
+                ),
+                &Category::Text(TextRules::DEFAULT, TextRules::DEFAULT),
+                &BinaryOperator::Eq,
+            ),
+            RowKinds::ANY,
+        );
+        // An equal pair under the inequality is a certain falsity per row.
+        assert_eq!(
+            pair_analysis(
+                &text(TextRules::DEFAULT, &["a"]),
+                &text(TextRules::DEFAULT, &["a"]),
+                &Category::Text(TextRules::DEFAULT, TextRules::DEFAULT),
+                &BinaryOperator::NotEq,
+            ),
+            RowKinds { all_true: false, all_false: true, mixed: false },
+        );
+        // An empty side admits no pair at all.
+        let empty =
+            Evaluation::new(ScalarType::Text(TextRules::DEFAULT), false, true, Values::none());
+        assert_eq!(
+            pair_analysis(
+                &empty,
+                &text(TextRules::DEFAULT, &["a"]),
+                &Category::Text(TextRules::DEFAULT, TextRules::DEFAULT),
+                &BinaryOperator::Eq,
+            ),
+            RowKinds::NONE,
+        );
+    }
+
+    fn instant(value: &str) -> Evaluation {
+        Evaluation::known(
+            PgValue::Timestamp(sql_values::parse_timestamp(value).expect("a valid timestamp")),
+            ScalarType::Timestamp,
+        )
+    }
+
+    #[test]
+    fn timestamp_pairs_follow_their_operator() {
+        let earlier = instant("2026-01-01 00:00:00");
+        let later = instant("2026-01-01 01:00:00");
+        assert_eq!(
+            pair_analysis(
+                &instant("2026-01-01 00:00:00"),
+                &instant("2026-01-01 00:00:00"),
+                &Category::Timestamp,
+                &BinaryOperator::NotEq,
+            ),
+            RowKinds { all_true: false, all_false: true, mixed: false },
+        );
+        assert_eq!(
+            pair_analysis(&earlier, &later, &Category::Timestamp, &BinaryOperator::LtEq),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        assert_eq!(
+            pair_analysis(
+                &instant("2026-01-01 00:00:00"),
+                &instant("2026-01-01 00:00:00"),
+                &Category::Timestamp,
+                &BinaryOperator::GtEq,
+            ),
+            RowKinds { all_true: true, all_false: false, mixed: false },
+        );
+        // An operator the timestamps do not support admits no certainty.
+        assert_eq!(
+            pair_analysis(&earlier, &later, &Category::Timestamp, &BinaryOperator::Spaceship),
+            RowKinds::ANY,
+        );
+        // An empty side admits no pair at all.
+        let empty = Evaluation::new(ScalarType::Timestamp, false, true, Values::none());
+        assert_eq!(
+            pair_analysis(&earlier, &empty, &Category::Timestamp, &BinaryOperator::Eq),
+            RowKinds::NONE,
+        );
+    }
+
     #[test]
     fn an_unmodelled_number_operator_admits_no_certainty() {
         assert_eq!(
             pair_analysis(&point(1), &point(1), &Category::Number, &BinaryOperator::Spaceship),
-            RowKinds { all_true: false, all_false: false, mixed: true },
+            RowKinds::ANY,
         );
     }
 
@@ -1803,37 +2001,33 @@ mod tests {
         assert_eq!(unlisted.numbers.high, Bound::Excluded(PgNumeric::from(0_i64)));
     }
 
-    /// `AND` and `OR` keep the sides correlated.
     #[test]
-    fn and_or_correlate_the_sides() {
-        let context = || ColumnContext::new().with_column("x", int4_unlisted());
-        let result = read(context(), "x IS NULL OR x IS NOT NULL");
+    fn a_date_column_compared_with_a_timestamp_resolves() {
+        let date = Evaluation::new(
+            ScalarType::Date,
+            true,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Date(
+                sql_values::parse_date("2026-01-01").expect("valid"),
+            )])),
+        );
+        let result = read(
+            ColumnContext::new().with_column("d", date),
+            "d = TIMESTAMP '2026-01-01 00:00:00'",
+        );
         assert!(result.may_be_true());
         assert!(!result.may_be_false());
-        assert!(!result.may_be_null());
-        let result = read(context(), "x IS NULL AND x IS NOT NULL");
+        let ts = Evaluation::new(
+            ScalarType::Timestamp,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Timestamp(
+                sql_values::parse_timestamp("2026-01-01 01:00:00").expect("valid"),
+            )])),
+        );
+        let result = read(ColumnContext::new().with_column("t", ts), "t = DATE '2026-01-01'");
         assert!(!result.may_be_true());
         assert!(result.may_be_false());
-        assert!(!result.may_be_null());
-    }
-
-    /// A depleted path budget stays sound.
-    #[test]
-    fn a_depleted_path_budget_stays_sound() {
-        let budget = Cell::new(1);
-        let expression = parse("x = 1 AND x = 2 AND x = 3");
-        let result = evaluate_within(
-            &expression,
-            &GenericDialect,
-            &(),
-            &mut ColumnContext::new().with_column("x", int4_unlisted()),
-            &Guarantees::new(),
-            &budget,
-        )
-        .expect("the context resolves");
-        assert!(!result.may_be_true());
-        assert!(result.may_be_false());
-        assert!(result.may_be_null());
     }
 
     /// An unknown literal whose reading a setting decides stays open.

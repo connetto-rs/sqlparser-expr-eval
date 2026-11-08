@@ -13,11 +13,11 @@ An [`EvalDialect`] answers the questions an expression's meaning turns on, and c
 ```rust
 use sqlparser::{
     ast::{Expr, Function, FunctionArguments, Ident, ObjectName, ObjectNamePart},
-    dialect::GenericDialect,
+    dialect::PostgreSqlDialect,
     parser::Parser,
 };
 use sqlparser_expr_eval::{
-    Callee, Context, Evaluation, Guarantees, Outcomes, Resolved,
+    Callee, Context, Evaluation, Guarantees, Outcomes, PostgreSqlOptions, Resolved,
     ScalarType, TextRules, Unlisted, Values, evaluate, implied,
     sql_values::IntegerType,
 };
@@ -45,8 +45,8 @@ impl Context for Teams {
     }
 }
 
-let dialect = GenericDialect;
-let options = ();
+let dialect = PostgreSqlDialect {};
+let options = PostgreSqlOptions::default();
 let parse = |sql: &str| Parser::new(&dialect).try_with_sql(sql)?.parse_expr();
 let read = |sql: &str| {
     let Ok(evaluation) = evaluate(&parse(sql)?, &dialect, &options, &mut Teams, &Guarantees::new());
@@ -55,8 +55,8 @@ let read = |sql: &str| {
 
 assert!(!read("id NOT IN (1, NULL)")?.may_be_true());
 assert!(read("note = NULL")?.is_always_null());
-assert!(read("2147483647 + 1")?.may_raise());
-assert!(read("7.0 / 2")?.may_raise());
+assert!(read("2147483647 + 1")?.always_raises());
+assert_eq!(read("7.0 / 2")?.constant().map(ToString::to_string).as_deref(), Some("3.5000000000000000"));
 
 let Ok(guarantees) = implied(
     &parse("note IN ('read', 'write')")?,
@@ -91,20 +91,25 @@ assert!(scope.callees(&Function {
 # Ok::<(), sqlparser::parser::ParserError>(())
 ```
 
-The generic reading keeps only what every dialect shares, three-valued logic and `NULL` propagation, and leaves values unknown. A dialect is any type implementing [`EvalDialect`], chosen at runtime, as in this engine that picks its reading when the query runs:
+Under [`PostgreSqlDialect`](sqlparser::dialect::PostgreSqlDialect) the evaluator folds with PostgreSQL's literal typing, overflow, numeric scale, casts and built-ins. Every other dialect keeps only what every dialect shares, three-valued logic and `NULL` propagation, and leaves values unknown. A dialect is any type implementing [`EvalDialect`], chosen at runtime, as in this engine that runs a query under PostgreSQL or the generic reading:
 
 ```rust
 use sqlparser::{
-    ast::{BinaryOperator, Expr, Function},
-    dialect::GenericDialect,
+    ast::{BinaryOperator, CastKind, DataType, Expr, Function},
+    dialect::{GenericDialect, PostgreSqlDialect},
     parser::Parser,
 };
 use sqlparser_expr_eval::{
-    Callee, Comparison, Context, EvalDialect, Evaluation, Guarantees, Resolved, Values, evaluate,
+    Callee, Comparison, Context, EvalDialect, Evaluation, Guarantees, PostgreSqlOptions, Resolved,
+    ScalarType, evaluate,
 };
 
-/// The dialect an engine picks at runtime, reading as the generic dialect.
-struct Engine;
+/// The engine a query runs under, chosen at runtime, holding the settings
+/// of the dialect it wraps.
+enum Engine {
+    Postgres(PostgreSqlDialect, PostgreSqlOptions),
+    Generic(GenericDialect),
+}
 
 impl EvalDialect for Engine {
     type Options = ();
@@ -114,9 +119,19 @@ impl EvalDialect for Engine {
         left: Evaluation,
         op: &BinaryOperator,
         right: Evaluation,
-        _options: &Self::Options,
+        _options: &(),
     ) -> Comparison {
-        GenericDialect.comparison(left, op, right, &())
+        match self {
+            Self::Postgres(dialect, options) => dialect.comparison(left, op, right, options),
+            Self::Generic(dialect) => dialect.comparison(left, op, right, &()),
+        }
+    }
+
+    fn concat(&self, left: &Evaluation, right: &Evaluation, _options: &()) -> Option<Evaluation> {
+        match self {
+            Self::Postgres(dialect, options) => dialect.concat(left, right, options),
+            Self::Generic(dialect) => dialect.concat(left, right, &()),
+        }
     }
 
     fn arithmetic(
@@ -124,38 +139,100 @@ impl EvalDialect for Engine {
         left: &Evaluation,
         op: &BinaryOperator,
         right: &Evaluation,
-        _options: &Self::Options,
+        _options: &(),
     ) -> Evaluation {
-        GenericDialect.arithmetic(left, op, right, &())
+        match self {
+            Self::Postgres(dialect, options) => dialect.arithmetic(left, op, right, options),
+            Self::Generic(dialect) => dialect.arithmetic(left, op, right, &()),
+        }
+    }
+
+    fn unary_plus_preserves(&self, inner: &Evaluation, _options: &()) -> bool {
+        match self {
+            Self::Postgres(dialect, options) => dialect.unary_plus_preserves(inner, options),
+            Self::Generic(dialect) => dialect.unary_plus_preserves(inner, &()),
+        }
+    }
+
+    fn cast(
+        &self,
+        source: Evaluation,
+        kind: &CastKind,
+        data_type: &DataType,
+        to: ScalarType,
+        element_type: impl Fn(&DataType) -> ScalarType,
+        _options: &(),
+    ) -> Evaluation {
+        match self {
+            Self::Postgres(dialect, options) => {
+                dialect.cast(source, kind, data_type, to, &element_type, options)
+            }
+            Self::Generic(dialect) => dialect.cast(source, kind, data_type, to, &element_type, &()),
+        }
+    }
+
+    fn named_call(&self, name: &str, arguments: &[Evaluation], _options: &()) -> Option<Evaluation> {
+        match self {
+            Self::Postgres(dialect, options) => dialect.named_call(name, arguments, options),
+            Self::Generic(dialect) => dialect.named_call(name, arguments, &()),
+        }
+    }
+
+    fn null_equals_operand<'a>(
+        &self,
+        left: &'a Expr,
+        right: &'a Expr,
+        _options: &(),
+    ) -> Option<&'a Expr> {
+        match self {
+            Self::Postgres(dialect, options) => dialect.null_equals_operand(left, right, options),
+            Self::Generic(dialect) => dialect.null_equals_operand(left, right, &()),
+        }
     }
 }
 
-/// A context with no columns of its own.
+/// A query with no columns of its own.
 struct Empty;
-
 impl Context for Empty {
     type Reference = ();
     type Error = sqlparser::parser::ParserError;
-
     fn reference(&mut self, _expression: &Expr) -> Result<Option<Resolved<()>>, Self::Error> {
         Ok(None)
     }
-
     fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Self::Error> {
         Ok(Vec::new())
     }
 }
 
 let parse = |sql: &str| Parser::new(&GenericDialect).try_with_sql(sql)?.parse_expr();
-let sum = evaluate(&parse("1 + 2")?, &Engine, &(), &mut Empty, &Guarantees::new())?;
-assert!(sum.may_raise());
-assert!(matches!(sum.values(), Values::Unlisted(_)));
-let eq = evaluate(&parse("1 = 1")?, &Engine, &(), &mut Empty, &Guarantees::new())?;
-assert!(eq.may_be_true());
-let call = evaluate(&parse("length(1)")?, &Engine, &(), &mut Empty, &Guarantees::new())?;
-assert!(call.may_be_null());
-let open = evaluate(&parse("x = 1")?, &Engine, &(), &mut Empty, &Guarantees::new())?;
+let postgres = |sql: &str| {
+    evaluate(
+        &parse(sql)?,
+        &Engine::Postgres(PostgreSqlDialect {}, PostgreSqlOptions::default()),
+        &(),
+        &mut Empty,
+        &Guarantees::new(),
+    )
+};
+let generic = |sql: &str| evaluate(&parse(sql)?, &Engine::Generic(GenericDialect), &(), &mut Empty, &Guarantees::new());
+// The same expressions, read under the two engines.
+assert!(postgres("2147483647 + 1")?.always_raises());
+assert!(generic("1 + 2")?.may_raise());
+assert!(postgres("1 = 1")?.may_be_true());
+assert!(generic("1 = 1")?.may_be_true());
+assert_eq!(postgres("'a' || 'b'")?.constant().map(ToString::to_string).as_deref(), Some("ab"));
+assert!(!generic("'a' || 'b'")?.may_raise());
+assert_eq!(postgres("+1")?.constant().map(ToString::to_string).as_deref(), Some("1"));
+assert!(!generic("+1")?.may_be_null());
+assert!(matches!(postgres("1::text")?.ty(), ScalarType::Text(_)));
+assert!(matches!(generic("1::text")?.ty(), ScalarType::Text(_)));
+assert!(!postgres("coalesce(1)")?.may_be_null());
+assert!(generic("coalesce(1)")?.may_be_null());
+assert!(postgres("1 = NULL")?.is_always_null());
+assert!(generic("1 = NULL")?.is_always_null());
+let open = postgres("x = 1")?;
 assert!(open.may_be_null());
+assert!(generic("x = 1")?.may_be_null());
 
 # Ok::<(), sqlparser::parser::ParserError>(())
 ```
