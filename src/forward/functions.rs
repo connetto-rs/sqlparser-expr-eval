@@ -1579,6 +1579,10 @@ mod tests {
         assert!(!read(context(), "name LIKE 'a\\%'").may_raise());
         assert!(!read(context(), "name LIKE 'a#' ESCAPE ''").may_raise());
         assert!(read(ColumnContext::new(), "'x' LIKE 'a' ESCAPE NULL").may_be_null());
+        // A pattern or an escape the evaluator does not know may raise.
+        let columns = || context().with_column("p", text_len(Bound::Unbounded, Bound::Unbounded));
+        assert!(read(columns(), "name LIKE p").may_raise());
+        assert!(read(columns(), "name LIKE 'a' ESCAPE p").may_raise());
     }
 
     /// `LIKE` of an impossible value is impossible.

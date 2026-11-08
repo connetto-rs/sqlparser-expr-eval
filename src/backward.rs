@@ -1824,6 +1824,34 @@ mod tests {
         assert!(admits("x = ANY (ARRAY[1.5])", Outcomes::FALSE, 2));
     }
 
+    /// Members of the other modelled types keep their own type too, and an
+    /// integer among `numeric`s reads as a `numeric`.
+    #[test]
+    fn typed_members_of_each_type_narrow_their_column() {
+        let implied = |name: &str, ty: ScalarType, sql: &str, outcomes: Outcomes| {
+            implied_with(
+                ColumnContext::new().with_column(name, plain_column(ty)),
+                &parse(sql),
+                outcomes,
+            )
+        };
+        let n = implied("n", ScalarType::Numeric, "n IN (1, 1.5)", Outcomes::TRUE);
+        let n = column(&n, "n");
+        assert!(n.may_be(&PgValue::Numeric(PgNumeric::from(1))));
+        assert!(!n.may_be(&PgValue::Numeric(PgNumeric::from(2))));
+        let b = implied("b", ScalarType::Boolean, "b IN (true)", Outcomes::TRUE);
+        let b = column(&b, "b");
+        assert!(b.may_be(&PgValue::Boolean(true)) && !b.may_be(&PgValue::Boolean(false)));
+        let d = implied("d", ScalarType::Date, "d IN (DATE '2024-03-01')", Outcomes::TRUE);
+        let d = column(&d, "d");
+        let day =
+            |text: &str| PgValue::Date(sql_values::postgres::parse_date(text).expect("a date"));
+        assert!(d.may_be(&day("2024-03-01")) && !d.may_be(&day("2025-01-01")));
+        let ts = "ts IN (TIMESTAMP '2024-03-01 10:00')";
+        assert!(!implied("ts", ScalarType::Timestamp, ts, Outcomes::TRUE).is_impossible());
+        assert!(!implied("ts", ScalarType::Timestamp, ts, Outcomes::FALSE).is_impossible());
+    }
+
     #[test]
     fn a_false_equality_keeps_the_apart_values_of_a_multi_value_side() {
         let x = Evaluation::new(
