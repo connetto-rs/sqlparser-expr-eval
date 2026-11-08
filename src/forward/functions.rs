@@ -433,8 +433,20 @@ pub(super) fn case<D: EvalDialect, C: Context>(
     conditions: &[CaseWhen],
     else_result: Option<&Expr>,
 ) -> Result<Evaluation, C::Error> {
-    let operand_evaluation =
-        if let Some(operand) = operand { Some(forward(state, operand)?) } else { None };
+    // PostgreSQL reads an untyped operand as `text` before any comparison.
+    let operand_evaluation = match operand {
+        Some(operand) => {
+            let evaluation = forward(state, operand)?;
+            let untyped = evaluation.ty() == ScalarType::UnknownLiteral
+                || (evaluation.ty() == ScalarType::Unknown && evaluation.is_always_null());
+            Some(if untyped {
+                coerce_to(evaluation, ScalarType::Text(TextRules::DEFAULT))
+            } else {
+                evaluation
+            })
+        }
+        None => None,
+    };
     let mut null = false;
     let mut error = false;
     let mut ty = ScalarType::Unknown;
@@ -476,8 +488,14 @@ pub(super) fn case<D: EvalDialect, C: Context>(
     } else if end_reachable {
         null = true;
     }
-    // Untyped literals alone resolve to `text`, as PostgreSQL resolves them.
-    if ty == ScalarType::UnknownLiteral {
+    // Untyped literals and `NULL`s alone resolve to `text`, as PostgreSQL
+    // resolves them.
+    let untyped_null = |(result, _): &(Evaluation, bool)| {
+        result.ty() == ScalarType::Unknown && result.is_always_null()
+    };
+    if ty == ScalarType::UnknownLiteral
+        || (ty == ScalarType::Unknown && results.iter().all(untyped_null))
+    {
         ty = ScalarType::Text(TextRules::DEFAULT);
     }
     let mut values = Values::none();
@@ -564,23 +582,83 @@ pub(super) fn like<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     expr: &Expr,
     pattern: &Expr,
-    _negated: bool,
+    escape: Option<&Expr>,
+    similar: bool,
 ) -> Result<Evaluation, C::Error> {
     let value = forward(state, expr)?;
     let pattern = forward(state, pattern)?;
+    let escape = match escape {
+        Some(escape) => Some(forward(state, escape)?),
+        None => None,
+    };
     let text = |ty: ScalarType| {
         matches!(ty, ScalarType::Text(_) | ScalarType::Unknown | ScalarType::UnknownLiteral)
     };
-    let error =
+    let mut error =
         value.may_raise() || pattern.may_raise() || !text(value.ty()) || !text(pattern.ty());
-    if value.is_impossible() || pattern.is_impossible() {
+    if value.is_impossible()
+        || pattern.is_impossible()
+        || escape.as_ref().is_some_and(Evaluation::is_impossible)
+    {
         return Ok(Evaluation::impossible(ScalarType::Boolean));
     }
-    let null = value.may_be_null() || pattern.may_be_null();
+    let mut null = value.may_be_null() || pattern.may_be_null();
+    // The escape characters the pattern may be read with, `None` among them
+    // for an empty escape, which turns escaping off.
+    let mut escapes = Vec::new();
+    match &escape {
+        None => escapes.push(Some('\\')),
+        Some(escape) => {
+            error |= escape.may_raise() || !text(escape.ty());
+            null |= escape.may_be_null();
+            match escape.values() {
+                Values::Listed(listed) => {
+                    for datum in listed {
+                        let PgValue::Text(text) = datum else { continue };
+                        let mut chars = text.chars();
+                        match (chars.next(), chars.next()) {
+                            (first, None) => escapes.push(first),
+                            // PostgreSQL takes an empty escape or one
+                            // character.
+                            _ => error = true,
+                        }
+                    }
+                }
+                Values::Unlisted(_) => error = true,
+            }
+        }
+    }
+    match pattern.values() {
+        Values::Listed(listed) => {
+            for datum in listed {
+                let PgValue::Text(text) = datum else { continue };
+                error |= escapes.iter().any(|escape| pattern_may_raise(text, *escape, similar));
+            }
+        }
+        // A pattern the evaluator does not know may end with its escape.
+        Values::Unlisted(_) => error = true,
+    }
     // The evaluator does not match `LIKE` patterns, so the value stays
     // unknown.
     let o = Outcomes { truth: true, falsity: true, null };
     Ok(Evaluation::condition(o, error))
+}
+
+/// Whether matching `pattern` may raise: a pattern ending with an unpaired
+/// `escape`, which PostgreSQL refuses once the match reaches it, or a
+/// `SIMILAR TO` pattern with a regular expression operator, which may not
+/// make a valid regular expression.
+fn pattern_may_raise(pattern: &str, escape: Option<char>, similar: bool) -> bool {
+    if similar && pattern.contains(['(', ')', '[', ']', '{', '}', '*', '+', '?', '|']) {
+        return true;
+    }
+    let mut chars = pattern.chars();
+    while let Some(next) = chars.next() {
+        if Some(next) == escape && chars.next().is_none() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The forward evaluation of `x op ANY/ALL (list | subquery)`.
@@ -599,7 +677,7 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
         Ok(Evaluation::new(ScalarType::Boolean, true, error, Values::Unlisted(Unlisted::any())))
     };
     let (value_null, value_has_values) = (value.may_be_null(), !value.values().is_empty());
-    let (cmp, members, error) = match right {
+    let (cmp, members, error) = match support::unnest(right) {
         Expr::Subquery(subquery) => {
             let SubqueryOperand { compared: cmp, column, rows } =
                 match subquery_comparison(state, value, op, subquery)? {
@@ -613,7 +691,8 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             } else {
                 Presence::Never
             };
-            // A row set may leave out the `NULL` rows a column may hold.
+            // A row set may leave out the `NULL` rows a column may hold, or
+            // hold nothing else.
             let null = if column.is_always_null() {
                 Presence::Always
             } else if column.may_be_null() {
@@ -621,7 +700,12 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             } else {
                 Presence::Never
             };
-            let members = Members { nonempty: !column.values().is_empty(), null, empty };
+            let members = Members {
+                nonempty: !column.values().is_empty(),
+                null,
+                empty,
+                null_only: rows_present && column.may_be_null(),
+            };
             (cmp, members, error)
         }
         other => {
@@ -629,7 +713,13 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             let (elements, row) = match other {
                 Expr::Array(Array { elem, .. }) => (elem.clone(), false),
                 Expr::Tuple(elements) => (elements.clone(), true),
-                _ => return unknown(value.may_raise()),
+                _ => {
+                    // An array is `Other`, or `Unknown` when untyped, and
+                    // text is read as an array literal that may be malformed.
+                    let operand = forward(state, other)?;
+                    let array = matches!(operand.ty(), ScalarType::Other | ScalarType::Unknown);
+                    return unknown(value.may_raise() || operand.may_raise() || !array);
+                }
             };
             let mut values = BTreeSet::new();
             let mut null = false;
@@ -673,7 +763,7 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             let empty = if values.is_empty() && !null { Presence::Always } else { Presence::Never };
             // An element that is always `NULL` is in every member set.
             let null = if null { Presence::Always } else { Presence::Never };
-            let members = Members { nonempty: !values.is_empty(), null, empty };
+            let members = Members { nonempty: !values.is_empty(), null, empty, null_only: false };
             (cmp, members, error)
         }
     };
@@ -720,9 +810,9 @@ fn quantified_outcomes(
     // true against every value and a member is `NULL`, both against the
     // non-`NULL` members.
     let nulls = if is_any {
-        rows.all_false || !members.nonempty
+        rows.all_false || !members.nonempty || members.null_only
     } else {
-        rows.all_true || !members.nonempty
+        rows.all_true || !members.nonempty || members.null_only
     };
     let null_member = !matches!(members.null, Presence::Never);
     let null = (value_null && (members.nonempty || null_member))
@@ -738,6 +828,8 @@ struct Members {
     null: Presence,
     /// Whether the members are absent.
     empty: Presence,
+    /// A member set may hold `NULL` members alone.
+    null_only: bool,
 }
 
 /// How often a fact about an `ANY`/`ALL` operand's members holds across the
@@ -1367,6 +1459,47 @@ mod tests {
         assert!(evaluation.may_be(&PgValue::Integer(2)));
     }
 
+    /// A `CASE` of untyped `NULL`s alone resolves to `text`, which `IS
+    /// UNKNOWN` refuses.
+    #[test]
+    fn a_case_of_untyped_nulls_resolves_to_text() {
+        let evaluation = read(ColumnContext::new(), "CASE WHEN true THEN NULL END");
+        assert_eq!(evaluation.ty(), default_text());
+        let tested =
+            read(ColumnContext::new(), "(CASE WHEN true THEN NULL ELSE NULL END) IS UNKNOWN");
+        assert!(tested.may_raise());
+    }
+
+    /// `ANY` keeps the raise of an operand it cannot list, and an operand of
+    /// a scalar type is not the array it needs.
+    #[test]
+    fn any_keeps_the_raise_of_an_unlisted_operand() {
+        let context =
+            ColumnContext::new().with_column("t", text_len(Bound::Unbounded, Bound::Unbounded));
+        assert!(read(context, "5 = ANY (CAST(t AS INT[]))").may_raise());
+        let context = ColumnContext::new().with_column("i", int_col());
+        assert!(read(context, "5 > ANY (i)").may_raise());
+    }
+
+    /// A simple `CASE` reads an untyped operand as `text`, which a number does
+    /// not compare with.
+    #[test]
+    fn a_simple_case_reads_an_untyped_operand_as_text() {
+        assert!(read(ColumnContext::new(), "CASE '1' WHEN 0 THEN 1 END").may_raise());
+        assert!(read(ColumnContext::new(), "CASE NULL WHEN -1 THEN 1 END").may_raise());
+        let matched = read(ColumnContext::new(), "CASE '1' WHEN '1' THEN 1 END");
+        assert_eq!(matched.constant(), Some(&PgValue::Integer(1)));
+        assert!(!matched.may_raise());
+    }
+
+    /// Parentheses around the array of an `ANY` leave its members read.
+    #[test]
+    fn any_reads_a_parenthesised_array() {
+        assert!(read(ColumnContext::new(), "5 <> ALL ((ARRAY[NULL]))").may_raise());
+        let evaluation = read(ColumnContext::new(), "5 = ANY ((ARRAY[1, 2]))");
+        assert!(!evaluation.may_be_true() && evaluation.may_be_false());
+    }
+
     /// `IN` over a list reads the members, including a `NULL`.
     #[test]
     fn in_list_reads_the_members() {
@@ -1429,6 +1562,23 @@ mod tests {
         assert!(nullable.may_be_true());
         let constant = read(ColumnContext::new(), "'abc' LIKE 'a%'");
         assert!(!constant.may_be_null());
+    }
+
+    /// A pattern ending with its escape character, an escape of more than one
+    /// character and a malformed `SIMILAR TO` pattern may raise, and a `NULL`
+    /// escape reads `NULL`.
+    #[test]
+    fn a_like_pattern_and_escape_may_raise() {
+        let context = || {
+            ColumnContext::new().with_column("name", text_len(Bound::Unbounded, Bound::Unbounded))
+        };
+        assert!(read(context(), "name LIKE 'a\\'").may_raise());
+        assert!(read(context(), "name ILIKE 'a#' ESCAPE '#'").may_raise());
+        assert!(read(context(), "name LIKE 'a' ESCAPE 'ab'").may_raise());
+        assert!(read(context(), "name SIMILAR TO '('").may_raise());
+        assert!(!read(context(), "name LIKE 'a\\%'").may_raise());
+        assert!(!read(context(), "name LIKE 'a#' ESCAPE ''").may_raise());
+        assert!(read(ColumnContext::new(), "'x' LIKE 'a' ESCAPE NULL").may_be_null());
     }
 
     /// `LIKE` of an impossible value is impossible.
@@ -1554,6 +1704,25 @@ mod tests {
         let context = || ColumnContext::new().with_column("id", id.clone());
         assert!(!read(context(), "id = ANY(ARRAY[1, NULL])").may_be_false());
         assert!(!read(context(), "id <> ALL(ARRAY[1, NULL])").may_be_true());
+    }
+
+    /// A subquery column that may be `NULL` may hold only `NULL` rows, which
+    /// read `NULL` whatever the members a value matches.
+    #[test]
+    fn a_nullable_subquery_column_may_hold_only_null_rows() {
+        let id = Evaluation::known(PgValue::Integer(1), int4());
+        let column = Evaluation::new(
+            int4(),
+            true,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),
+        );
+        let rows = Rows { none: false, one: true, many: true };
+        let context =
+            || ColumnContext::new().with_column("id", id.clone()).with_query(rows, column.clone());
+        assert!(read(context(), "id = ANY(SELECT id FROM t)").may_be_null());
+        assert!(read(context(), "id <> ALL(SELECT id FROM t)").may_be_null());
+        assert!(read(context(), "id < ANY(SELECT id FROM t)").may_be_null());
     }
 
     /// `ANY` of an impossible value is impossible.

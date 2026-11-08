@@ -50,9 +50,14 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
         return Evaluation::new(ScalarType::Other, null, true, Values::Unlisted(Unlisted::any()));
     }
     // The operator is strict, so a `NULL` operand answers `NULL` without a
-    // raise.
+    // raise, save the widening of a `numeric` side to `double precision`
+    // before it, which may overflow.
     if left.is_always_null() || right.is_always_null() {
-        return Evaluation::null(ty).with_error(error);
+        let widened = ty == ScalarType::Float
+            && [left, right]
+                .iter()
+                .any(|side| side.ty() == ScalarType::Numeric && !side.is_always_null());
+        return Evaluation::null(ty).with_error(error || widened);
     }
     // Never folded, and a float may overflow or divide by zero.
     if matches!(ty, ScalarType::Float | ScalarType::Unknown) {
@@ -619,6 +624,20 @@ mod tests {
         assert!(result.may_raise());
         let one = known_int(1, IntegerType::Integer);
         assert!(arithmetic(&one, &BinaryOperator::Divide, &float).may_raise());
+    }
+
+    /// A `numeric` widens to `double precision` before the operator reads a
+    /// `NULL` side, and may overflow it.
+    #[test]
+    fn a_numeric_widening_may_raise_beside_a_null_float() {
+        let numeric =
+            Evaluation::new(ScalarType::Numeric, false, false, Values::Unlisted(Unlisted::any()));
+        let null = Evaluation::null(ScalarType::Float);
+        let result = arithmetic(&numeric, &BinaryOperator::Multiply, &null);
+        assert!(result.may_be_null());
+        assert!(result.may_raise());
+        let null_numeric = Evaluation::null(ScalarType::Numeric);
+        assert!(!arithmetic(&null_numeric, &BinaryOperator::Multiply, &null).may_raise());
     }
 
     /// A pair PostgreSQL has no operator for raises, on every operator.
