@@ -138,6 +138,26 @@ pub fn parse_statement(statement: &str) -> Expr {
     expr.clone()
 }
 
+/// Reads `sql` under PostgreSQL with no settings.
+pub fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
+    let options = crate::postgres::PostgreSqlOptions::default();
+    crate::forward::evaluate(
+        &parse(sql),
+        &PostgreSqlDialect {},
+        &options,
+        &mut context,
+        &Guarantees::new(),
+    )
+    .expect("the context resolves")
+}
+
+/// Reads `sql` under the conservative generic dialect, with no settings.
+pub fn read_default(mut context: ColumnContext, sql: &str) -> Evaluation {
+    let dialect = sqlparser::dialect::GenericDialect {};
+    crate::forward::evaluate(&parse(sql), &dialect, &(), &mut context, &Guarantees::new())
+        .expect("the context resolves")
+}
+
 /// A callee that returns `returns` and is strict.
 pub fn strict_callee(returns: ScalarType) -> Callee {
     Callee {

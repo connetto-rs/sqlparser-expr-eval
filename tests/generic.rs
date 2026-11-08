@@ -5,86 +5,15 @@ extern crate alloc;
 
 use alloc::collections::BTreeSet;
 
-use sqlparser::{
-    ast::{Expr, Function, ObjectNamePart, SelectItem, SetExpr, Statement},
-    dialect::PostgreSqlDialect,
-    parser::{Parser, ParserError},
-};
 use sqlparser_expr_eval::{
-    Builtin, Callee, CalleeKind, Context, Evaluation, Guarantees, NullInput, Outcomes, Resolved,
-    ScalarType, Unlisted, Values, Volatility, evaluate, implied,
+    Builtin, Callee, CalleeKind, Evaluation, Guarantees, NullInput, Outcomes, ScalarType, Values,
+    Volatility, evaluate, implied,
     sql_values::{IntegerType, PgValue},
 };
 
-/// A context that resolves a fixed set of columns and callees.
-struct Ctx {
-    columns: Vec<(String, Evaluation)>,
-    callees: Vec<(String, Callee)>,
-}
+mod common;
 
-impl Ctx {
-    fn with_callee(mut self, name: &str, callee: Callee) -> Self {
-        self.callees.push((name.to_string(), callee));
-        self
-    }
-}
-
-/// A nullable, non-raising column of `ty` with unlisted values.
-fn column(ty: ScalarType, null: bool) -> Evaluation {
-    Evaluation::new(ty, null, false, Values::Unlisted(Unlisted::any()))
-}
-
-impl Context for Ctx {
-    type Reference = String;
-    type Error = ParserError;
-
-    fn reference(
-        &mut self,
-        expression: &Expr,
-    ) -> Result<Option<Resolved<Self::Reference>>, Self::Error> {
-        let name = match expression {
-            Expr::Identifier(ident) => Some(ident.value.clone()),
-            Expr::CompoundIdentifier(parts) if parts.len() == 1 => Some(parts[0].value.clone()),
-            _ => None,
-        };
-        let Some(name) = name else {
-            return Ok(None);
-        };
-        Ok(self.columns.iter().find(|(key, _)| *key == name).map(|(_, evaluation)| {
-            Resolved { reference: name.clone(), evaluation: evaluation.clone() }
-        }))
-    }
-
-    fn callees(&mut self, call: &Function) -> Result<Vec<Callee>, Self::Error> {
-        let Some(name) = call.name.0.last().and_then(ObjectNamePart::as_ident) else {
-            return Ok(Vec::new());
-        };
-        let name = name.value.to_lowercase();
-        Ok(self
-            .callees
-            .iter()
-            .filter(|(callee_name, _)| *callee_name == name)
-            .map(|(_, callee)| callee.clone())
-            .collect())
-    }
-}
-
-/// The expression of `SELECT expression`.
-#[expect(clippy::expect_used, clippy::panic, reason = "a malformed test expression fails the test")]
-fn parse(expression: &str) -> Expr {
-    let statements =
-        Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expression}")).expect("parses");
-    let Statement::Query(query) = &statements[0] else {
-        panic!("the test statement is a query");
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        panic!("the test query is a select");
-    };
-    let [SelectItem::UnnamedExpr(expr)] = select.projection.as_slice() else {
-        panic!("the test select projects one expression");
-    };
-    expr.clone()
-}
+use common::{Ctx, builtin_callee, column, parse};
 
 /// Reads `sql` under the conservative generic dialect, with no settings.
 #[expect(clippy::expect_used, reason = "a context error fails the test")]
@@ -101,10 +30,7 @@ fn read(mut context: Ctx, sql: &str) -> Evaluation {
 
 /// A context with a nullable integer `x`.
 fn context() -> Ctx {
-    Ctx {
-        columns: vec![("x".into(), column(ScalarType::Integer(IntegerType::Integer), true))],
-        callees: Vec::new(),
-    }
+    Ctx::with_columns(vec![("x".into(), column(ScalarType::Integer(IntegerType::Integer), true))])
 }
 
 /// Reads `sql`'s guarantee under the given outcomes, in the conservative
@@ -126,19 +52,6 @@ fn imply(mut context: Ctx, sql: &str, outcomes: Outcomes) -> Guarantees<String> 
 fn strict_callee(returns: ScalarType) -> Callee {
     Callee::new(
         None,
-        NullInput::Strict,
-        Volatility::Immutable,
-        CalleeKind::Normal,
-        returns,
-        false,
-        0,
-    )
-}
-
-/// A callee that folds the built-in `builtin` and returns `returns`.
-fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
-    Callee::new(
-        Some(builtin),
         NullInput::Strict,
         Volatility::Immutable,
         CalleeKind::Normal,
@@ -266,7 +179,7 @@ fn an_all_over_a_null_member_reads_null_when_it_equals_the_rest() {
             Values::Listed(BTreeSet::from([PgValue::Integer(value)])),
         )
     };
-    let context = Ctx { columns: vec![("x".to_string(), listed(1))], callees: Vec::new() };
+    let context = Ctx::with_columns(vec![("x".to_string(), listed(1))]);
     let result = read(context, "x = ALL (ARRAY[1, NULL])");
     assert!(result.is_always_null());
 }
@@ -283,7 +196,7 @@ fn an_any_over_a_null_member_reads_null_when_it_is_apart() {
             Values::Listed(BTreeSet::from([PgValue::Integer(value)])),
         )
     };
-    let context = Ctx { columns: vec![("x".to_string(), listed(2))], callees: Vec::new() };
+    let context = Ctx::with_columns(vec![("x".to_string(), listed(2))]);
     let result = read(context, "x = ANY (ARRAY[1, NULL])");
     assert!(result.is_always_null());
 }

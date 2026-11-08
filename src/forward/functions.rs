@@ -909,31 +909,14 @@ mod tests {
     use core::ops::Bound;
 
     use sql_values::{IntegerType, PgNumeric, PgValue};
-    use sqlparser::{
-        ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart},
-        dialect::PostgreSqlDialect,
-    };
+    use sqlparser::ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart};
 
     use crate::{
         context::{Builtin, Callee, CalleeKind, NullInput, Rows, Volatility},
         domain::{Evaluation, Interval, Unlisted, Values},
-        evaluate,
-        guarantees::Guarantees,
-        postgres::PostgreSqlOptions,
         scalar::{ScalarType, TextRules},
-        test_context::{ColumnContext, builtin_callee, parse},
+        test_context::{ColumnContext, builtin_callee, parse, read},
     };
-
-    fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(
-            &parse(sql),
-            &PostgreSqlDialect {},
-            &PostgreSqlOptions::default(),
-            &mut context,
-            &Guarantees::new(),
-        )
-        .expect("the context resolves")
-    }
 
     fn int(value: i64) -> Evaluation {
         Evaluation::known(PgValue::Integer(value), ScalarType::Integer(IntegerType::Integer))

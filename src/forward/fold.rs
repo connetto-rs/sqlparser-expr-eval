@@ -1094,7 +1094,7 @@ mod tests {
     use sql_values::{IntegerType, PgNumeric, PgValue};
     use sqlparser::{
         ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan},
-        dialect::{GenericDialect, PostgreSqlDialect},
+        dialect::PostgreSqlDialect,
         tokenizer::Span,
     };
 
@@ -1108,24 +1108,8 @@ mod tests {
         guarantees::{Guarantees, Subject},
         postgres::PostgreSqlOptions,
         scalar::{ScalarType, TextRules},
-        test_context::{ColumnContext, parse},
+        test_context::{ColumnContext, parse, read, read_default},
     };
-
-    fn read(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(
-            &parse(sql),
-            &PostgreSqlDialect {},
-            &PostgreSqlOptions::default(),
-            &mut context,
-            &Guarantees::new(),
-        )
-        .expect("resolves")
-    }
-
-    fn read_default(mut context: ColumnContext, sql: &str) -> Evaluation {
-        evaluate(&parse(sql), &GenericDialect, &(), &mut context, &Guarantees::new())
-            .expect("resolves")
-    }
 
     fn read_guarantees(
         mut context: ColumnContext,

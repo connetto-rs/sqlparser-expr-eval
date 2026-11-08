@@ -85,30 +85,14 @@ mod tests {
     use alloc::collections::BTreeSet;
 
     use sql_values::{IntegerType, PgValue};
-    use sqlparser::{ast::BinaryOperator, dialect::PostgreSqlDialect};
+    use sqlparser::ast::BinaryOperator;
 
     use super::comparison;
     use crate::{
         domain::{Evaluation, Unlisted, Values},
-        forward::evaluate,
-        guarantees::Guarantees,
-        postgres::PostgreSqlOptions,
         scalar::{ScalarType, TextRules},
-        test_context::{ColumnContext, parse},
+        test_context::{ColumnContext, read},
     };
-
-    fn read(context: ColumnContext, sql: &str) -> Evaluation {
-        let expression = parse(sql);
-        let mut context = context;
-        evaluate(
-            &expression,
-            &PostgreSqlDialect {},
-            &PostgreSqlOptions::default(),
-            &mut context,
-            &Guarantees::new(),
-        )
-        .expect("the context resolves")
-    }
 
     fn int(ty: IntegerType) -> Evaluation {
         Evaluation::new(ScalarType::Integer(ty), true, false, Values::Unlisted(Unlisted::any()))

@@ -1677,6 +1677,20 @@ mod tests {
         Evaluation::new(ty, false, false, Values::Unlisted(Unlisted::any()))
     }
 
+    /// A boolean routine that runs on `NULL` input and returns `NULL` for a
+    /// `NULL` at one of `positions`.
+    fn called_on_null(positions: Vec<usize>) -> crate::Callee {
+        crate::context::Callee {
+            builtin: None,
+            null_input: crate::context::NullInput::CalledOnNull(positions),
+            volatility: crate::context::Volatility::Immutable,
+            kind: crate::context::CalleeKind::Normal,
+            returns: ScalarType::Boolean,
+            returns_set: false,
+            token: 1,
+        }
+    }
+
     /// PostgreSQL's `length(text)`.
     fn length_callee() -> crate::Callee {
         let mut callee = crate::test_context::strict_callee(ScalarType::Integer(
@@ -1757,15 +1771,7 @@ mod tests {
 
     #[test]
     fn a_called_on_null_callee_keeps_the_argument_null() {
-        let other = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(Vec::new()),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let other = called_on_null(Vec::new());
         let expression = parse("f(x)");
         let guarantees = implied_with(
             ColumnContext::new()
@@ -4195,15 +4201,7 @@ mod tests {
 
     #[test]
     fn a_call_making_several_routines_keeps_the_argument_when_each_routine_nulls_it() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4249,15 +4247,7 @@ mod tests {
 
     #[test]
     fn a_called_on_null_callee_null_points_at_the_argument_under_a_null_on_null_input_dialect() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_null_on_null(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4272,15 +4262,7 @@ mod tests {
     fn a_called_on_null_callee_null_under_postgres_points_at_nothing() {
         // PostgreSQL's `NULL` result may come from non-`NULL` input, so no
         // argument is constrained.
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4296,15 +4278,7 @@ mod tests {
     fn a_call_null_over_no_argument_keeps_nothing() {
         // The routine may answer `NULL` however it likes, so no argument is
         // pointed at.
-        let no_position = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(Vec::new()),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let no_position = called_on_null(Vec::new());
         let guarantees = implied_null_on_null(
             ColumnContext::new().with_callee("g", no_position),
             &parse("g()"),
@@ -4357,15 +4331,7 @@ mod tests {
     #[test]
     fn a_out_of_range_called_on_null_position_keeps_no_subject() {
         // The routine nulls its second argument, which the call holds no.
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![1]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![1]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4712,15 +4678,7 @@ mod tests {
     /// Two routines nulling the same argument still point at it once.
     #[test]
     fn two_routines_nulling_one_argument_keep_it_non_null() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4735,15 +4693,7 @@ mod tests {
     /// Two routines nulling the same argument point a `NULL` result at it once.
     #[test]
     fn two_routines_nulling_one_argument_keep_the_null_subject() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![0]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![0]);
         let guarantees = implied_null_on_null(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
@@ -4759,15 +4709,7 @@ mod tests {
     /// at nothing.
     #[test]
     fn an_out_of_range_null_position_keeps_no_subject() {
-        let called_on_null = crate::context::Callee {
-            builtin: None,
-            null_input: crate::context::NullInput::CalledOnNull(vec![5]),
-            volatility: crate::context::Volatility::Immutable,
-            kind: crate::context::CalleeKind::Normal,
-            returns: ScalarType::Boolean,
-            returns_set: false,
-            token: 1,
-        };
+        let called_on_null = called_on_null(vec![5]);
         let guarantees = implied_null_on_null(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
