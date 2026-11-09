@@ -6,11 +6,11 @@ use core::ops::Bound;
 use sql_values::postgres::{
     CastTarget, CastValue, CharLength, IntegerType, NumericTypmod, PgNumeric, PgValue, cast_value,
 };
-use sqlparser::ast::{ArrayElemTypeDef, CastKind, CharacterLength, DataType, ExactNumberInfo};
+use sqlparser::ast::{CastKind, CharacterLength, DataType, ExactNumberInfo};
 
 use crate::{
     domain::{Evaluation, Unlisted, Values},
-    scalar::{self, ScalarType},
+    scalar::{self, ArrayElement, ScalarType},
 };
 
 /// The result of a cast of `source` to `to` under PostgreSQL's casts and
@@ -28,117 +28,162 @@ pub(super) fn cast(
     if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) {
         return Evaluation::unknown(to).with_error(source.may_raise());
     }
-    if let DataType::Array(element) = data_type {
-        let element = match element {
-            // The element's type decides the members' cast; the bracket and
-            // size syntax does not.
-            ArrayElemTypeDef::AngleBracket(element)
-            | ArrayElemTypeDef::SquareBracket(element, _)
-            | ArrayElemTypeDef::Parenthesis(element)
-            | ArrayElemTypeDef::ParenthesisNotNull(element)
-            | ArrayElemTypeDef::Qualified(element, _) => element,
-            // An array without a stated element type casts nothing we can
-            // fold.
-            ArrayElemTypeDef::None => {
-                return Evaluation::unknown(ScalarType::Other).with_error(source.may_raise());
-            }
+    if let DataType::Array(definition) = data_type {
+        // An array without a stated element type casts nothing we can fold.
+        let Some(element) = scalar::array_element(definition) else {
+            return Evaluation::unknown(ScalarType::Other).with_error(source.may_raise());
         };
         return cast_array(element, element_type(element), source);
     }
-    let mut values = BTreeSet::new();
-    let mut unknown = false;
     // A typed `NULL` still needs a cast between the two types.
     let mut fold_error = source.may_raise() || (source.is_always_null() && cast_raises(source, to));
-    match source.values() {
+    let values = match source.values() {
         Values::Listed(listed) => {
-            for datum in listed {
-                match scalar::cast(datum, source.ty(), to) {
-                    scalar::Cast::Folded(folded) => {
-                        values.insert(folded);
-                    }
-                    scalar::Cast::Raises => fold_error = true,
-                    scalar::Cast::Unknown => {
-                        unknown = true;
-                        fold_error |= cast_raises(source, to);
-                    }
-                }
+            let fold = scalar::cast_datums(listed, |datum| scalar::cast(datum, source.ty(), to));
+            fold_error |= fold.raises || (fold.undecided && cast_raises(source, to));
+            if fold.undecided {
+                Values::Unlisted(Unlisted::any())
+            } else {
+                Values::Listed(fold.values)
             }
         }
         Values::Unlisted(_) => {
-            unknown = true;
             fold_error |= cast_raises(source, to);
+            Values::Unlisted(Unlisted::any())
         }
-    }
-    let values = if unknown { Values::Unlisted(Unlisted::any()) } else { Values::Listed(values) };
+    };
     let mut evaluation = Evaluation::new(to, source.may_be_null(), fold_error, values);
-    if to.is_text()
-        && let Some(limit) = varchar_limit(data_type)
-    {
-        evaluation = if CharLength::new(limit).is_some() {
-            truncate_text(&evaluation, limit)
-        } else {
-            // PostgreSQL refuses the type itself.
-            Evaluation::raising(to)
-        };
-    }
-    if let Some((precision, scale)) = numeric_modifier(data_type) {
-        let typmod = u16::try_from(precision)
-            .ok()
-            .zip(i16::try_from(scale).ok())
-            .and_then(|(precision, scale)| NumericTypmod::new(precision, scale));
-        evaluation = match typmod {
-            Some(typmod) => {
-                let raise = numeric_typmod_raises(source, typmod) || evaluation.may_raise();
-                round_numeric(evaluation, typmod).with_error(raise)
+    match modifier(data_type) {
+        Modifier::Varchar(limit) => {
+            if to.is_text() {
+                evaluation = truncate_text(&evaluation, limit);
             }
+        }
+        Modifier::Refused => {
             // PostgreSQL refuses the type itself.
-            None => Evaluation::raising(to),
-        };
+            evaluation = Evaluation::raising(to);
+        }
+        Modifier::Numeric(typmod) => {
+            let raise = numeric_typmod_raises(source, typmod) || evaluation.may_raise();
+            evaluation = round_numeric(evaluation, typmod).with_error(raise);
+        }
+        Modifier::None => {}
     }
     evaluation
 }
 
-/// The fold of a cast of a constant array, applying the element cast and
-/// its `varchar` bound to every member, unknown when a member's cast is
-/// undecided or the array holds no constant members.
+/// The cast of `source` to an array of `element`: text read by `array_in`
+/// and an array cast element by element, both under the element's
+/// modifiers, while PostgreSQL has no cast from another type to an array.
 fn cast_array(element: &DataType, ty: ScalarType, source: &Evaluation) -> Evaluation {
-    let limit = varchar_limit(element);
-    if limit.is_some_and(|limit| CharLength::new(limit).is_none()) {
-        // PostgreSQL refuses the element type itself.
-        return Evaluation::raising(ScalarType::Other);
+    let array = ScalarType::Array(ArrayElement::of(ty));
+    let readable = matches!(
+        source.ty(),
+        ScalarType::Array(_)
+            | ScalarType::Text(_)
+            | ScalarType::UnknownLiteral
+            | ScalarType::Unknown
+            | ScalarType::Other
+    );
+    if !readable {
+        return Evaluation::raising(array);
     }
-    // Only an `ARRAY[...]` constructor lists its members, untyped. Any other
-    // source is text read as an array literal, which may be malformed, or an
-    // array whose members the cast may refuse.
-    if source.ty() != ScalarType::Unknown {
-        let error = source.may_raise() || !source.is_always_null();
+    let target = match element_target(element, ty) {
+        ElementTarget::Refused => return Evaluation::raising(array),
+        ElementTarget::Unmodelled => None,
+        ElementTarget::Cast(target) => Some(target),
+    };
+    if source.is_always_null() {
+        return Evaluation::null(array).with_error(source.may_raise());
+    }
+    // A type the evaluator does not model may have no cast to the array.
+    let unmodelled = source.ty().is_unmodelled();
+    let (Some(target), Values::Listed(listed)) = (target, source.values()) else {
         return Evaluation::new(
-            ScalarType::Other,
+            array,
             source.may_be_null(),
-            error,
+            true,
             Values::Unlisted(Unlisted::any()),
         );
-    }
-    let Values::Listed(listed) = source.values() else {
-        return Evaluation::unknown(ScalarType::Other).with_error(source.may_raise());
     };
-    let mut values = BTreeSet::new();
-    let mut error = source.may_raise();
-    for datum in listed {
-        match scalar::cast(datum, source.ty(), ty) {
-            scalar::Cast::Folded(folded) => {
-                values.insert(match limit {
-                    Some(limit) => clip(&folded, limit),
-                    None => folded,
-                });
+    let fold = scalar::cast_datums(listed, |datum| scalar::array_cast(datum, target));
+    let error = source.may_raise() || unmodelled || fold.raises || fold.undecided;
+    let values = if fold.undecided {
+        Values::Unlisted(Unlisted::any())
+    } else {
+        Values::Listed(fold.values)
+    };
+    Evaluation::new(array, source.may_be_null(), error, values)
+}
+
+/// How an array's element type reads as a cast target.
+enum ElementTarget {
+    /// PostgreSQL refuses the type's modifier.
+    Refused,
+    /// The casts do not model the type.
+    Unmodelled,
+    /// The target with its modifier.
+    Cast(CastTarget),
+}
+
+/// The cast target of an array's element type `ty`, spelled `element`, with
+/// the `varchar`, `numeric` and `timestamp` modifiers it states.
+fn element_target(element: &DataType, ty: ScalarType) -> ElementTarget {
+    match modifier(element) {
+        // `modifier` checks the limit against PostgreSQL's range.
+        Modifier::Varchar(limit) => {
+            ElementTarget::Cast(CastTarget::Varchar(CharLength::new(limit)))
+        }
+        Modifier::Refused => ElementTarget::Refused,
+        Modifier::Numeric(typmod) => ElementTarget::Cast(CastTarget::Numeric(Some(typmod))),
+        Modifier::None => {
+            if let (ScalarType::Timestamp, DataType::Timestamp(Some(precision), _)) = (ty, element)
+            {
+                let precision = u8::try_from((*precision).min(6)).unwrap_or(6);
+                return ElementTarget::Cast(CastTarget::Timestamp(Some(precision)));
             }
-            scalar::Cast::Raises => error = true,
-            scalar::Cast::Unknown => {
-                return Evaluation::unknown(ScalarType::Other).with_error(error);
+            match scalar::cast_target(ty) {
+                Some(target) => ElementTarget::Cast(target),
+                None => ElementTarget::Unmodelled,
             }
         }
     }
-    Evaluation::new(ScalarType::Other, source.may_be_null(), error, Values::Listed(values))
+}
+
+/// The modifier a type states: a bound or typmod PostgreSQL holds, or a
+/// modifier it refuses.
+enum Modifier {
+    /// No `varchar` or `numeric` modifier.
+    None,
+    /// PostgreSQL refuses the modifier.
+    Refused,
+    /// A `varchar` bound PostgreSQL accepts.
+    Varchar(usize),
+    /// A `numeric` typmod PostgreSQL accepts.
+    Numeric(NumericTypmod),
+}
+
+/// The modifier `data_type` states.
+fn modifier(data_type: &DataType) -> Modifier {
+    if let Some(limit) = varchar_limit(data_type) {
+        return match CharLength::new(limit) {
+            Some(_) => Modifier::Varchar(limit),
+            None => Modifier::Refused,
+        };
+    }
+    match numeric_modifier(data_type) {
+        Some((precision, scale)) => {
+            let typmod = u16::try_from(precision)
+                .ok()
+                .zip(i16::try_from(scale).ok())
+                .and_then(|(precision, scale)| NumericTypmod::new(precision, scale));
+            match typmod {
+                Some(typmod) => Modifier::Numeric(typmod),
+                None => Modifier::Refused,
+            }
+        }
+        None => Modifier::None,
+    }
 }
 
 /// The maximum length `varchar` typmods state, when they name one.
@@ -241,7 +286,7 @@ fn cast_raises(source: &Evaluation, to: ScalarType) -> bool {
         }
         // An integer always fits a `float`, a `numeric` or `float` may not.
         ScalarType::Float => !matches!(from, ScalarType::Integer(_)),
-        ScalarType::Other => true,
+        ScalarType::Other | ScalarType::Array(_) => true,
     }
 }
 
@@ -314,7 +359,7 @@ fn round_numeric(evaluation: Evaluation, typmod: NumericTypmod) -> Evaluation {
 
 #[cfg(test)]
 mod tests {
-    use alloc::collections::BTreeSet;
+    use alloc::{collections::BTreeSet, string::ToString};
     use core::ops::Bound;
 
     use sql_values::postgres::{IntegerType, NumericTypmod, PgNumeric, PgValue};
@@ -675,10 +720,14 @@ mod tests {
         ));
     }
 
-    /// The evaluation of an `ARRAY[...]` constructor of the text members.
+    /// The `text[]` value of the members.
     fn array(members: &[&str]) -> Evaluation {
-        let members = members.iter().map(|member| PgValue::Text((*member).to_string())).collect();
-        Evaluation::new(ScalarType::Unknown, false, false, Values::Listed(members))
+        let elements =
+            members.iter().map(|member| Some(PgValue::Text((*member).to_string()))).collect();
+        Evaluation::known(
+            PgValue::Array(sql_values::postgres::PgArray::new(elements)),
+            ScalarType::Array(crate::scalar::ArrayElement::Text(TextRules::DEFAULT)),
+        )
     }
 
     /// A cast to an array of a non-listed source is unknown.
@@ -701,14 +750,15 @@ mod tests {
         assert!(evaluation.may_raise());
     }
 
-    /// Text cast to an array is an array literal, which may be malformed,
-    /// and only a `NULL` never raises.
+    /// Text cast to an array reads through `array_in`, raising on a
+    /// malformed literal or element, and a `NULL` never raises.
     #[test]
-    fn an_array_cast_of_text_may_raise() {
+    fn an_array_cast_reads_text_through_array_in() {
         let int = ScalarType::Integer(IntegerType::Integer);
         let evaluation = super::cast_array(&DataType::Int(None), int, &text("{1,2}"));
-        assert!(evaluation.may_raise() && !evaluation.always_raises());
-        assert!(!evaluation.may_be_null());
+        assert_eq!(evaluation.constant().map(ToString::to_string).as_deref(), Some("{1,2}"));
+        assert!(super::cast_array(&DataType::Int(None), int, &text("{a}")).always_raises());
+        assert!(super::cast_array(&DataType::Int(None), int, &text("{1")).always_raises());
         let null = Evaluation::null(ScalarType::Text(TextRules::DEFAULT));
         let evaluation = super::cast_array(&DataType::Int(None), int, &null);
         assert!(!evaluation.may_raise());
@@ -726,14 +776,12 @@ mod tests {
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     }
 
-    /// An array cast folds each member and applies a `varchar` bound.
+    /// An array cast casts each element under the element's `varchar` bound.
     #[test]
-    fn an_array_cast_folds_its_members() {
+    fn an_array_cast_casts_its_elements() {
         let elem = varchar(1);
         let evaluation =
             super::cast_array(&elem, ScalarType::Text(TextRules::DEFAULT), &array(&["abcd", "xy"]));
-        assert!(evaluation.may_be(&PgValue::Text("a".to_string())));
-        assert!(evaluation.may_be(&PgValue::Text("x".to_string())));
-        assert!(!evaluation.may_be(&PgValue::Text("abcd".to_string())));
+        assert_eq!(evaluation.constant().map(ToString::to_string).as_deref(), Some("{a,x}"));
     }
 }

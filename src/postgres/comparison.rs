@@ -5,7 +5,7 @@ use sqlparser::ast::BinaryOperator;
 use crate::{
     domain::Evaluation,
     forward::fold::{
-        Comparison, RowKinds, comparison_category, pair_analysis, reinterpret_unknown,
+        Category, Comparison, RowKinds, comparison_category, pair_analysis, reinterpret_unknown,
     },
     scalar::{ScalarType, TextRules},
 };
@@ -14,6 +14,8 @@ use crate::{
 /// literal typing and value comparison.
 pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluation) -> Comparison {
     let error = left.may_raise() || right.may_raise();
+    let literal =
+        left.ty() == ScalarType::UnknownLiteral || right.ty() == ScalarType::UnknownLiteral;
     let (left, right) = resolve_unknown_sides(left, right);
     // Resolving an untyped literal against the other side may raise.
     let error = error || left.may_raise() || right.may_raise();
@@ -26,10 +28,17 @@ pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluatio
     if right.ty() == ScalarType::Date && left.ty() == ScalarType::Timestamp {
         right = right.with_type(ScalarType::Timestamp);
     }
-    let unmodelled = |ty: ScalarType| matches!(ty, ScalarType::Other | ScalarType::Unknown);
-    let modelled = !unmodelled(left.ty()) && !unmodelled(right.ty());
+    let modelled = !left.ty().is_unmodelled() && !right.ty().is_unmodelled();
+    // The evaluator reads `varchar` as `text`, and PostgreSQL compares a
+    // `varchar` array with no `text` array, save an untyped literal that
+    // takes the other side's type.
+    let text_arrays = |category: &Category| {
+        matches!(category, Category::Array(element) if element.is_text()) && !literal
+    };
     if left.is_always_null() || right.is_always_null() {
-        let refused = modelled && comparison_category(left.ty(), right.ty()).is_none();
+        let refused = modelled
+            && comparison_category(left.ty(), right.ty())
+                .is_none_or(|category| text_arrays(&category));
         return Comparison::new(RowKinds::NONE, error || refused);
     }
     // An unmodelled type may have the operator, with any outcome.
@@ -51,7 +60,8 @@ pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluatio
     if !valid_op {
         return Comparison::new(RowKinds::NONE, true);
     }
-    Comparison::new(pair_analysis(&left, &right, &category, op), error)
+    let refused = text_arrays(&category);
+    Comparison::new(pair_analysis(&left, &right, &category, op), error || refused)
 }
 
 /// The operands with their unknown-literal types resolved against the other

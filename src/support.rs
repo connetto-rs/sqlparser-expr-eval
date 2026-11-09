@@ -3,7 +3,7 @@
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::ops::Bound;
 
-use sql_values::postgres::{PgNumeric, PgValue};
+use sql_values::postgres::{PgArray, PgNumeric, PgValue};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName, Value,
     ValueWithSpan,
@@ -432,6 +432,8 @@ pub(crate) fn as_condition(evaluation: Evaluation) -> Evaluation {
         ScalarType::UnknownLiteral => {
             crate::forward::fold::reinterpret_unknown(evaluation, ScalarType::Boolean)
         }
+        // No engine reads an array as a condition.
+        ScalarType::Array(_) => Evaluation::raising(ScalarType::Boolean),
         _ => {
             Evaluation::new(
                 ScalarType::Boolean,
@@ -450,6 +452,19 @@ pub(crate) fn sign_may_raise(evaluation: &Evaluation) -> bool {
     let ty = evaluation.ty();
     let untyped_null = evaluation.is_untyped_null();
     untyped_null || !(ty.is_number() || matches!(ty, ScalarType::Float | ScalarType::Unknown))
+}
+
+/// The non-`NULL` members of `array`, and whether it holds a `NULL` member.
+pub(crate) fn array_members(array: &PgArray) -> (BTreeSet<PgValue>, bool) {
+    let (mut values, mut null) = (BTreeSet::new(), false);
+    for member in array.elements() {
+        if let Some(member) = member {
+            values.insert(member.clone());
+        } else {
+            null = true;
+        }
+    }
+    (values, null)
 }
 
 #[cfg(test)]
