@@ -909,7 +909,7 @@ fn concat_combine<D: EvalDialect, C: Context>(
     let is_text = |evaluation: &Evaluation| {
         evaluation.ty().is_text()
             || evaluation.ty() == ScalarType::UnknownLiteral
-            || (evaluation.ty() == ScalarType::Unknown && evaluation.is_always_null())
+            || evaluation.is_untyped_null()
     };
     if !is_text(left) && !is_text(right) {
         // Neither side is text, so `||` has no type to resolve to.

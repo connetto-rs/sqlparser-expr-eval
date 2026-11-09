@@ -437,9 +437,7 @@ pub(super) fn case<D: EvalDialect, C: Context>(
     let operand_evaluation = match operand {
         Some(operand) => {
             let evaluation = forward(state, operand)?;
-            let untyped = evaluation.ty() == ScalarType::UnknownLiteral
-                || (evaluation.ty() == ScalarType::Unknown && evaluation.is_always_null());
-            Some(if untyped {
+            Some(if evaluation.is_untyped() {
                 coerce_to(evaluation, ScalarType::Text(TextRules::DEFAULT))
             } else {
                 evaluation
@@ -490,11 +488,9 @@ pub(super) fn case<D: EvalDialect, C: Context>(
     }
     // Untyped literals and `NULL`s alone resolve to `text`, as PostgreSQL
     // resolves them.
-    let untyped_null = |(result, _): &(Evaluation, bool)| {
-        result.ty() == ScalarType::Unknown && result.is_always_null()
-    };
     if ty == ScalarType::UnknownLiteral
-        || (ty == ScalarType::Unknown && results.iter().all(untyped_null))
+        || (ty == ScalarType::Unknown
+            && results.iter().all(|(result, _): &(Evaluation, bool)| result.is_untyped_null()))
     {
         ty = ScalarType::Text(TextRules::DEFAULT);
     }
@@ -1684,11 +1680,9 @@ mod tests {
         assert!(read(context(), "id = ALL(SELECT id FROM t)").may_be_true());
     }
 
-    /// A subquery column that may be `NULL` need not hold a `NULL` row, so an
-    /// `ANY` may still fail every row and an `ALL` may still satisfy every row.
-    #[test]
-    fn a_nullable_subquery_column_need_not_hold_a_null_row() {
-        let id = Evaluation::known(PgValue::Integer(3), int4());
+    /// The context of a constant `id` beside a subquery column that may be
+    /// `NULL` and holds one or many of its listed rows.
+    fn nullable_subquery(id: &PgValue) -> ColumnContext {
         let column = Evaluation::new(
             int4(),
             true,
@@ -1696,16 +1690,28 @@ mod tests {
             Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),
         );
         let rows = Rows { none: false, one: true, many: true };
-        let context =
-            || ColumnContext::new().with_column("id", id.clone()).with_query(rows, column.clone());
+        ColumnContext::new()
+            .with_column("id", Evaluation::known(id.clone(), int4()))
+            .with_query(rows, column)
+    }
+
+    /// A subquery column that may be `NULL` need not hold a `NULL` row, so an
+    /// `ANY` may still fail every row and an `ALL` may still satisfy every row.
+    #[test]
+    fn a_nullable_subquery_column_need_not_hold_a_null_row() {
+        let id = PgValue::Integer(3);
+        let context = || nullable_subquery(&id);
         assert!(read(context(), "id = ANY(SELECT id FROM t)").may_be_false());
         assert!(read(context(), "id <> ALL(SELECT id FROM t)").may_be_true());
         // A column holding only `NULL` reads `NULL` on every row set.
-        let nulls = Evaluation::null(int4());
-        let context = ColumnContext::new().with_column("id", id.clone()).with_query(rows, nulls);
+        let rows = Rows { none: false, one: true, many: true };
+        let context = ColumnContext::new()
+            .with_column("id", Evaluation::known(id.clone(), int4()))
+            .with_query(rows, Evaluation::null(int4()));
         assert!(read(context, "id = ANY(SELECT id FROM t)").is_always_null());
         // An array's `NULL` element is in every member set.
-        let context = || ColumnContext::new().with_column("id", id.clone());
+        let context =
+            || ColumnContext::new().with_column("id", Evaluation::known(id.clone(), int4()));
         assert!(!read(context(), "id = ANY(ARRAY[1, NULL])").may_be_false());
         assert!(!read(context(), "id <> ALL(ARRAY[1, NULL])").may_be_true());
     }
@@ -1714,16 +1720,8 @@ mod tests {
     /// read `NULL` whatever the members a value matches.
     #[test]
     fn a_nullable_subquery_column_may_hold_only_null_rows() {
-        let id = Evaluation::known(PgValue::Integer(1), int4());
-        let column = Evaluation::new(
-            int4(),
-            true,
-            false,
-            Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),
-        );
-        let rows = Rows { none: false, one: true, many: true };
-        let context =
-            || ColumnContext::new().with_column("id", id.clone()).with_query(rows, column.clone());
+        let id = PgValue::Integer(1);
+        let context = || nullable_subquery(&id);
         assert!(read(context(), "id = ANY(SELECT id FROM t)").may_be_null());
         assert!(read(context(), "id <> ALL(SELECT id FROM t)").may_be_null());
         assert!(read(context(), "id < ANY(SELECT id FROM t)").may_be_null());

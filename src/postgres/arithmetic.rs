@@ -22,13 +22,11 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
         return result;
     }
     // An untyped `NULL` reads as the type of a number on the other side.
-    let untyped_null =
-        |side: &Evaluation| side.ty() == ScalarType::Unknown && side.is_always_null();
     let number = |side: &Evaluation| side.ty().is_number() || side.ty() == ScalarType::Float;
-    if untyped_null(left) && number(right) {
+    if left.is_untyped_null() && number(right) {
         return arithmetic(&Evaluation::null(right.ty()).with_error(left.may_raise()), op, right);
     }
-    if untyped_null(right) && number(left) {
+    if right.is_untyped_null() && number(left) {
         return arithmetic(left, op, &Evaluation::null(left.ty()).with_error(right.may_raise()));
     }
     let ty = arithmetic_type(left.ty(), right.ty());
