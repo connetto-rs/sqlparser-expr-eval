@@ -7,7 +7,7 @@ use sql_values::postgres::PgValue;
 use crate::{
     domain::{Evaluation, Unlisted, Values},
     forward::fold::reinterpret_unknown,
-    scalar::{ScalarType, TextRules},
+    scalar::{ArrayElement, ScalarType, TextRules},
     support,
 };
 
@@ -47,7 +47,11 @@ pub(super) fn name_recognised(
     } else {
         argument_evaluations
     };
-    let error = error || unsure || arguments.iter().any(Evaluation::may_raise);
+    // `NULLIF` compares its arguments through `=`, which PostgreSQL has
+    // between no `text` and `varchar` arrays, both read as `text` here.
+    let text_arrays = name == "nullif"
+        && argument_evaluations.iter().all(|argument| argument.ty().is_text_array());
+    let error = error || unsure || text_arrays || arguments.iter().any(Evaluation::may_raise);
     match name {
         "nullif" => nullif(arguments, ty, error),
         "coalesce" => coalesce(arguments, ty, error),
@@ -127,11 +131,10 @@ fn resolved_type(argument_evaluations: &[Evaluation]) -> Option<(ScalarType, boo
 /// The type two argument types meet at and whether reading both as it may
 /// raise, `None` for two type categories PostgreSQL never matches.
 fn common_type(current: ScalarType, ty: ScalarType) -> Option<(ScalarType, bool)> {
-    let unmodelled = |t: ScalarType| matches!(t, ScalarType::Other | ScalarType::Unknown);
     let number = |t: ScalarType| t.is_number() || t == ScalarType::Float;
     let temporal = |t: ScalarType| matches!(t, ScalarType::Date | ScalarType::Timestamp);
     Some(match (current, ty) {
-        _ if unmodelled(current) || unmodelled(ty) => (ScalarType::Other, true),
+        _ if current.is_unmodelled() || ty.is_unmodelled() => (ScalarType::Other, true),
         _ if current == ty => (current, false),
         // Two implicit collations leave the comparison's collation undecided.
         (ScalarType::Text(_), ScalarType::Text(_)) => (ScalarType::Text(TextRules::UNKNOWN), true),
@@ -143,6 +146,11 @@ fn common_type(current: ScalarType, ty: ScalarType) -> Option<(ScalarType, bool)
             (if float { ScalarType::Float } else { ScalarType::Numeric }, false)
         }
         _ if temporal(current) && temporal(ty) => (ScalarType::Timestamp, false),
+        // Arrays meet at the array of their elements' common type.
+        (ScalarType::Array(a), ScalarType::Array(b)) => {
+            let (joined, may_raise) = common_type(a.scalar(), b.scalar())?;
+            (ScalarType::Array(ArrayElement::of(joined)), may_raise)
+        }
         _ => return None,
     })
 }

@@ -30,5 +30,5 @@ pub use forward::{
 };
 pub use guarantees::{Guarantees, Subject};
 pub use postgres::PostgreSqlOptions;
-pub use scalar::{ScalarType, TextRules};
+pub use scalar::{ArrayElement, ScalarType, TextRules};
 pub use sql_values;

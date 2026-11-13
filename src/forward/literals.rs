@@ -59,16 +59,35 @@ pub(super) fn cast<D: EvalDialect, C: Context>(
     expr: &Expr,
     data_type: &DataType,
 ) -> Result<Evaluation, C::Error> {
-    let to = state.context.data_type(data_type);
+    // PostgreSQL casts each element of a cast `ARRAY[...]` to the element
+    // type, which also types an empty one.
+    if let (Expr::Array(array), DataType::Array(definition)) =
+        (crate::support::unnest(expr), data_type)
+        && let Some(element) = scalar::array_element(definition)
+        && matches!(kind, CastKind::Cast | CastKind::DoubleColon)
+    {
+        return super::arrays::cast_constructor(state, kind, array, data_type, element);
+    }
     let source = forward(state, expr)?;
-    Ok(state.dialect.cast(
+    Ok(cast_evaluation(state, kind, source, data_type))
+}
+
+/// The dialect's reading of a cast of the already-evaluated `source`.
+pub(super) fn cast_evaluation<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    kind: &CastKind,
+    source: Evaluation,
+    data_type: &DataType,
+) -> Evaluation {
+    let to = state.context.data_type(data_type);
+    state.dialect.cast(
         source,
         kind,
         data_type,
         to,
         |element| state.context.data_type(element),
         state.options,
-    ))
+    )
 }
 
 #[cfg(test)]

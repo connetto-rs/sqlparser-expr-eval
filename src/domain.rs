@@ -724,6 +724,7 @@ impl Evaluation {
                 ScalarType::Timestamp => {
                     matches!(value, PgValue::Timestamp(_) | PgValue::Date(_))
                 }
+                ScalarType::Array(_) => matches!(value, PgValue::Array(_)),
             }
         };
         if listed.iter().any(|value| !keep(value)) {

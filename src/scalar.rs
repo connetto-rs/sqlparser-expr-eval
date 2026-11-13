@@ -1,10 +1,13 @@
 //! The scalar types the evaluator reads an expression as, and the casts and
 //! literal typing it folds [`PgValue`]s with.
 
+use alloc::{collections::BTreeSet, string::ToString};
+
 use sql_values::postgres::{
-    CastError, CastTarget, CastValue, IntegerType, PgNumeric, PgValue, cast_value, number_constant,
+    CastError, CastTarget, CastValue, IntegerType, PgArray, PgNumeric, PgValue, cast_value,
+    number_constant,
 };
-use sqlparser::ast::{DataType, TimezoneInfo};
+use sqlparser::ast::{ArrayElemTypeDef, DataType, TimezoneInfo};
 
 /// What a text collation lets the evaluator decide about text values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,6 +54,77 @@ pub enum ScalarType {
     Timestamp,
     /// Any other known type whose values are not modelled.
     Other,
+    /// An array of the element type, of any number of dimensions.
+    Array(ArrayElement),
+}
+
+/// The element type of an array, any scalar type that is not itself an
+/// array, since PostgreSQL types an array by its element alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayElement {
+    /// The element type is not known.
+    Unknown,
+    /// `boolean`.
+    Boolean,
+    /// An integer type.
+    Integer(IntegerType),
+    /// `numeric`.
+    Numeric,
+    /// `real` or `double precision`.
+    Float,
+    /// A text type, with the collation it carries.
+    Text(TextRules),
+    /// `date`.
+    Date,
+    /// `timestamp` without time zone.
+    Timestamp,
+    /// Any other known type whose values are not modelled.
+    Other,
+}
+
+impl ArrayElement {
+    /// The element type of an array of `ty`, the element of an array being
+    /// its own element and an untyped literal being `text`.
+    #[must_use]
+    pub fn of(ty: ScalarType) -> Self {
+        match ty {
+            ScalarType::Unknown => ArrayElement::Unknown,
+            ScalarType::UnknownLiteral => ArrayElement::Text(TextRules::DEFAULT),
+            ScalarType::Boolean => ArrayElement::Boolean,
+            ScalarType::Integer(integer) => ArrayElement::Integer(integer),
+            ScalarType::Numeric => ArrayElement::Numeric,
+            ScalarType::Float => ArrayElement::Float,
+            ScalarType::Text(rules) => ArrayElement::Text(rules),
+            ScalarType::Date => ArrayElement::Date,
+            ScalarType::Timestamp => ArrayElement::Timestamp,
+            ScalarType::Other => ArrayElement::Other,
+            ScalarType::Array(element) => element,
+        }
+    }
+
+    /// The element type as a scalar type.
+    #[must_use]
+    pub fn scalar(self) -> ScalarType {
+        match self {
+            ArrayElement::Unknown => ScalarType::Unknown,
+            ArrayElement::Boolean => ScalarType::Boolean,
+            ArrayElement::Integer(integer) => ScalarType::Integer(integer),
+            ArrayElement::Numeric => ScalarType::Numeric,
+            ArrayElement::Float => ScalarType::Float,
+            ArrayElement::Text(rules) => ScalarType::Text(rules),
+            ArrayElement::Date => ScalarType::Date,
+            ArrayElement::Timestamp => ScalarType::Timestamp,
+            ArrayElement::Other => ScalarType::Other,
+        }
+    }
+
+    /// Whether the element is a text type, which PostgreSQL may spell as
+    /// `varchar`, and whose arrays it compares between one `text` spelling
+    /// only.
+    #[must_use]
+    pub fn is_text(self) -> bool {
+        matches!(self, ArrayElement::Text(_))
+    }
 }
 
 impl ScalarType {
@@ -79,8 +153,43 @@ impl ScalarType {
             DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
                 ScalarType::Timestamp
             }
+            DataType::Array(definition) => {
+                match array_element(definition) {
+                    Some(element) => ScalarType::Array(ArrayElement::of(ScalarType::of(element))),
+                    None => ScalarType::Other,
+                }
+            }
             _ => ScalarType::Other,
         }
+    }
+
+    /// The element type of an array type.
+    #[must_use]
+    pub fn element(self) -> Option<ScalarType> {
+        match self {
+            ScalarType::Array(element) => Some(element.scalar()),
+            _ => None,
+        }
+    }
+
+    /// Whether the type is an array type.
+    #[must_use]
+    pub fn is_array(self) -> bool {
+        matches!(self, ScalarType::Array(_))
+    }
+
+    /// Whether the type is an array of text, which PostgreSQL may have typed
+    /// as a `varchar` array it compares with no `text` array.
+    #[must_use]
+    pub fn is_text_array(self) -> bool {
+        matches!(self, ScalarType::Array(ArrayElement::Text(_)))
+    }
+
+    /// Whether the type carries no modelled values: the untyped `Unknown` or
+    /// a known type the evaluator does not model.
+    #[must_use]
+    pub fn is_unmodelled(self) -> bool {
+        matches!(self, ScalarType::Unknown | ScalarType::Other)
     }
 
     /// Whether the type is a number, an integer or `numeric`.
@@ -102,6 +211,19 @@ impl ScalarType {
             ScalarType::Integer(integer) => Some(integer.range().into_inner()),
             _ => None,
         }
+    }
+}
+
+/// The element type an array type spells, `None` for an array that names
+/// none.
+pub(crate) fn array_element(definition: &ArrayElemTypeDef) -> Option<&DataType> {
+    match definition {
+        ArrayElemTypeDef::AngleBracket(element)
+        | ArrayElemTypeDef::SquareBracket(element, _)
+        | ArrayElemTypeDef::Parenthesis(element)
+        | ArrayElemTypeDef::ParenthesisNotNull(element)
+        | ArrayElemTypeDef::Qualified(element, _) => Some(element),
+        ArrayElemTypeDef::None => None,
     }
 }
 
@@ -139,6 +261,32 @@ pub(crate) enum Cast {
     Unknown,
 }
 
+/// The listed `datums` cast one at a time, the values the casts fold and the
+/// raises and undecidability their results carry.
+pub(crate) struct CastFold {
+    /// The folded values.
+    pub values: BTreeSet<PgValue>,
+    /// A cast raises.
+    pub raises: bool,
+    /// A cast is undecided.
+    pub undecided: bool,
+}
+
+/// `datums` cast one at a time by `cast`.
+pub(crate) fn cast_datums(datums: &BTreeSet<PgValue>, cast: impl Fn(&PgValue) -> Cast) -> CastFold {
+    let mut fold = CastFold { values: BTreeSet::new(), raises: false, undecided: false };
+    for datum in datums {
+        match cast(datum) {
+            Cast::Folded(value) => {
+                fold.values.insert(value);
+            }
+            Cast::Raises => fold.raises = true,
+            Cast::Unknown => fold.undecided = true,
+        }
+    }
+    fold
+}
+
 /// Casts `datum` of type `from` to type `to`, following PostgreSQL's casts.
 /// A date or a timestamp prints through `DateStyle`, so its cast to text is
 /// left undecided, as is a cast to a type the evaluator does not model.
@@ -146,29 +294,71 @@ pub(crate) fn cast(datum: &PgValue, from: ScalarType, to: ScalarType) -> Cast {
     if from == to {
         return Cast::Folded(datum.clone());
     }
+    if let ScalarType::Array(element) = to {
+        return match cast_target(element.scalar()) {
+            Some(target) => array_cast(datum, target),
+            None => Cast::Unknown,
+        };
+    }
+    if matches!(datum, PgValue::Array(_)) {
+        // An array casts to text through its output function, which prints a
+        // date or a timestamp through `DateStyle`, and to no other type.
+        return match (to, datum.output()) {
+            (ScalarType::Text(_), Some(output)) => Cast::Folded(PgValue::Text(output.to_string())),
+            (ScalarType::Text(_) | ScalarType::Unknown | ScalarType::Other, _) => Cast::Unknown,
+            _ => Cast::Raises,
+        };
+    }
     let target = match to {
+        // A date or a timestamp prints through `DateStyle`.
+        ScalarType::Text(_) if matches!(datum, PgValue::Date(_) | PgValue::Timestamp(_)) => {
+            return Cast::Unknown;
+        }
+        _ => {
+            match cast_target(to) {
+                Some(target) => target,
+                None => return Cast::Unknown,
+            }
+        }
+    };
+    let Some(source) = cast_source(datum, from) else { return Cast::Unknown };
+    match cast_value(source, target) {
+        Ok(value) => folded(value),
+        Err(CastError::Unsupported) => Cast::Unknown,
+        Err(_) => Cast::Raises,
+    }
+}
+
+/// The cast target of a type without a modifier, `None` for a type the
+/// casts do not model.
+pub(crate) fn cast_target(ty: ScalarType) -> Option<CastTarget> {
+    Some(match ty {
         ScalarType::Boolean => CastTarget::Boolean,
         ScalarType::Integer(IntegerType::Smallint) => CastTarget::Smallint,
         ScalarType::Integer(IntegerType::Integer) => CastTarget::Integer,
         ScalarType::Integer(IntegerType::Bigint) => CastTarget::Bigint,
         ScalarType::Numeric => CastTarget::Numeric(None),
-        // A date or a timestamp prints through `DateStyle`.
-        ScalarType::Text(_) if matches!(datum, PgValue::Date(_) | PgValue::Timestamp(_)) => {
-            return Cast::Unknown;
-        }
         ScalarType::Text(_) => CastTarget::Text,
         ScalarType::Date => CastTarget::Date,
         ScalarType::Timestamp => CastTarget::Timestamp(None),
         ScalarType::Unknown
         | ScalarType::UnknownLiteral
         | ScalarType::Float
-        | ScalarType::Other => {
-            return Cast::Unknown;
-        }
+        | ScalarType::Other
+        | ScalarType::Array(_) => return None,
+    })
+}
+
+/// The cast of `datum` to an array of `element`, text read by `array_in` and
+/// an array cast element by element, and refused for any other value.
+pub(crate) fn array_cast(datum: &PgValue, element: CastTarget) -> Cast {
+    let cast = match datum {
+        PgValue::Text(text) => PgArray::parse(text, element),
+        PgValue::Array(array) => array.cast(element),
+        _ => return Cast::Raises,
     };
-    let Some(source) = cast_source(datum, from) else { return Cast::Unknown };
-    match cast_value(source, target) {
-        Ok(value) => folded(value),
+    match cast {
+        Ok(array) => Cast::Folded(PgValue::Array(array)),
         Err(CastError::Unsupported) => Cast::Unknown,
         Err(_) => Cast::Raises,
     }
@@ -479,5 +669,45 @@ mod tests {
     fn text_length_counts_characters() {
         assert_eq!(text_length(&text("héllo")), Some(5));
         assert_eq!(text_length(&PgValue::Integer(1)), None);
+    }
+
+    /// An array's element is every scalar type but an array, an untyped
+    /// literal's element is `text`, and an array of an array is the array.
+    #[test]
+    fn an_array_element_is_a_scalar_type() {
+        for ty in [
+            ScalarType::Unknown,
+            ScalarType::Boolean,
+            ScalarType::Integer(IntegerType::Smallint),
+            ScalarType::Numeric,
+            ScalarType::Float,
+            ScalarType::Text(TextRules::BYTEWISE),
+            ScalarType::Date,
+            ScalarType::Timestamp,
+            ScalarType::Other,
+        ] {
+            let array = ScalarType::Array(ArrayElement::of(ty));
+            assert_eq!(array.element(), Some(ty));
+            assert_eq!(ArrayElement::of(array), ArrayElement::of(ty));
+            assert_eq!(ty.element(), None);
+        }
+        assert_eq!(
+            ArrayElement::of(ScalarType::UnknownLiteral).scalar(),
+            ScalarType::Text(TextRules::DEFAULT)
+        );
+        let int_array =
+            DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(DataType::Int(None)), None));
+        assert_eq!(
+            ScalarType::of(&int_array).element(),
+            Some(ScalarType::Integer(IntegerType::Integer))
+        );
+        assert_eq!(ScalarType::of(&DataType::Array(ArrayElemTypeDef::None)), ScalarType::Other);
+    }
+
+    /// Only text and arrays cast to an array.
+    #[test]
+    fn only_text_and_arrays_cast_to_an_array() {
+        assert_eq!(array_cast(&PgValue::Integer(1), CastTarget::Integer), Cast::Raises);
+        assert!(matches!(array_cast(&text("{1}"), CastTarget::Integer), Cast::Folded(_)));
     }
 }

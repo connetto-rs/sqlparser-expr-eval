@@ -1,21 +1,17 @@
 //! The forward pass: what an expression evaluates to over every row.
 
+mod arrays;
 pub(crate) mod fold;
 mod functions;
 mod literals;
 
-use alloc::collections::BTreeSet;
 use core::cell::Cell;
 
 use sqlparser::ast::Expr;
 
 use super::{
-    context::Context,
-    dialect::EvalDialect,
-    domain::{Evaluation, Values},
-    guarantees::Guarantees,
-    scalar::ScalarType,
-    support,
+    context::Context, dialect::EvalDialect, domain::Evaluation, guarantees::Guarantees,
+    scalar::ScalarType, support,
 };
 
 /// How many times one top-level evaluation reads the right operand of an
@@ -155,29 +151,7 @@ fn evaluate_node<D: EvalDialect, C: Context>(
         }
         Expr::Exists { subquery, negated } => functions::exists(state, subquery, *negated)?,
         Expr::Subquery(query) => functions::scalar_subquery(state, query)?,
-        Expr::Array(array) => {
-            let mut values = BTreeSet::new();
-            let mut has_null = false;
-            let mut error = false;
-            for element in &array.elem {
-                let evaluation = forward(state, element)?;
-                error |= evaluation.may_raise();
-                match evaluation.constant() {
-                    Some(datum) => {
-                        values.insert(datum.clone());
-                    }
-                    None if evaluation.is_always_null() => has_null = true,
-                    None => {
-                        // A non-constant member leaves the array's members
-                        // unknown.
-                        return Ok(Evaluation::unknown(ScalarType::Unknown));
-                    }
-                }
-            }
-            // A `NULL` member nulls every `ANY` and `ALL` reading of the
-            // array, so it stands for the array's `NULL` possibility.
-            Evaluation::new(ScalarType::Unknown, has_null, error, Values::Listed(values))
-        }
+        Expr::Array(array) => arrays::constructor(state, array)?,
         _ => Evaluation::unknown(ScalarType::Unknown),
     })
 }
@@ -321,15 +295,19 @@ mod tests {
         assert!(evaluation.is_always_null());
     }
 
-    /// An array holding a non-constant member leaves its members unknown.
+    /// An array holding a non-constant member keeps its type and leaves its
+    /// values unlisted.
     #[test]
-    fn an_array_with_a_non_constant_member_is_unknown() {
+    fn an_array_with_a_non_constant_member_is_unlisted() {
         let evaluation = read(
             ColumnContext::new()
                 .with_column("x", Evaluation::unknown(ScalarType::Text(TextRules::DEFAULT))),
             "ARRAY[x]",
         );
-        assert_eq!(evaluation.ty(), ScalarType::Unknown);
+        assert_eq!(
+            evaluation.ty(),
+            ScalarType::Array(crate::scalar::ArrayElement::Text(TextRules::DEFAULT))
+        );
         assert!(!matches!(evaluation.values(), Values::Listed(_)));
     }
 
@@ -427,24 +405,6 @@ mod tests {
         assert!(evaluation.may_be_false());
         assert!(!evaluation.may_be_true());
         assert!(!evaluation.may_be_null());
-    }
-
-    #[test]
-    fn an_array_cast_folds_its_elements_to_the_element_type() {
-        let evaluation = read(ColumnContext::new(), "ARRAY['read', 'write']::text[]");
-        let Values::Listed(listed) = evaluation.values() else { panic!("the cast is listed") };
-        let expected: BTreeSet<PgValue> =
-            [PgValue::Text("read".to_string()), PgValue::Text("write".to_string())].into();
-        assert_eq!(listed, &expected);
-    }
-
-    #[test]
-    fn a_bounded_varchar_array_cast_truncates_its_elements() {
-        let evaluation = read(ColumnContext::new(), "ARRAY['read', 'write']::varchar(2)[]");
-        let Values::Listed(listed) = evaluation.values() else { panic!("the cast is listed") };
-        let expected: BTreeSet<PgValue> =
-            [PgValue::Text("re".to_string()), PgValue::Text("wr".to_string())].into();
-        assert_eq!(listed, &expected);
     }
 
     #[test]

@@ -706,32 +706,20 @@ fn any_all<D: EvalDialect, C: Context>(
             }
             typed_members(values, null)
         }
-        Expr::Cast { expr: operand, .. } if matches!(support::unnest(operand), Expr::Array(_)) => {
-            // A cast of an array, folded member by member by the forward
-            // pass, such as PostgreSQL's `ARRAY[...]::text[]`.
-            let evaluation = forward_of(state, right)?;
-            let Values::Listed(listed) = evaluation.values() else {
+        other => {
+            // One constant array, such as `ARRAY[...]::text[]` or
+            // `'{1,2}'::int[]`, narrows to its elements. The forward pass
+            // decides its empty and `NULL`-only readings.
+            let evaluation = forward_of(state, other)?;
+            let Some(PgValue::Array(array)) = evaluation.constant() else {
                 return Ok(());
             };
-            let nonempty = !listed.is_empty();
-            if !nonempty {
-                // The cast-array forward is unknown, so this, not the prune,
-                // decides the outcome.
-                let takes = if evaluation.may_be_null() {
-                    outcomes.null
-                } else if family == Family::All {
-                    outcomes.truth
-                } else {
-                    outcomes.falsity
-                };
-                if !takes {
-                    impossible(state);
-                }
+            let (values, null) = support::array_members(array);
+            if values.is_empty() {
                 return Ok(());
             }
-            typed_members(Values::Listed(listed.clone()), evaluation.may_be_null())
+            typed_members(Values::Listed(values), null)
         }
-        _ => return Ok(()),
     };
     comparison_with(state, left, &other, op, family, outcomes)
 }
@@ -747,6 +735,12 @@ fn listed_union<D: EvalDialect, C: Context>(
     for element in elements {
         let evaluation = forward_of(state, element)?;
         match evaluation.constant() {
+            // A sub-array of a multidimensional array holds members of its own.
+            Some(PgValue::Array(array)) => {
+                let (members, has_null) = support::array_members(array);
+                union.extend(members);
+                null |= has_null;
+            }
             Some(datum) => {
                 union.insert(datum.clone());
             }
@@ -1272,19 +1266,9 @@ fn reinterpreted_values(source: &Evaluation, target: ScalarType) -> Option<BTree
     let Values::Listed(listed) = source.values() else {
         return None;
     };
-    let mut values = BTreeSet::new();
-    for datum in listed {
-        match crate::scalar::cast(datum, source.ty(), target) {
-            crate::scalar::Cast::Folded(value) => {
-                values.insert(value);
-            }
-            crate::scalar::Cast::Raises => {}
-            crate::scalar::Cast::Unknown => {
-                return None;
-            }
-        }
-    }
-    Some(values)
+    let fold =
+        crate::scalar::cast_datums(listed, |datum| crate::scalar::cast(datum, source.ty(), target));
+    if fold.undecided { None } else { Some(fold.values) }
 }
 
 /// Whether the categories can compare as values.
@@ -2409,6 +2393,22 @@ mod tests {
         let x = column(&guarantees, "x");
         assert!(x.may_be(&PgValue::Numeric(PgNumeric::from(3))));
         assert!(!x.may_be(&PgValue::Numeric(PgNumeric::from(4))));
+    }
+
+    /// `ANY` over a multidimensional constructor reads every element, a
+    /// `NULL` one among them.
+    #[test]
+    fn any_reads_every_element_of_a_multidimensional_constructor() {
+        for sql in ["x = ANY (ARRAY[[1, 2], [3, 5]])", "x = ANY (ARRAY[[1, NULL], [3, 5]])"] {
+            let guarantees = implied_with(
+                ColumnContext::new().with_column("x", plain_column(ScalarType::Numeric)),
+                &parse(sql),
+                Outcomes::TRUE,
+            );
+            let x = column(&guarantees, "x");
+            assert!(x.may_be(&PgValue::Numeric(PgNumeric::from(5))), "{sql}");
+            assert!(!x.may_be(&PgValue::Numeric(PgNumeric::from(4))), "{sql}");
+        }
     }
 
     /// An untyped literal term reads through the `boolean` input.

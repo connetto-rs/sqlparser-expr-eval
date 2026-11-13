@@ -3,7 +3,7 @@
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::{fmt::Write, ops::Bound};
 
-use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
+use sql_values::postgres::{IntegerType, PgArray, PgNumeric, PgValue};
 use sqlparser::ast::{Array, BinaryOperator, CaseWhen, Expr, Function, InTarget, Query};
 
 use super::{
@@ -11,7 +11,7 @@ use super::{
         context::{Builtin, CalleeKind, Context, NullInput, Rows},
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
-        scalar::{ScalarType, TextRules},
+        scalar::{ArrayElement, ScalarType, TextRules},
         support,
     },
     State,
@@ -332,7 +332,7 @@ fn single_value(evaluation: &Evaluation) -> Option<PgValue> {
 
 /// The type that holds the values of both `ty` and `branch`, and whether an
 /// engine may refuse to join them.
-fn joined_type(ty: ScalarType, branch: ScalarType) -> (ScalarType, bool) {
+pub(super) fn joined_type(ty: ScalarType, branch: ScalarType) -> (ScalarType, bool) {
     let untyped = |t: ScalarType| matches!(t, ScalarType::Unknown | ScalarType::UnknownLiteral);
     let number = |t: ScalarType| t.is_number() || t == ScalarType::Float;
     if ty == branch || (untyped(branch) && ty != ScalarType::Unknown) {
@@ -347,7 +347,7 @@ fn joined_type(ty: ScalarType, branch: ScalarType) -> (ScalarType, bool) {
 }
 
 /// The evaluation read as the type a join resolved it to.
-fn coerce_to(evaluation: Evaluation, ty: ScalarType) -> Evaluation {
+pub(super) fn coerce_to(evaluation: Evaluation, ty: ScalarType) -> Evaluation {
     let from = evaluation.ty();
     if from == ty || matches!(ty, ScalarType::Unknown | ScalarType::UnknownLiteral) {
         return evaluation;
@@ -470,10 +470,9 @@ pub(super) fn case<D: EvalDialect, C: Context>(
         error |= refused;
         let reachable = end_reachable && condition.truth;
         results.push((result, reachable));
-        if !reachable {
-            continue;
-        }
-        if condition.truth && !condition.falsity && !condition.null {
+        // A condition never false nor `NULL`, true or raising on every row,
+        // leaves no row for what follows it.
+        if !condition.falsity && !condition.null {
             end_reachable = false;
         }
     }
@@ -669,9 +668,6 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
     if value.is_impossible() {
         return Ok(Evaluation::impossible(ScalarType::Boolean));
     }
-    let unknown = |error: bool| -> Result<Evaluation, C::Error> {
-        Ok(Evaluation::new(ScalarType::Boolean, true, error, Values::Unlisted(Unlisted::any())))
-    };
     let (value_null, value_has_values) = (value.may_be_null(), !value.values().is_empty());
     let (cmp, members, error) = match support::unnest(right) {
         Expr::Subquery(subquery) => {
@@ -710,11 +706,8 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
                 Expr::Array(Array { elem, .. }) => (elem.clone(), false),
                 Expr::Tuple(elements) => (elements.clone(), true),
                 _ => {
-                    // An array is `Other`, or `Unknown` when untyped, and
-                    // text is read as an array literal that may be malformed.
                     let operand = forward(state, other)?;
-                    let array = matches!(operand.ty(), ScalarType::Other | ScalarType::Unknown);
-                    return unknown(value.may_raise() || operand.may_raise() || !array);
+                    return Ok(array_operand(state, &value, op, operand, is_any));
                 }
             };
             let mut values = BTreeSet::new();
@@ -728,6 +721,12 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
                 ty = joined;
                 error |= refused;
                 evaluations.push(evaluation);
+            }
+            // Sub-arrays make a multidimensional array, whose every element
+            // is a member.
+            if !row && evaluations.iter().any(|evaluation| evaluation.ty().is_array()) {
+                let operand = super::arrays::multidimensional(&evaluations);
+                return Ok(array_operand(state, &value, op, operand, is_any));
             }
             // An engine may type an array of untyped literals as `text[]`.
             let untyped =
@@ -749,7 +748,7 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
                     }
                     None if evaluation.is_always_null() => null = true,
                     None => {
-                        return unknown(error);
+                        return Ok(unknown_outcome(error));
                     }
                 }
             }
@@ -767,6 +766,97 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
         quantified_outcomes(cmp.rows, &members, value_null, value_has_values, is_any),
         error,
     ))
+}
+
+/// The unknown `ANY`/`ALL` answer, a `Boolean` holding no outcome and
+/// carrying the error `error`.
+fn unknown_outcome(error: bool) -> Evaluation {
+    Evaluation::new(ScalarType::Boolean, true, error, Values::Unlisted(Unlisted::any()))
+}
+
+/// `value op ANY/ALL (operand)` for an operand written neither as a list nor
+/// as a subquery: an array, each listed array read for its own members, or
+/// an untyped literal read as an array of the value's type. PostgreSQL
+/// refuses an operand of another type.
+fn array_operand<D: EvalDialect, C: Context>(
+    state: &State<'_, D, C>,
+    value: &Evaluation,
+    op: &BinaryOperator,
+    operand: Evaluation,
+    is_any: bool,
+) -> Evaluation {
+    let operand = if operand.ty() == ScalarType::UnknownLiteral {
+        let element = if value.ty() == ScalarType::UnknownLiteral {
+            ScalarType::Text(TextRules::DEFAULT)
+        } else {
+            value.ty()
+        };
+        super::fold::reinterpret_unknown(operand, ScalarType::Array(ArrayElement::of(element)))
+    } else {
+        operand
+    };
+    let mut error = value.may_raise() || operand.may_raise();
+    let ScalarType::Array(element) = operand.ty() else {
+        // An unmodelled type may be an array, and no other type is.
+        let array = matches!(operand.ty(), ScalarType::Other | ScalarType::Unknown);
+        return unknown_outcome(error || !array);
+    };
+    if operand.is_impossible() {
+        return Evaluation::impossible(ScalarType::Boolean);
+    }
+    let Values::Listed(arrays) = operand.values() else {
+        // The element type still decides whether the comparison exists.
+        let members =
+            Evaluation::new(element.scalar(), true, false, Values::Unlisted(Unlisted::any()));
+        let refused = comparison_evals(state, value.clone(), op, members).error;
+        return unknown_outcome(error || refused);
+    };
+    // `ANY` and `ALL` over a `NULL` array are `NULL`.
+    let mut outcomes = Outcomes { truth: false, falsity: false, null: operand.may_be_null() };
+    for datum in arrays {
+        let PgValue::Array(array) = datum else { continue };
+        let (array_outcomes, refused) =
+            array_outcomes(state, value, op, array, element.scalar(), is_any);
+        outcomes = outcomes.union(array_outcomes);
+        error |= refused;
+    }
+    Evaluation::condition(outcomes, error)
+}
+
+/// The outcomes of `value op ANY/ALL (array)` against one array value of
+/// `element` type, and whether the comparison may raise.
+fn array_outcomes<D: EvalDialect, C: Context>(
+    state: &State<'_, D, C>,
+    value: &Evaluation,
+    op: &BinaryOperator,
+    array: &PgArray,
+    element: ScalarType,
+    is_any: bool,
+) -> (Outcomes, bool) {
+    let (values, null) = support::array_members(array);
+    let nonempty = !values.is_empty();
+    let set = Evaluation::new(element, null, false, Values::Listed(values));
+    let mut cmp = comparison_evals(state, value.clone(), op, set);
+    if !nonempty {
+        // With no member to compare, an unlisted one still types the
+        // operator.
+        let member = Evaluation::new(element, true, false, Values::Unlisted(Unlisted::any()));
+        cmp.error |= comparison_evals(state, value.clone(), op, member).error;
+    }
+    let members = Members {
+        nonempty,
+        null: if null { Presence::Always } else { Presence::Never },
+        empty: if !nonempty && !null { Presence::Always } else { Presence::Never },
+        null_only: false,
+    };
+    let outcomes = quantified_outcomes(
+        cmp.rows,
+        &members,
+        value.may_be_null(),
+        !value.values().is_empty(),
+        is_any,
+    );
+    (outcomes, cmp.error)
 }
 
 /// The outcomes of a left value `op ANY` the members, or `op ALL` them when
@@ -1416,13 +1506,15 @@ mod tests {
         );
     }
 
-    /// A decisive branch stops the `CASE` search.
+    /// A decisive branch stops the `CASE` search, and so does a condition
+    /// that raises on every row.
     #[test]
     fn a_decisive_case_branch_stops_the_search() {
         let decisive = read(ColumnContext::new(), "CASE WHEN true THEN 2 ELSE 3 END");
         assert_eq!(decisive.constant(), Some(&PgValue::Integer(2)));
         let skipped = read(ColumnContext::new(), "CASE WHEN true THEN 2 WHEN false THEN 3 END");
         assert_eq!(skipped.constant(), Some(&PgValue::Integer(2)));
+        assert!(read(ColumnContext::new(), "CASE WHEN 1 / 0 = 1 THEN 2 END").always_raises());
     }
 
     /// The `CASE` else reads when the end is reachable, `NULL` without it.

@@ -76,7 +76,7 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
 }
 
 /// Whether the reading knows every arithmetic operator PostgreSQL has for
-/// the type.
+/// the type, an array having none.
 fn modelled(ty: ScalarType) -> bool {
     matches!(
         ty,
@@ -87,6 +87,7 @@ fn modelled(ty: ScalarType) -> bool {
             | ScalarType::Text(_)
             | ScalarType::Date
             | ScalarType::Timestamp
+            | ScalarType::Array(_)
     )
 }
 

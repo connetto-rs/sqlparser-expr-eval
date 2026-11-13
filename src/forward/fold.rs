@@ -12,19 +12,20 @@ use super::{
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
         guarantees::Guarantees,
-        scalar::{self, ScalarType, TextRules},
+        scalar::{self, ArrayElement, ScalarType, TextRules},
         support,
     },
     State, forward,
 };
 
 /// The category two operands compare in, with the text rules when both are
-/// text.
+/// text, and the element type when both are arrays.
 pub(crate) enum Category {
     Number,
     Boolean,
     Text(TextRules, TextRules),
     Timestamp,
+    Array(ScalarType),
 }
 
 /// The comparison category of two resolved operand types.
@@ -43,8 +44,24 @@ pub(crate) fn comparison_category(left: ScalarType, right: ScalarType) -> Option
         (ScalarType::Date | ScalarType::Timestamp, ScalarType::Date | ScalarType::Timestamp) => {
             Category::Timestamp
         }
+        // PostgreSQL compares arrays of one element type only, without the
+        // implicit casts between the elements.
+        (ScalarType::Array(a), ScalarType::Array(b)) if same_element(a, b) => {
+            Category::Array(a.scalar())
+        }
         _ => return None,
     })
+}
+
+/// Whether two array element types are the one type an array comparison
+/// takes, text of any collation being `text`.
+fn same_element(left: ArrayElement, right: ArrayElement) -> bool {
+    match (left, right) {
+        (ArrayElement::Text(_), ArrayElement::Text(_))
+        | (ArrayElement::Unknown | ArrayElement::Other, _)
+        | (_, ArrayElement::Unknown | ArrayElement::Other) => true,
+        _ => left == right,
+    }
 }
 
 /// The kinds of answer one non-`NULL` left value may give against the whole
@@ -209,7 +226,19 @@ pub(crate) fn pair_analysis(
         Category::Text(rules_left, rules_right) => {
             text_pairs(left.values(), right.values(), *rules_left, *rules_right, op)
         }
-        Category::Timestamp => timestamp_pairs(left.values(), right.values(), op),
+        // Text elements order under their collation, which decides only what
+        // its rules allow, while other elements order by value, as dates and
+        // timestamps do.
+        Category::Array(ScalarType::Text(rules))
+            if !(rules.identity_equality
+                && (rules.byte_order
+                    || matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq))) =>
+        {
+            RowKinds::ANY
+        }
+        Category::Timestamp | Category::Array(_) => {
+            value_order_pairs(left.values(), right.values(), op)
+        }
     }
 }
 
@@ -220,25 +249,15 @@ pub(crate) fn reinterpret_unknown(evaluation: Evaluation, target: ScalarType) ->
         return evaluation.with_type(target);
     }
     if let Values::Listed(listed) = evaluation.values() {
-        let mut values = BTreeSet::new();
-        let mut error = evaluation.may_raise();
-        let mut open = false;
-        for datum in listed {
-            match scalar::cast(datum, ScalarType::UnknownLiteral, target) {
-                scalar::Cast::Folded(value) => {
-                    values.insert(value);
-                }
-                // The cast raises on the rows this literal stands for, while
-                // the other literals may still fold.
-                scalar::Cast::Raises => error = true,
-                // Undecidable, so any value may and the input may refuse it.
-                scalar::Cast::Unknown => {
-                    open = true;
-                    error = true;
-                }
-            }
-        }
-        let values = if open { Values::Unlisted(Unlisted::any()) } else { Values::Listed(values) };
+        let fold = scalar::cast_datums(listed, |datum| {
+            scalar::cast(datum, ScalarType::UnknownLiteral, target)
+        });
+        let error = evaluation.may_raise() || fold.raises || fold.undecided;
+        let values = if fold.undecided {
+            Values::Unlisted(Unlisted::any())
+        } else {
+            Values::Listed(fold.values)
+        };
         return Evaluation::new(target, evaluation.may_be_null(), error, values);
     }
     // An unlisted literal may hold text the target's input refuses.
@@ -269,6 +288,11 @@ fn comparable(left: &Evaluation, right: &Evaluation) -> bool {
                     (l, r),
                     (ScalarType::Text(_), ScalarType::Text(_))
                         | (ScalarType::Boolean, ScalarType::Boolean)
+                )
+                || matches!(
+                    (l, r),
+                    (ScalarType::Array(a), ScalarType::Array(b))
+                        if same_element(a, b) && !a.is_text()
                 )
         }
     }
@@ -559,9 +583,10 @@ fn text_pairs(
     })
 }
 
-/// The kinds of answer a left date or timestamp may give against the right
-/// ones under `op`.
-fn timestamp_pairs(left: &Values, right: &Values, op: &BinaryOperator) -> RowKinds {
+/// The kinds of answer a left value may give against the right ones under
+/// `op`, for dates, timestamps and arrays, whose operators follow the value
+/// order.
+fn value_order_pairs(left: &Values, right: &Values, op: &BinaryOperator) -> RowKinds {
     let (Values::Listed(l), Values::Listed(r)) = (left, right) else {
         return RowKinds::ANY;
     };
@@ -904,6 +929,9 @@ fn concat_combine<D: EvalDialect, C: Context>(
     let null = left.may_be_null() || right.may_be_null();
     if left.is_impossible() || right.is_impossible() {
         return Evaluation::impossible(ScalarType::Text(TextRules::DEFAULT));
+    }
+    if let Some(array) = super::arrays::concat(left, right) {
+        return array;
     }
     // An untyped `NULL` takes the text side `||` needs.
     let is_text = |evaluation: &Evaluation| {
