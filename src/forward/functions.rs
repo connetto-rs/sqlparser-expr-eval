@@ -3,7 +3,7 @@
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::{fmt::Write, ops::Bound};
 
-use sql_values::{IntegerType, PgNumeric, PgValue};
+use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
 use sqlparser::ast::{Array, BinaryOperator, CaseWhen, Expr, Function, InTarget, Query};
 
 use super::{
@@ -908,7 +908,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use core::ops::Bound;
 
-    use sql_values::{IntegerType, PgNumeric, PgValue};
+    use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
     use sqlparser::ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart};
 
     use crate::{

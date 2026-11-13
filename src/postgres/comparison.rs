@@ -84,7 +84,7 @@ fn resolve_unknown_sides(left: Evaluation, right: Evaluation) -> (Evaluation, Ev
 mod tests {
     use alloc::collections::BTreeSet;
 
-    use sql_values::{IntegerType, PgValue};
+    use sql_values::postgres::{IntegerType, PgValue};
     use sqlparser::ast::BinaryOperator;
 
     use super::comparison;
@@ -143,7 +143,7 @@ mod tests {
                 .with_column(
                     "b",
                     Evaluation::known(
-                        PgValue::Numeric(sql_values::PgNumeric::from(3_i64)),
+                        PgValue::Numeric(sql_values::postgres::PgNumeric::from(3_i64)),
                         ScalarType::Numeric,
                     ),
                 ),
@@ -210,7 +210,7 @@ mod tests {
         assert!(resolved.error);
 
         // Date and timestamp literals resolve against their columns.
-        let date = sql_values::parse_date("2026-01-01").expect("a valid date");
+        let date = sql_values::postgres::parse_date("2026-01-01").expect("a valid date");
         let resolved = comparison(
             Evaluation::known(PgValue::Date(date), ScalarType::Date),
             &BinaryOperator::Eq,
@@ -218,8 +218,8 @@ mod tests {
         );
         assert!(resolved.rows.may_be_true());
         assert!(!resolved.rows.may_be_false());
-        let timestamp =
-            sql_values::parse_timestamp("2026-01-01 03:00:00").expect("a valid timestamp");
+        let timestamp = sql_values::postgres::parse_timestamp("2026-01-01 03:00:00")
+            .expect("a valid timestamp");
         let resolved = comparison(
             Evaluation::known(PgValue::Timestamp(timestamp), ScalarType::Timestamp),
             &BinaryOperator::Eq,
@@ -289,9 +289,9 @@ mod tests {
     #[test]
     fn dates_compare_against_timestamps_at_midnight() {
         // A listed date reads as its midnight against a timestamp.
-        let date = sql_values::parse_date("2026-01-01").expect("a valid date");
-        let timestamp =
-            sql_values::parse_timestamp("2026-01-01 00:00:00").expect("a valid timestamp");
+        let date = sql_values::postgres::parse_date("2026-01-01").expect("a valid date");
+        let timestamp = sql_values::postgres::parse_timestamp("2026-01-01 00:00:00")
+            .expect("a valid timestamp");
         let resolved = comparison(
             Evaluation::known(PgValue::Date(date), ScalarType::Date),
             &BinaryOperator::Eq,

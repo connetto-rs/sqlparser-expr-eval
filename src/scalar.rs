@@ -1,7 +1,7 @@
 //! The scalar types the evaluator reads an expression as, and the casts and
 //! literal typing it folds [`PgValue`]s with.
 
-use sql_values::{
+use sql_values::postgres::{
     CastError, CastTarget, CastValue, IntegerType, PgNumeric, PgValue, cast_value, number_constant,
 };
 use sqlparser::ast::{DataType, TimezoneInfo};
@@ -216,7 +216,7 @@ pub(crate) fn exact_i64(value: &PgNumeric) -> Option<i64> {
 mod tests {
     use alloc::string::String;
 
-    use sql_values::{PgBpchar, PgDate, PgTimestamp, PgTimestampTz};
+    use sql_values::postgres::{PgBpchar, PgDate, PgTimestamp, PgTimestampTz};
 
     use super::*;
 

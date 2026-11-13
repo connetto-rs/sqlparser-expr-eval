@@ -225,8 +225,8 @@ mod tests {
         let mut context = ColumnContext::new().with_column(
             "x",
             Evaluation::known(
-                sql_values::PgValue::Integer(1),
-                ScalarType::Integer(sql_values::IntegerType::Integer),
+                sql_values::postgres::PgValue::Integer(1),
+                ScalarType::Integer(sql_values::postgres::IntegerType::Integer),
             ),
         );
         let evaluation = crate::forward::evaluate(
@@ -239,7 +239,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             evaluation.values(),
-            &Values::Listed(alloc::collections::BTreeSet::from([sql_values::PgValue::Integer(1)]))
+            &Values::Listed(alloc::collections::BTreeSet::from([
+                sql_values::postgres::PgValue::Integer(1)
+            ]))
         );
         assert!(!evaluation.may_be_null());
     }

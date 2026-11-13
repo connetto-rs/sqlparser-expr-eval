@@ -8,7 +8,7 @@ use alloc::{
 };
 use core::{cell::Cell, ops::Bound};
 
-use sql_values::{PgNumeric, PgValue};
+use sql_values::postgres::{PgNumeric, PgValue};
 use sqlparser::ast::{
     Array, BinaryOperator, CastKind, CharacterLength, DataType, Expr, Function, FunctionArguments,
     InTarget, Query, UnaryOperator,
@@ -1657,7 +1657,7 @@ fn numeric_bound(bound: &Bound<PgNumeric>) -> Bound<u64> {
 
 #[cfg(test)]
 mod tests {
-    use sql_values::IntegerType;
+    use sql_values::postgres::IntegerType;
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::*;
@@ -1694,7 +1694,7 @@ mod tests {
     /// PostgreSQL's `length(text)`.
     fn length_callee() -> crate::Callee {
         let mut callee = crate::test_context::strict_callee(ScalarType::Integer(
-            sql_values::IntegerType::Integer,
+            sql_values::postgres::IntegerType::Integer,
         ));
         callee.builtin = Some(Builtin::Length);
         callee
@@ -2246,7 +2246,8 @@ mod tests {
     /// minimum, since a row set may hold the minimum alone.
     #[test]
     fn a_listed_date_all_reading_true_keeps_the_values_past_the_min() {
-        let day = |text: &str| PgValue::Date(sql_values::parse_date(text).expect("a date"));
+        let day =
+            |text: &str| PgValue::Date(sql_values::postgres::parse_date(text).expect("a date"));
         let v = Evaluation::new(
             ScalarType::Date,
             false,
@@ -2594,7 +2595,7 @@ mod tests {
     /// a condition read against every row reads against one row backward.
     #[test]
     fn a_subquery_condition_reads_any_row_backward() {
-        let int4 = ScalarType::Integer(sql_values::IntegerType::Integer);
+        let int4 = ScalarType::Integer(sql_values::postgres::IntegerType::Integer);
         let listed = Evaluation::new(
             int4,
             false,
@@ -3435,8 +3436,9 @@ mod tests {
 
     #[test]
     fn a_listed_date_comparison_restricts_by_value() {
-        let day =
-            |text: &str| PgValue::Date(sql_values::parse_date(text).expect("the date parses"));
+        let day = |text: &str| {
+            PgValue::Date(sql_values::postgres::parse_date(text).expect("the date parses"))
+        };
         let x = Evaluation::new(
             ScalarType::Date,
             false,
@@ -4533,7 +4535,7 @@ mod tests {
                 .with_callee(
                     "f",
                     crate::test_context::strict_callee(ScalarType::Integer(
-                        sql_values::IntegerType::Integer,
+                        sql_values::postgres::IntegerType::Integer,
                     )),
                 ),
             &parse("f(x) < 10"),
@@ -4561,7 +4563,7 @@ mod tests {
             ColumnContext::new().with_column("x", x).with_callee(
                 "f",
                 crate::test_context::strict_callee(ScalarType::Integer(
-                    sql_values::IntegerType::Integer,
+                    sql_values::postgres::IntegerType::Integer,
                 )),
             ),
             &parse("f(x) < 1"),
@@ -4898,8 +4900,8 @@ mod tests {
             false,
             false,
             Values::Listed(BTreeSet::from([
-                PgValue::Date(sql_values::parse_date("2020-01-01").expect("a date")),
-                PgValue::Date(sql_values::parse_date("2020-01-03").expect("a date")),
+                PgValue::Date(sql_values::postgres::parse_date("2020-01-01").expect("a date")),
+                PgValue::Date(sql_values::postgres::parse_date("2020-01-03").expect("a date")),
             ])),
         );
         let guarantees = quantified_over(
@@ -4920,8 +4922,8 @@ mod tests {
             false,
             false,
             Values::Listed(BTreeSet::from([
-                PgValue::Date(sql_values::parse_date("2020-01-01").expect("a date")),
-                PgValue::Date(sql_values::parse_date("2020-01-03").expect("a date")),
+                PgValue::Date(sql_values::postgres::parse_date("2020-01-01").expect("a date")),
+                PgValue::Date(sql_values::postgres::parse_date("2020-01-03").expect("a date")),
             ])),
         );
         let guarantees = quantified_over(
@@ -4983,7 +4985,7 @@ mod tests {
             ColumnContext::new().with_callee(
                 "f",
                 crate::test_context::strict_callee(ScalarType::Integer(
-                    sql_values::IntegerType::Integer,
+                    sql_values::postgres::IntegerType::Integer,
                 )),
             ),
             &parse("f(*) < 10"),
@@ -4999,7 +5001,7 @@ mod tests {
             ColumnContext::new()
                 .with_column(
                     "x",
-                    unknown_column(ScalarType::Integer(sql_values::IntegerType::Integer)),
+                    unknown_column(ScalarType::Integer(sql_values::postgres::IntegerType::Integer)),
                 )
                 .with_callee("char_length", length_callee()),
             &parse("char_length(x) = 3"),
@@ -5087,7 +5089,7 @@ mod tests {
         );
         assert_eq!(
             context.data_type(&sqlparser::ast::DataType::Integer(None)),
-            ScalarType::Integer(sql_values::IntegerType::Integer)
+            ScalarType::Integer(sql_values::postgres::IntegerType::Integer)
         );
     }
 

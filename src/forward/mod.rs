@@ -184,7 +184,7 @@ fn evaluate_node<D: EvalDialect, C: Context>(
 mod tests {
     use alloc::collections::BTreeSet;
 
-    use sql_values::{IntegerType, PgValue};
+    use sql_values::postgres::{IntegerType, PgValue};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{
@@ -276,14 +276,16 @@ mod tests {
             false,
             false,
             Values::Listed(BTreeSet::from([PgValue::Date(
-                sql_values::parse_date("2000-01-01").unwrap(),
+                sql_values::postgres::parse_date("2000-01-01").unwrap(),
             )])),
         );
         let days = Evaluation::new(
             ScalarType::Integer(IntegerType::Integer),
             false,
             false,
-            Values::Listed(BTreeSet::from([PgValue::Numeric(sql_values::PgNumeric::from(3))])),
+            Values::Listed(BTreeSet::from([PgValue::Numeric(
+                sql_values::postgres::PgNumeric::from(3),
+            )])),
         );
         let context = ColumnContext::new().with_column("d", date).with_column("n", days);
         // A numeric shift stands for the same day count but cannot be folded

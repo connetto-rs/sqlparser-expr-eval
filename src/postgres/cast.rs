@@ -3,7 +3,7 @@
 use alloc::collections::BTreeSet;
 use core::ops::Bound;
 
-use sql_values::{
+use sql_values::postgres::{
     CastTarget, CastValue, CharLength, IntegerType, NumericTypmod, PgNumeric, PgValue, cast_value,
 };
 use sqlparser::ast::{ArrayElemTypeDef, CastKind, CharacterLength, DataType, ExactNumberInfo};
@@ -305,7 +305,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use core::ops::Bound;
 
-    use sql_values::{IntegerType, NumericTypmod, PgNumeric, PgValue};
+    use sql_values::postgres::{IntegerType, NumericTypmod, PgNumeric, PgValue};
     use sqlparser::ast::{ArrayElemTypeDef, CastKind, CharacterLength, DataType, ExactNumberInfo};
 
     use crate::{

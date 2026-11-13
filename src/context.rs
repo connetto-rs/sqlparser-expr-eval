@@ -240,7 +240,7 @@ pub trait Context {
 mod tests {
     use core::convert::Infallible;
 
-    use sql_values::IntegerType;
+    use sql_values::postgres::IntegerType;
     use sqlparser::{
         ast::{Expr, Function, Ident, ObjectNamePart},
         dialect::GenericDialect,
@@ -325,8 +325,8 @@ mod tests {
         assert_eq!(
             evaluation.values(),
             &Values::Listed(alloc::collections::BTreeSet::from([
-                sql_values::PgValue::Boolean(true),
-                sql_values::PgValue::Boolean(false)
+                sql_values::postgres::PgValue::Boolean(true),
+                sql_values::postgres::PgValue::Boolean(false)
             ]))
         );
     }

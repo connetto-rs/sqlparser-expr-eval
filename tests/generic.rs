@@ -8,7 +8,7 @@ use alloc::collections::BTreeSet;
 use sqlparser_expr_eval::{
     Builtin, Callee, CalleeKind, Evaluation, Guarantees, NullInput, Outcomes, ScalarType, Values,
     Volatility, evaluate, implied,
-    sql_values::{IntegerType, PgValue},
+    sql_values::postgres::{IntegerType, PgValue},
 };
 
 mod common;

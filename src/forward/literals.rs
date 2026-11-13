@@ -1,6 +1,6 @@
 //! Literals and typed string literals, forward.
 
-use sql_values::PgValue;
+use sql_values::postgres::PgValue;
 use sqlparser::ast::{CastKind, DataType, Expr, TypedString, Value, ValueWithSpan};
 
 use super::{
@@ -73,7 +73,7 @@ pub(super) fn cast<D: EvalDialect, C: Context>(
 
 #[cfg(test)]
 mod tests {
-    use sql_values::{IntegerType, PgValue};
+    use sql_values::postgres::{IntegerType, PgValue};
     use sqlparser::{
         ast::{DataType, TimezoneInfo, TypedString, Value, ValueWithSpan},
         tokenizer::Span,

@@ -7,7 +7,7 @@ mod comparison;
 
 use alloc::{collections::BTreeSet, format};
 
-use sql_values::PgValue;
+use sql_values::postgres::PgValue;
 use sqlparser::{
     ast::{
         BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
@@ -306,9 +306,9 @@ mod tests {
         assert!(!evaluation.may_raise());
         assert_eq!(
             evaluation.values(),
-            &Values::Listed(alloc::collections::BTreeSet::from([sql_values::PgValue::Text(
-                alloc::string::String::from("ab")
-            )]))
+            &Values::Listed(alloc::collections::BTreeSet::from([
+                sql_values::postgres::PgValue::Text(alloc::string::String::from("ab"))
+            ]))
         );
     }
 
@@ -316,7 +316,10 @@ mod tests {
     fn concat_reads_a_boolean_as_its_text_cast() {
         // `'1' || false` is `1false`
         let evaluation = read("'1' || false", false);
-        assert_eq!(evaluation.constant(), Some(&sql_values::PgValue::Text("1false".into())));
+        assert_eq!(
+            evaluation.constant(),
+            Some(&sql_values::postgres::PgValue::Text("1false".into()))
+        );
     }
 
     #[test]
@@ -351,7 +354,9 @@ mod tests {
         let evaluation = read("+1", false);
         assert_eq!(
             evaluation.values(),
-            &Values::Listed(alloc::collections::BTreeSet::from([sql_values::PgValue::Integer(1)]))
+            &Values::Listed(alloc::collections::BTreeSet::from([
+                sql_values::postgres::PgValue::Integer(1)
+            ]))
         );
         assert!(!evaluation.may_raise());
     }

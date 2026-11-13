@@ -5,7 +5,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser_expr_eval::{
     Builtin, Callee, Evaluation, Guarantees, Interval, Outcomes, PostgreSqlOptions,
     QueryEvaluation, Rows, ScalarType, TextRules, Values, evaluate, implied,
-    sql_values::{IntegerType, PgValue},
+    sql_values::postgres::{IntegerType, PgValue},
 };
 
 mod common;

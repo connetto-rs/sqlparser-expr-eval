@@ -3,7 +3,7 @@
 use alloc::collections::BTreeSet;
 use core::{cmp::Ordering, ops::Bound};
 
-use sql_values::{PgNumeric, PgValue};
+use sql_values::postgres::{PgNumeric, PgValue};
 
 use super::{ScalarType, scalar::rounded_i64};
 
@@ -726,7 +726,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use core::{cmp::Ordering, ops::Bound};
 
-    use sql_values::IntegerType;
+    use sql_values::postgres::IntegerType;
 
     use super::*;
     use crate::{
@@ -1053,8 +1053,8 @@ mod tests {
             &Values::Listed(BTreeSet::from([PgValue::Numeric(num("32767"))]))
         );
         // A `timestamp` holds timestamps and their midnights, not text
-        let date = sql_values::parse_date("2024-02-29").unwrap();
-        let timestamp = sql_values::parse_timestamp("2024-02-29 12:34:56").unwrap();
+        let date = sql_values::postgres::parse_date("2024-02-29").unwrap();
+        let timestamp = sql_values::postgres::parse_timestamp("2024-02-29 12:34:56").unwrap();
         let evaluation = Evaluation::new(
             ScalarType::Timestamp,
             false,

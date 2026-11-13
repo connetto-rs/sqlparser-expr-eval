@@ -174,7 +174,7 @@ impl<R: Ord + Clone> Guarantees<R> {
 
 #[cfg(test)]
 mod tests {
-    use sql_values::{IntegerType, PgValue};
+    use sql_values::postgres::{IntegerType, PgValue};
     use sqlparser::ast::{Expr, Ident};
 
     use super::*;
