@@ -8,7 +8,7 @@ use alloc::{
 };
 use core::{cell::Cell, ops::Bound};
 
-use sql_values::postgres::{PgNumeric, PgValue};
+use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
 use sqlparser::ast::{
     Array, BinaryOperator, CastKind, CharacterLength, DataType, Expr, Function, FunctionArguments,
     InTarget, Query, UnaryOperator,
@@ -280,6 +280,14 @@ fn single_node<D: EvalDialect, C: Context>(
         Expr::Function(call) if support::simple_name(&call.name).as_deref() == Some("coalesce")
     );
     if evaluation.is_uninformative() && !coalesce {
+        return Ok(());
+    }
+    // An untyped literal reads through the `boolean` input and has no
+    // subject to narrow.
+    if evaluation.ty() == ScalarType::UnknownLiteral {
+        if support::as_condition(evaluation).outcomes().intersection(outcomes).is_empty() {
+            impossible(state);
+        }
         return Ok(());
     }
     if support::could_be_boolean(evaluation.ty()) {
@@ -620,7 +628,7 @@ fn in_list<D: EvalDialect, C: Context>(
     } else {
         Values::Listed(constants)
     };
-    let other = Evaluation::new(ScalarType::Unknown, any_null, false, values);
+    let other = typed_members(values, any_null);
     comparison_with(state, value, &other, CmpOp::Eq, Family::Any, outcomes)
 }
 
@@ -674,7 +682,7 @@ fn any_all<D: EvalDialect, C: Context>(
     let Some(op) = CmpOp::of(op) else {
         return Ok(());
     };
-    let other = match right {
+    let other = match support::unnest(right) {
         Expr::Subquery(subquery) => {
             let Some(column) = subquery_column(state, subquery, family, outcomes)? else {
                 return Ok(());
@@ -696,7 +704,7 @@ fn any_all<D: EvalDialect, C: Context>(
                 // forward pass.
                 return Ok(());
             }
-            Evaluation::new(ScalarType::Unknown, null, false, values)
+            typed_members(values, null)
         }
         Expr::Cast { expr: operand, .. } if matches!(support::unnest(operand), Expr::Array(_)) => {
             // A cast of an array, folded member by member by the forward
@@ -721,12 +729,7 @@ fn any_all<D: EvalDialect, C: Context>(
                 }
                 return Ok(());
             }
-            Evaluation::new(
-                ScalarType::Unknown,
-                evaluation.may_be_null(),
-                false,
-                Values::Listed(listed.clone()),
-            )
+            typed_members(Values::Listed(listed.clone()), evaluation.may_be_null())
         }
         _ => return Ok(()),
     };
@@ -752,6 +755,51 @@ fn listed_union<D: EvalDialect, C: Context>(
         }
     }
     Ok((Values::Listed(union), null))
+}
+
+/// The members of an `IN` list or an `ANY`/`ALL` array, typed by their
+/// constants so each compares under its own type: integers as `bigint`,
+/// which holds every one, integers among `numeric`s as `numeric`s, and text
+/// untyped, as the literal a column reads under its own type.
+fn typed_members(values: Values, null: bool) -> Evaluation {
+    let Values::Listed(listed) = values else {
+        return Evaluation::new(ScalarType::Unknown, null, false, values);
+    };
+    let kind = |value: &PgValue| {
+        match value {
+            PgValue::Integer(_) => ScalarType::Integer(IntegerType::Bigint),
+            PgValue::Numeric(_) => ScalarType::Numeric,
+            PgValue::Boolean(_) => ScalarType::Boolean,
+            PgValue::Date(_) => ScalarType::Date,
+            PgValue::Timestamp(_) => ScalarType::Timestamp,
+            PgValue::Text(_) | PgValue::Array(_) => ScalarType::Unknown,
+        }
+    };
+    let ty = listed.iter().map(kind).reduce(|ty, next| {
+        match (ty, next) {
+            _ if ty == next => ty,
+            (
+                ScalarType::Integer(_) | ScalarType::Numeric,
+                ScalarType::Integer(_) | ScalarType::Numeric,
+            ) => ScalarType::Numeric,
+            _ => ScalarType::Unknown,
+        }
+    });
+    let ty = ty.unwrap_or(ScalarType::Unknown);
+    let listed = if ty == ScalarType::Numeric {
+        listed
+            .into_iter()
+            .map(|value| {
+                match value {
+                    PgValue::Integer(integer) => PgValue::Numeric(PgNumeric::from(integer)),
+                    other => other,
+                }
+            })
+            .collect()
+    } else {
+        listed
+    };
+    Evaluation::new(ty, null, false, Values::Listed(listed))
 }
 
 /// A branch in which `value` is non-`NULL` and restricted by `restrict` to
@@ -1566,6 +1614,11 @@ fn apply_length<D: EvalDialect, C: Context>(
     range: &Interval<PgNumeric>,
 ) -> Result<(), C::Error> {
     let evaluation = forward_of(state, arg)?;
+    if matches!(evaluation.ty(), ScalarType::Unknown | ScalarType::Other) {
+        // A type the evaluator does not model, such as `char(n)`, may hold
+        // text of any length.
+        return Ok(());
+    }
     if !evaluation.ty().is_text() && evaluation.ty() != ScalarType::UnknownLiteral {
         // A length only bounds text; anything else cannot satisfy the
         // outcome.
@@ -1744,6 +1797,59 @@ mod tests {
         let expected: BTreeSet<PgValue> =
             [PgValue::Text("a".to_string()), PgValue::Text("b".to_string())].into();
         assert_eq!(listed, &expected);
+    }
+
+    /// Typed members compare under their own type, so a member past the
+    /// column's range or with a fraction is a value no row holds, never a
+    /// raise or a rounded one.
+    #[test]
+    fn typed_members_compare_under_their_own_type() {
+        let x = plain_column(ScalarType::Integer(IntegerType::Integer));
+        let admits = |sql: &str, outcomes: Outcomes, value: i64| {
+            let guarantees = implied_with(
+                ColumnContext::new().with_column("x", x.clone()),
+                &parse(sql),
+                outcomes,
+            );
+            !guarantees.is_impossible()
+                && guarantees
+                    .reference(&"x".to_string())
+                    .is_none_or(|x| x.may_be(&PgValue::Integer(value)))
+        };
+        assert!(admits("x IN (9223372036854775807)", Outcomes::FALSE, 1));
+        assert!(admits("x NOT IN (2147483648)", Outcomes::TRUE, 1));
+        assert!(admits("x IN (1.5)", Outcomes::FALSE, 2));
+        assert!(!admits("x IN (1.5)", Outcomes::TRUE, 2));
+        assert!(admits("x = ANY (ARRAY[9223372036854775807])", Outcomes::FALSE, 1));
+        assert!(admits("x = ANY (ARRAY[1.5])", Outcomes::FALSE, 2));
+    }
+
+    /// Members of the other modelled types keep their own type too, and an
+    /// integer among `numeric`s reads as a `numeric`.
+    #[test]
+    fn typed_members_of_each_type_narrow_their_column() {
+        let implied = |name: &str, ty: ScalarType, sql: &str, outcomes: Outcomes| {
+            implied_with(
+                ColumnContext::new().with_column(name, plain_column(ty)),
+                &parse(sql),
+                outcomes,
+            )
+        };
+        let n = implied("n", ScalarType::Numeric, "n IN (1, 1.5)", Outcomes::TRUE);
+        let n = column(&n, "n");
+        assert!(n.may_be(&PgValue::Numeric(PgNumeric::from(1))));
+        assert!(!n.may_be(&PgValue::Numeric(PgNumeric::from(2))));
+        let b = implied("b", ScalarType::Boolean, "b IN (true)", Outcomes::TRUE);
+        let b = column(&b, "b");
+        assert!(b.may_be(&PgValue::Boolean(true)) && !b.may_be(&PgValue::Boolean(false)));
+        let d = implied("d", ScalarType::Date, "d IN (DATE '2024-03-01')", Outcomes::TRUE);
+        let d = column(&d, "d");
+        let day =
+            |text: &str| PgValue::Date(sql_values::postgres::parse_date(text).expect("a date"));
+        assert!(d.may_be(&day("2024-03-01")) && !d.may_be(&day("2025-01-01")));
+        let ts = "ts IN (TIMESTAMP '2024-03-01 10:00')";
+        assert!(!implied("ts", ScalarType::Timestamp, ts, Outcomes::TRUE).is_impossible());
+        assert!(!implied("ts", ScalarType::Timestamp, ts, Outcomes::FALSE).is_impossible());
     }
 
     #[test]
@@ -2290,6 +2396,28 @@ mod tests {
         assert!(admits("x > ALL (ARRAY[0, NULL])", 1));
         assert!(admits("x = ANY (ARRAY[3, NULL])", 1));
         assert!(admits("x = ALL (ARRAY[3, NULL])", 3));
+    }
+
+    /// Parentheses around the array of an `ANY` leave its members read.
+    #[test]
+    fn any_reads_a_parenthesised_array() {
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("x", plain_column(ScalarType::Numeric)),
+            &parse("x = ANY ((ARRAY[3, 5]))"),
+            Outcomes::TRUE,
+        );
+        let x = column(&guarantees, "x");
+        assert!(x.may_be(&PgValue::Numeric(PgNumeric::from(3))));
+        assert!(!x.may_be(&PgValue::Numeric(PgNumeric::from(4))));
+    }
+
+    /// An untyped literal term reads through the `boolean` input.
+    #[test]
+    fn an_untyped_literal_term_reads_as_a_boolean() {
+        let context = || ColumnContext::new().with_column("b", plain_column(ScalarType::Boolean));
+        assert!(!implied_with(context(), &parse("'t' AND b"), Outcomes::TRUE).is_impossible());
+        assert!(!implied_with(context(), &parse("'f' OR b"), Outcomes::FALSE).is_impossible());
+        assert!(implied_with(context(), &parse("'f' AND b"), Outcomes::TRUE).is_impossible());
     }
 
     /// An untyped ordering bound reads as the column type.
@@ -5008,6 +5136,26 @@ mod tests {
             Outcomes::TRUE,
         );
         assert!(guarantees.is_impossible());
+    }
+
+    /// A length over a type the evaluator does not model, such as a
+    /// `char(n)` cast, bounds nothing.
+    #[test]
+    fn a_length_over_an_unmodelled_value_bounds_nothing() {
+        for (ty, sql) in [
+            (ScalarType::Date, "char_length(x::char(2)) < 5"),
+            (ScalarType::Other, "char_length(x) < 5"),
+            (ScalarType::Unknown, "char_length(x) < 5"),
+        ] {
+            let guarantees = implied_with(
+                ColumnContext::new()
+                    .with_column("x", unknown_column(ty))
+                    .with_callee("char_length", length_callee()),
+                &parse(sql),
+                Outcomes::TRUE,
+            );
+            assert!(!guarantees.is_impossible(), "{sql}");
+        }
     }
 
     /// A context that names a text column `x` and reads a `text` cast as

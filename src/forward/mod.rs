@@ -140,10 +140,12 @@ fn evaluate_node<D: EvalDialect, C: Context>(
         Expr::Between { expr, negated, low, high } => {
             fold::between(state, expr, low, high, *negated)?
         }
-        Expr::Like { negated, expr, pattern, .. }
-        | Expr::ILike { negated, expr, pattern, .. }
-        | Expr::SimilarTo { negated, expr, pattern, .. } => {
-            functions::like(state, expr, pattern, *negated)?
+        Expr::Like { expr, pattern, escape_char, .. }
+        | Expr::ILike { expr, pattern, escape_char, .. } => {
+            functions::like(state, expr, pattern, escape_char.as_deref(), false)?
+        }
+        Expr::SimilarTo { expr, pattern, escape_char, .. } => {
+            functions::like(state, expr, pattern, escape_char.as_deref(), true)?
         }
         Expr::AnyOp { left, compare_op, right, .. } => {
             functions::any_all(state, left, compare_op, right, true)?
@@ -209,6 +211,24 @@ mod tests {
     fn division_by_zero_raises() {
         let evaluation = read(ColumnContext::new(), "1 / 0");
         assert!(evaluation.always_raises());
+    }
+
+    /// A text column cast to an array may hold a malformed array literal, and
+    /// a well-formed literal is a value its `IS NULL` reads.
+    #[test]
+    fn an_array_cast_of_text_may_raise() {
+        let context = ColumnContext::new().with_column(
+            "t",
+            Evaluation::new(
+                ScalarType::Text(TextRules::DEFAULT),
+                true,
+                false,
+                Values::Unlisted(Unlisted::any()),
+            ),
+        );
+        assert!(read(context, "CAST(t AS INT[])").may_raise());
+        let tested = read(ColumnContext::new(), "('{1,2}'::INT[]) IS NULL");
+        assert!(tested.may_be_false() && !tested.always_raises());
     }
 
     #[test]

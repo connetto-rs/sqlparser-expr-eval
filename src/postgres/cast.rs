@@ -107,6 +107,18 @@ fn cast_array(element: &DataType, ty: ScalarType, source: &Evaluation) -> Evalua
         // PostgreSQL refuses the element type itself.
         return Evaluation::raising(ScalarType::Other);
     }
+    // Only an `ARRAY[...]` constructor lists its members, untyped. Any other
+    // source is text read as an array literal, which may be malformed, or an
+    // array whose members the cast may refuse.
+    if source.ty() != ScalarType::Unknown {
+        let error = source.may_raise() || !source.is_always_null();
+        return Evaluation::new(
+            ScalarType::Other,
+            source.may_be_null(),
+            error,
+            Values::Unlisted(Unlisted::any()),
+        );
+    }
     let Values::Listed(listed) = source.values() else {
         return Evaluation::unknown(ScalarType::Other).with_error(source.may_raise());
     };
@@ -663,10 +675,16 @@ mod tests {
         ));
     }
 
+    /// The evaluation of an `ARRAY[...]` constructor of the text members.
+    fn array(members: &[&str]) -> Evaluation {
+        let members = members.iter().map(|member| PgValue::Text((*member).to_string())).collect();
+        Evaluation::new(ScalarType::Unknown, false, false, Values::Listed(members))
+    }
+
     /// A cast to an array of a non-listed source is unknown.
     #[test]
     fn an_array_cast_of_an_unlisted_source_is_unknown() {
-        let source = column(ScalarType::UnknownLiteral);
+        let source = column(ScalarType::Unknown);
         let elem = DataType::Int(None);
         let evaluation =
             super::cast_array(&elem, ScalarType::Integer(IntegerType::Integer), &source);
@@ -676,11 +694,24 @@ mod tests {
     /// An array cast that raises on one member carries the error.
     #[test]
     fn an_array_cast_that_raises_carries_the_error() {
-        let source = text("not an integer");
+        let source = array(&["not an integer"]);
         let elem = DataType::Int(None);
         let evaluation =
             super::cast_array(&elem, ScalarType::Integer(IntegerType::Integer), &source);
         assert!(evaluation.may_raise());
+    }
+
+    /// Text cast to an array is an array literal, which may be malformed,
+    /// and only a `NULL` never raises.
+    #[test]
+    fn an_array_cast_of_text_may_raise() {
+        let int = ScalarType::Integer(IntegerType::Integer);
+        let evaluation = super::cast_array(&DataType::Int(None), int, &text("{1,2}"));
+        assert!(evaluation.may_raise() && !evaluation.always_raises());
+        assert!(!evaluation.may_be_null());
+        let null = Evaluation::null(ScalarType::Text(TextRules::DEFAULT));
+        let evaluation = super::cast_array(&DataType::Int(None), int, &null);
+        assert!(!evaluation.may_raise());
     }
 
     /// A cast that is undecided on a member, as a date whose reading the
@@ -688,32 +719,21 @@ mod tests {
     /// array.
     #[test]
     fn a_cast_that_is_undecided_is_unknown() {
-        let source = text("01/02/2026");
-        let evaluation = cast(&source, &DataType::Date, ScalarType::Date);
+        let evaluation = cast(&text("01/02/2026"), &DataType::Date, ScalarType::Date);
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
-        let evaluation = super::cast_array(&DataType::Date, ScalarType::Date, &source);
+        let evaluation =
+            super::cast_array(&DataType::Date, ScalarType::Date, &array(&["01/02/2026"]));
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     }
 
     /// An array cast folds each member and applies a `varchar` bound.
     #[test]
     fn an_array_cast_folds_its_members() {
-        let members =
-            BTreeSet::from([PgValue::Text("abcd".to_string()), PgValue::Text("xy".to_string())]);
-        let source =
-            Evaluation::new(ScalarType::UnknownLiteral, false, false, Values::Listed(members));
         let elem = varchar(1);
-        let evaluation = super::cast_array(&elem, ScalarType::Text(TextRules::DEFAULT), &source);
+        let evaluation =
+            super::cast_array(&elem, ScalarType::Text(TextRules::DEFAULT), &array(&["abcd", "xy"]));
         assert!(evaluation.may_be(&PgValue::Text("a".to_string())));
         assert!(evaluation.may_be(&PgValue::Text("x".to_string())));
-    }
-
-    /// A `varchar` bound truncates each array member to the element bound.
-    #[test]
-    fn an_array_cast_applies_the_varchar_bound() {
-        let source = text("abcd");
-        let elem = varchar(1);
-        let evaluation = super::cast_array(&elem, ScalarType::Text(TextRules::DEFAULT), &source);
-        assert!(evaluation.may_be(&PgValue::Text("a".to_string())));
+        assert!(!evaluation.may_be(&PgValue::Text("abcd".to_string())));
     }
 }

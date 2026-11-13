@@ -676,11 +676,15 @@ fn and_or<D: EvalDialect, C: Context>(
     let mut helper_guarantee = base.clone();
     let mut outcomes = if and { Outcomes::TRUE } else { Outcomes::FALSE };
     let mut error = false;
+    // A term that decides the chain may be read first, and the engine then
+    // skips a term that would raise.
+    let mut deciding = false;
     let mut first = true;
     for term in terms {
-        // The first term has no prefix to read under, and each later term
-        // reads correlated only while the budget holds.
-        if !first && state.budget.get() > 0 {
+        // The first term has no prefix to read under, nor has a term after a
+        // prefix that always raises, and each later term reads correlated
+        // only while the budget holds.
+        if !first && !outcomes.is_empty() && state.budget.get() > 0 {
             state.budget.set(state.budget.get() - 1);
             let mut next_outcomes = Outcomes::NONE;
             // The term is read once per outcome the prefix may take, under
@@ -702,6 +706,8 @@ fn and_or<D: EvalDialect, C: Context>(
                     state.budget,
                 )?);
                 let evaluation_outcomes = evaluation.outcomes();
+                deciding |=
+                    if and { evaluation_outcomes.falsity } else { evaluation_outcomes.truth };
                 for reading in support::OUTCOMES {
                     if reading.intersection(evaluation_outcomes).is_empty() {
                         continue;
@@ -720,7 +726,9 @@ fn and_or<D: EvalDialect, C: Context>(
                 state.guarantees,
                 state.budget,
             )?);
-            outcomes = combine(outcomes, evaluation.outcomes());
+            let evaluation_outcomes = evaluation.outcomes();
+            deciding |= if and { evaluation_outcomes.falsity } else { evaluation_outcomes.truth };
+            outcomes = combine(outcomes, evaluation_outcomes);
             error |= evaluation.may_raise();
         }
         first = false;
@@ -758,6 +766,9 @@ fn and_or<D: EvalDialect, C: Context>(
                     (next_true, next_false, next_null, next_helper);
             }
         }
+    }
+    if deciding {
+        outcomes = outcomes.union(if and { Outcomes::FALSE } else { Outcomes::TRUE });
     }
     Ok(Evaluation::condition(outcomes, error))
 }
@@ -898,7 +909,7 @@ fn concat_combine<D: EvalDialect, C: Context>(
     let is_text = |evaluation: &Evaluation| {
         evaluation.ty().is_text()
             || evaluation.ty() == ScalarType::UnknownLiteral
-            || (evaluation.ty() == ScalarType::Unknown && evaluation.is_always_null())
+            || evaluation.is_untyped_null()
     };
     if !is_text(left) && !is_text(right) {
         // Neither side is text, so `||` has no type to resolve to.
@@ -2095,6 +2106,18 @@ mod tests {
         assert!(read("'a' AND true").may_raise());
         let integer = read("1 AND true");
         assert!(integer.may_raise() && integer.may_be_true());
+    }
+
+    /// A term that decides an `AND` or an `OR` may be read before a raising
+    /// term, which the engine then never reads.
+    #[test]
+    fn a_deciding_term_may_skip_a_raising_term() {
+        let read = |sql: &str| read(ColumnContext::new(), sql);
+        let and = read("false AND (1 / 0 = 1)");
+        assert!(and.may_be_false() && !and.may_be_true());
+        let or = read("(1 / 0 = 1) OR true");
+        assert!(or.may_be_true() && !or.may_be_false());
+        assert!(read("true AND (1 / 0 = 1)").always_raises());
     }
 
     /// An operand an engine refuses under a boolean, a sign or a comparison

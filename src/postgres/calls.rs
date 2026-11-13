@@ -110,9 +110,7 @@ fn resolved_type(argument_evaluations: &[Evaluation]) -> Option<(ScalarType, boo
     for evaluation in argument_evaluations {
         let ty = evaluation.ty();
         // An untyped literal and an untyped `NULL` take the resolved type.
-        if ty == ScalarType::UnknownLiteral
-            || (ty == ScalarType::Unknown && evaluation.is_always_null())
-        {
+        if evaluation.is_untyped() {
             continue;
         }
         let Some(current) = resolved else {

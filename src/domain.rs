@@ -453,6 +453,19 @@ impl Evaluation {
         self.values.is_empty() && !self.error && self.null
     }
 
+    /// Whether it is the untyped `NULL`, an `Unknown` with no value that
+    /// never raises, which reads as the type of its context.
+    #[must_use]
+    pub fn is_untyped_null(&self) -> bool {
+        self.ty == ScalarType::Unknown && self.is_always_null()
+    }
+
+    /// Whether it is an untyped literal or an untyped `NULL`.
+    #[must_use]
+    pub fn is_untyped(&self) -> bool {
+        self.ty == ScalarType::UnknownLiteral || self.is_untyped_null()
+    }
+
     /// Whether every evaluation raises an error.
     #[must_use]
     pub fn always_raises(&self) -> bool {

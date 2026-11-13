@@ -448,7 +448,7 @@ pub(crate) fn as_condition(evaluation: Evaluation) -> Evaluation {
 #[must_use]
 pub(crate) fn sign_may_raise(evaluation: &Evaluation) -> bool {
     let ty = evaluation.ty();
-    let untyped_null = ty == ScalarType::Unknown && evaluation.is_always_null();
+    let untyped_null = evaluation.is_untyped_null();
     untyped_null || !(ty.is_number() || matches!(ty, ScalarType::Float | ScalarType::Unknown))
 }
 

@@ -94,7 +94,7 @@ pub trait EvalDialect {
         }
         if source.is_always_null() {
             // A typed `NULL` may name a cast that does not exist.
-            let typed = !matches!(source.ty(), ScalarType::Unknown | ScalarType::UnknownLiteral);
+            let typed = !source.is_untyped();
             let refused = typed && to != source.ty();
             return Evaluation::null(to).with_error(source.may_raise() || refused);
         }
