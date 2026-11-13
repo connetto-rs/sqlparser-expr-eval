@@ -3,7 +3,7 @@
 use alloc::collections::BTreeSet;
 use core::{cmp::Ordering, ops::Bound};
 
-use sql_values::{PgNumeric, PgValue};
+use sql_values::postgres::{PgNumeric, PgValue};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
 
 use super::{
@@ -973,7 +973,7 @@ fn arithmetic_sides(left: Evaluation, right: Evaluation) -> (Evaluation, Evaluat
         }
         // An engine may find no unique operator for two untyped literals.
         (ScalarType::UnknownLiteral, ScalarType::UnknownLiteral) => {
-            let integer = ScalarType::Integer(sql_values::IntegerType::Integer);
+            let integer = ScalarType::Integer(sql_values::postgres::IntegerType::Integer);
             (
                 reinterpret_unknown(left, integer).with_error(true),
                 reinterpret_unknown(right, integer),
@@ -1091,7 +1091,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use core::{cell::Cell, ops::Bound};
 
-    use sql_values::{IntegerType, PgNumeric, PgValue};
+    use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
     use sqlparser::{
         ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan},
         dialect::PostgreSqlDialect,
@@ -1840,7 +1840,9 @@ mod tests {
 
     fn instant(value: &str) -> Evaluation {
         Evaluation::known(
-            PgValue::Timestamp(sql_values::parse_timestamp(value).expect("a valid timestamp")),
+            PgValue::Timestamp(
+                sql_values::postgres::parse_timestamp(value).expect("a valid timestamp"),
+            ),
             ScalarType::Timestamp,
         )
     }
@@ -1965,7 +1967,7 @@ mod tests {
             true,
             false,
             Values::Listed(BTreeSet::from([PgValue::Date(
-                sql_values::parse_date("2026-01-01").expect("valid"),
+                sql_values::postgres::parse_date("2026-01-01").expect("valid"),
             )])),
         );
         let result = read(
@@ -1979,7 +1981,7 @@ mod tests {
             false,
             false,
             Values::Listed(BTreeSet::from([PgValue::Timestamp(
-                sql_values::parse_timestamp("2026-01-01 01:00:00").expect("valid"),
+                sql_values::postgres::parse_timestamp("2026-01-01 01:00:00").expect("valid"),
             )])),
         );
         let result = read(ColumnContext::new().with_column("t", ts), "t = DATE '2026-01-01'");

@@ -2,7 +2,7 @@
 
 use alloc::{collections::BTreeSet, vec::Vec};
 
-use sql_values::PgValue;
+use sql_values::postgres::PgValue;
 
 use crate::{
     domain::{Evaluation, Unlisted, Values},
@@ -247,7 +247,7 @@ fn values_hull<'a>(evaluations: impl Iterator<Item = &'a Evaluation>) -> Values 
 
 #[cfg(test)]
 mod tests {
-    use sql_values::{IntegerType, PgDate, PgNumeric, PgTimestamp, PgValue};
+    use sql_values::postgres::{IntegerType, PgDate, PgNumeric, PgTimestamp, PgValue};
 
     use crate::{
         domain::{Evaluation, Unlisted, Values},

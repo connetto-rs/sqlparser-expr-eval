@@ -3,7 +3,7 @@
 use alloc::collections::BTreeSet;
 use core::ops::Bound;
 
-use sql_values::{IntegerType, PgNumeric, PgValue};
+use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
 use sqlparser::ast::BinaryOperator;
 
 use crate::{
@@ -558,7 +558,7 @@ mod tests {
     }
 
     fn known_date(text: &str) -> Evaluation {
-        let date = sql_values::parse_date(text).expect("a date");
+        let date = sql_values::postgres::parse_date(text).expect("a date");
         Evaluation::known(PgValue::Date(date), ScalarType::Date)
     }
 
@@ -937,7 +937,7 @@ mod tests {
         assert!(!result.may_raise());
         assert_eq!(
             result.constant(),
-            Some(&PgValue::Date(sql_values::parse_date("2020-02-01").expect("a date")))
+            Some(&PgValue::Date(sql_values::postgres::parse_date("2020-02-01").expect("a date")))
         );
         let result = arithmetic(
             &known_int(1, IntegerType::Integer),
@@ -946,7 +946,7 @@ mod tests {
         );
         assert_eq!(
             result.constant(),
-            Some(&PgValue::Date(sql_values::parse_date("2020-02-01").expect("a date")))
+            Some(&PgValue::Date(sql_values::postgres::parse_date("2020-02-01").expect("a date")))
         );
         let result = arithmetic(
             &known_date("2020-01-31"),
@@ -955,7 +955,7 @@ mod tests {
         );
         assert_eq!(
             result.constant(),
-            Some(&PgValue::Date(sql_values::parse_date("2020-01-30").expect("a date")))
+            Some(&PgValue::Date(sql_values::postgres::parse_date("2020-01-30").expect("a date")))
         );
 
         // a date minus a date is the day span, of type `int4`
@@ -978,8 +978,10 @@ mod tests {
         let result = arithmetic(&dates, &BinaryOperator::Minus, &dates);
         assert_eq!(result.ty(), ScalarType::Integer(IntegerType::Integer));
         assert!(result.may_raise());
-        let infinite =
-            Evaluation::known(PgValue::Date(sql_values::PgDate::INFINITY), ScalarType::Date);
+        let infinite = Evaluation::known(
+            PgValue::Date(sql_values::postgres::PgDate::INFINITY),
+            ScalarType::Date,
+        );
         let result = arithmetic(&infinite, &BinaryOperator::Minus, &known_date("2020-01-01"));
         assert!(result.always_raises());
     }
@@ -1046,7 +1048,7 @@ mod tests {
         // a shift past the date range raises, leaving no value behind
         let result = arithmetic(
             &Evaluation::known(
-                PgValue::Date(sql_values::PgDate::from_ymd(5_874_897, 12, 31).unwrap()),
+                PgValue::Date(sql_values::postgres::PgDate::from_ymd(5_874_897, 12, 31).unwrap()),
                 ScalarType::Date,
             ),
             &BinaryOperator::Plus,
@@ -1057,7 +1059,7 @@ mod tests {
         assert!(listed.is_empty());
         let result = arithmetic(
             &Evaluation::known(
-                PgValue::Date(sql_values::PgDate::from_ymd(-4713, 11, 24).unwrap()),
+                PgValue::Date(sql_values::postgres::PgDate::from_ymd(-4713, 11, 24).unwrap()),
                 ScalarType::Date,
             ),
             &BinaryOperator::Minus,
@@ -1075,7 +1077,7 @@ mod tests {
         let result = arithmetic(&known_date("2020-01-01"), &BinaryOperator::Plus, &days);
         assert_eq!(
             result.constant(),
-            Some(&PgValue::Date(sql_values::parse_date("2020-01-02").expect("a date")))
+            Some(&PgValue::Date(sql_values::postgres::parse_date("2020-01-02").expect("a date")))
         );
     }
 

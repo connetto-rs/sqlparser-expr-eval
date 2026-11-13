@@ -3,7 +3,7 @@
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::ops::Bound;
 
-use sql_values::{PgNumeric, PgValue};
+use sql_values::postgres::{PgNumeric, PgValue};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName, Value,
     ValueWithSpan,
@@ -457,7 +457,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use core::ops::Bound;
 
-    use sql_values::{IntegerType, PgNumeric, PgValue};
+    use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
     use sqlparser::ast::{Expr, Function};
 
     use super::{
@@ -839,7 +839,7 @@ mod tests {
         let unlisted = Evaluation::new(ScalarType::UnknownLiteral, false, false, any);
         assert!(super::as_condition(unlisted).may_raise());
         let impossible =
-            Evaluation::impossible(ScalarType::Integer(sql_values::IntegerType::Integer));
+            Evaluation::impossible(ScalarType::Integer(sql_values::postgres::IntegerType::Integer));
         assert!(super::as_condition(impossible).is_impossible());
     }
 }

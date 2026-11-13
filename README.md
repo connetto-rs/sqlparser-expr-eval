@@ -19,7 +19,7 @@ use sqlparser::{
 use sqlparser_expr_eval::{
     Callee, Context, Evaluation, Guarantees, Outcomes, PostgreSqlOptions, Resolved,
     ScalarType, TextRules, Unlisted, Values, evaluate, implied,
-    sql_values::IntegerType,
+    sql_values::postgres::IntegerType,
 };
 
 /// `id INT NOT NULL` and `note TEXT`.
