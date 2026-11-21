@@ -37,10 +37,12 @@ pub(super) fn cast(
     }
     // A typed `NULL` still needs a cast between the two types.
     let mut fold_error = source.may_raise() || (source.is_always_null() && cast_raises(source, to));
+    let mut null = source.may_be_null();
     let values = match source.values() {
         Values::Listed(listed) => {
             let fold = scalar::cast_datums(listed, |datum| scalar::cast(datum, source.ty(), to));
             fold_error |= fold.raises || (fold.undecided && cast_raises(source, to));
+            null |= fold.null;
             if fold.undecided {
                 Values::Unlisted(Unlisted::any())
             } else {
@@ -52,7 +54,7 @@ pub(super) fn cast(
             Values::Unlisted(Unlisted::any())
         }
     };
-    let mut evaluation = Evaluation::new(to, source.may_be_null(), fold_error, values);
+    let mut evaluation = Evaluation::new(to, null, fold_error, values);
     match modifier(data_type) {
         Modifier::Varchar(limit) => {
             if to.is_text() {
@@ -113,7 +115,7 @@ fn cast_array(element: &DataType, ty: ScalarType, source: &Evaluation) -> Evalua
     } else {
         Values::Listed(fold.values)
     };
-    Evaluation::new(array, source.may_be_null(), error, values)
+    Evaluation::new(array, source.may_be_null() || fold.null, error, values)
 }
 
 /// How an array's element type reads as a cast target.
@@ -219,7 +221,7 @@ fn numeric_modifier(data_type: &DataType) -> Option<(u64, i64)> {
 /// The value cast to `numeric` under `typmod`, `None` when the cast raises.
 fn apply_typmod(value: &PgNumeric, typmod: NumericTypmod) -> Option<PgNumeric> {
     match cast_value(CastValue::Numeric(value.clone()), CastTarget::Numeric(Some(typmod))) {
-        Ok(CastValue::Numeric(rounded)) => Some(rounded),
+        Ok(Some(CastValue::Numeric(rounded))) => Some(rounded),
         _ => None,
     }
 }
@@ -323,7 +325,9 @@ fn truncate_text(evaluation: &Evaluation, limit: usize) -> Evaluation {
 fn clip(value: &PgValue, limit: usize) -> PgValue {
     let clipped = match (value, CharLength::new(limit)) {
         (PgValue::Text(text), Some(length)) => {
-            cast_value(CastValue::Text(text.clone()), CastTarget::Varchar(Some(length))).ok()
+            cast_value(CastValue::Text(text.clone()), CastTarget::Varchar(Some(length)))
+                .ok()
+                .flatten()
         }
         _ => None,
     };
@@ -362,7 +366,7 @@ mod tests {
     use alloc::{collections::BTreeSet, string::ToString};
     use core::ops::Bound;
 
-    use sql_values::postgres::{IntegerType, NumericTypmod, PgNumeric, PgValue};
+    use sql_values::postgres::{IntegerType, NumericTypmod, PgJsonb, PgNumeric, PgValue};
     use sqlparser::ast::{ArrayElemTypeDef, CastKind, CharacterLength, DataType, ExactNumberInfo};
 
     use crate::{
@@ -470,6 +474,25 @@ mod tests {
         let evaluation =
             cast(&source, &DataType::Numeric(ExactNumberInfo::None), ScalarType::Numeric);
         assert_eq!(evaluation.constant(), Some(&PgValue::Numeric(PgNumeric::INFINITY)));
+    }
+
+    /// A `jsonb` `null` casts to a scalar type as `NULL`, never raising, so a
+    /// listed `jsonb` source may be `NULL` beside the values it folds to.
+    #[test]
+    fn a_jsonb_null_casts_to_null() {
+        let jsonb = |texts: &[&str]| {
+            let listed = texts.iter().map(|text| PgValue::Jsonb(PgJsonb::parse(text).unwrap()));
+            Evaluation::new(ScalarType::Other, false, false, Values::Listed(listed.collect()))
+        };
+        let int4 = ScalarType::Integer(IntegerType::Integer);
+        let evaluation = cast(&jsonb(&["null"]), &DataType::Integer(None), int4);
+        assert!(evaluation.is_always_null());
+        assert!(!evaluation.may_raise());
+        let evaluation = cast(&jsonb(&["null", "7"]), &DataType::Integer(None), int4);
+        assert!(evaluation.may_be_null());
+        assert!(!evaluation.may_raise());
+        let Values::Listed(listed) = evaluation.values() else { panic!("the values are listed") };
+        assert_eq!(listed, &BTreeSet::from([PgValue::Integer(7)]));
     }
 
     /// A `varchar(n)` cast truncates each listed member to `n` characters.

@@ -258,7 +258,7 @@ pub(crate) fn reinterpret_unknown(evaluation: Evaluation, target: ScalarType) ->
         } else {
             Values::Listed(fold.values)
         };
-        return Evaluation::new(target, evaluation.may_be_null(), error, values);
+        return Evaluation::new(target, evaluation.may_be_null() || fold.null, error, values);
     }
     // An unlisted literal may hold text the target's input refuses.
     Evaluation::new(target, evaluation.may_be_null(), true, Values::Unlisted(Unlisted::any()))
