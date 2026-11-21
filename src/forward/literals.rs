@@ -47,7 +47,7 @@ pub(super) fn typed_string<C: Context>(context: &mut C, typed: &TypedString) -> 
     match scalar::cast(&PgValue::Text(text.clone()), ScalarType::UnknownLiteral, ty) {
         Cast::Folded(datum) => Evaluation::known(datum, ty),
         Cast::Raises => Evaluation::raising(ty),
-        Cast::Unknown => Evaluation::unknown(ty),
+        Cast::Null | Cast::Unknown => Evaluation::unknown(ty),
     }
 }
 

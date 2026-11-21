@@ -255,6 +255,8 @@ pub(crate) fn number_literal(text: &str, negated: bool) -> Option<(PgValue, Scal
 pub(crate) enum Cast {
     /// The cast folds to this value.
     Folded(PgValue),
+    /// The cast yields `NULL`, as a `jsonb` `null` cast to a scalar type does.
+    Null,
     /// The cast raises an error.
     Raises,
     /// The cast's result is not decided by the value.
@@ -262,10 +264,12 @@ pub(crate) enum Cast {
 }
 
 /// The listed `datums` cast one at a time, the values the casts fold and the
-/// raises and undecidability their results carry.
+/// `NULL`s, raises and undecidability their results carry.
 pub(crate) struct CastFold {
     /// The folded values.
     pub values: BTreeSet<PgValue>,
+    /// A cast yields `NULL`.
+    pub null: bool,
     /// A cast raises.
     pub raises: bool,
     /// A cast is undecided.
@@ -274,12 +278,14 @@ pub(crate) struct CastFold {
 
 /// `datums` cast one at a time by `cast`.
 pub(crate) fn cast_datums(datums: &BTreeSet<PgValue>, cast: impl Fn(&PgValue) -> Cast) -> CastFold {
-    let mut fold = CastFold { values: BTreeSet::new(), raises: false, undecided: false };
+    let mut fold =
+        CastFold { values: BTreeSet::new(), null: false, raises: false, undecided: false };
     for datum in datums {
         match cast(datum) {
             Cast::Folded(value) => {
                 fold.values.insert(value);
             }
+            Cast::Null => fold.null = true,
             Cast::Raises => fold.raises = true,
             Cast::Unknown => fold.undecided = true,
         }
@@ -323,7 +329,8 @@ pub(crate) fn cast(datum: &PgValue, from: ScalarType, to: ScalarType) -> Cast {
     };
     let Some(source) = cast_source(datum, from) else { return Cast::Unknown };
     match cast_value(source, target) {
-        Ok(value) => folded(value),
+        Ok(Some(value)) => folded(value),
+        Ok(None) => Cast::Null,
         Err(CastError::Unsupported) => Cast::Unknown,
         Err(_) => Cast::Raises,
     }
@@ -392,7 +399,7 @@ fn folded(value: CastValue) -> Cast {
 /// `None` for `NaN`, an infinity or a value past `bigint`.
 pub(crate) fn rounded_i64(value: &PgNumeric) -> Option<i64> {
     match cast_value(CastValue::Numeric(value.clone()), CastTarget::Bigint) {
-        Ok(CastValue::Bigint(rounded)) => Some(rounded),
+        Ok(Some(CastValue::Bigint(rounded))) => Some(rounded),
         _ => None,
     }
 }
@@ -406,7 +413,7 @@ pub(crate) fn exact_i64(value: &PgNumeric) -> Option<i64> {
 mod tests {
     use alloc::string::String;
 
-    use sql_values::postgres::{PgBpchar, PgDate, PgTimestamp, PgTimestampTz};
+    use sql_values::postgres::{PgBpchar, PgDate, PgJsonb, PgTimestamp, PgTimestampTz};
 
     use super::*;
 
@@ -571,6 +578,20 @@ mod tests {
             Cast::Folded(text("1.50"))
         );
         assert_eq!(cast(&text("42"), text_type, int8), Cast::Folded(PgValue::Integer(42)));
+    }
+
+    /// A `jsonb` `null` casts to a scalar type as `NULL`, any other `jsonb`
+    /// scalar as its value, and a `jsonb` of the wrong kind raises.
+    #[test]
+    fn jsonb_casts_fold_null_to_null() {
+        let jsonb = |text: &str| PgValue::Jsonb(PgJsonb::parse(text).unwrap());
+        let int4 = ScalarType::Integer(IntegerType::Integer);
+        assert_eq!(cast(&jsonb("null"), ScalarType::Other, int4), Cast::Null);
+        assert_eq!(cast(&jsonb("null"), ScalarType::Other, ScalarType::Boolean), Cast::Null);
+        assert_eq!(cast(&jsonb("42"), ScalarType::Other, int4), Cast::Folded(PgValue::Integer(42)));
+        assert_eq!(cast(&jsonb("true"), ScalarType::Other, int4), Cast::Raises);
+        let text_type = ScalarType::Text(TextRules::DEFAULT);
+        assert_eq!(cast(&jsonb("null"), ScalarType::Other, text_type), Cast::Folded(text("null")));
     }
 
     #[test]

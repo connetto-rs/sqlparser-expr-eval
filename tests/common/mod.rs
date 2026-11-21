@@ -81,7 +81,6 @@ pub fn column(ty: ScalarType, null: bool) -> Evaluation {
 }
 
 /// The expression of `SELECT expression`, parsed as PostgreSQL.
-#[expect(clippy::expect_used, clippy::panic, reason = "a malformed test expression fails the test")]
 pub fn parse(expression: &str) -> Expr {
     let statements =
         Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expression}")).expect("parses");

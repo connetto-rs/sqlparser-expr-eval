@@ -753,8 +753,9 @@ fn listed_union<D: EvalDialect, C: Context>(
 
 /// The members of an `IN` list or an `ANY`/`ALL` array, typed by their
 /// constants so each compares under its own type: integers as `bigint`,
-/// which holds every one, integers among `numeric`s as `numeric`s, and text
-/// untyped, as the literal a column reads under its own type.
+/// which holds every one, integers among `numeric`s as `numeric`s, `jsonb`
+/// as the unmodelled type a `jsonb` column reads as, and text untyped, as
+/// the literal a column reads under its own type.
 fn typed_members(values: Values, null: bool) -> Evaluation {
     let Values::Listed(listed) = values else {
         return Evaluation::new(ScalarType::Unknown, null, false, values);
@@ -766,6 +767,7 @@ fn typed_members(values: Values, null: bool) -> Evaluation {
             PgValue::Boolean(_) => ScalarType::Boolean,
             PgValue::Date(_) => ScalarType::Date,
             PgValue::Timestamp(_) => ScalarType::Timestamp,
+            PgValue::Jsonb(_) => ScalarType::Other,
             PgValue::Text(_) | PgValue::Array(_) => ScalarType::Unknown,
         }
     };
@@ -1213,15 +1215,10 @@ fn restriction(
     // An untyped value side reads its values as the other side's type.
     let reinterpreted;
     let right = if untyped(right.ty()) && !untyped(left.ty()) && !left.ty().is_text() {
-        let Some(values) = reinterpreted_values(right, left.ty()) else {
+        let Some(read) = reinterpreted_as(right, left.ty()) else {
             return Restriction::Skip;
         };
-        reinterpreted = Evaluation::new(
-            left.ty(),
-            right.may_be_null(),
-            right.may_raise(),
-            Values::Listed(values),
-        );
+        reinterpreted = read;
         &reinterpreted
     } else {
         right
@@ -1261,14 +1258,19 @@ fn restriction(
     }
 }
 
-/// The values of `source` re-read as `target`, `None` when one stays undecided.
-fn reinterpreted_values(source: &Evaluation, target: ScalarType) -> Option<BTreeSet<PgValue>> {
+/// The listed `source` re-read as `target`, `NULL` where a value casts to
+/// `NULL`, and `None` when one cast stays undecided.
+fn reinterpreted_as(source: &Evaluation, target: ScalarType) -> Option<Evaluation> {
     let Values::Listed(listed) = source.values() else {
         return None;
     };
     let fold =
         crate::scalar::cast_datums(listed, |datum| crate::scalar::cast(datum, source.ty(), target));
-    if fold.undecided { None } else { Some(fold.values) }
+    if fold.undecided {
+        return None;
+    }
+    let null = source.may_be_null() || fold.null;
+    Some(Evaluation::new(target, null, source.may_raise(), Values::Listed(fold.values)))
 }
 
 /// Whether the categories can compare as values.
@@ -1834,6 +1836,21 @@ mod tests {
         let ts = "ts IN (TIMESTAMP '2024-03-01 10:00')";
         assert!(!implied("ts", ScalarType::Timestamp, ts, Outcomes::TRUE).is_impossible());
         assert!(!implied("ts", ScalarType::Timestamp, ts, Outcomes::FALSE).is_impossible());
+    }
+
+    /// `jsonb` members read as the type a `jsonb` column has, so they
+    /// narrow it to themselves.
+    #[test]
+    fn jsonb_members_narrow_a_jsonb_column() {
+        let jsonb =
+            |text: &str| PgValue::Jsonb(sql_values::postgres::PgJsonb::parse(text).unwrap());
+        let context = ColumnContext::new()
+            .with_column("j", plain_column(ScalarType::Other))
+            .with_column("k", Evaluation::known(jsonb("[1, 2]"), ScalarType::Other));
+        let guarantees = implied_with(context, &parse("j IN (k)"), Outcomes::TRUE);
+        let j = column(&guarantees, "j");
+        assert!(j.may_be(&jsonb("[1, 2]")));
+        assert!(!j.may_be(&jsonb("[]")));
     }
 
     #[test]
@@ -2488,7 +2505,7 @@ mod tests {
             false,
             Values::Unlisted(Unlisted::any()),
         );
-        assert!(super::reinterpreted_values(&any, ScalarType::Numeric).is_none());
+        assert!(super::reinterpreted_as(&any, ScalarType::Numeric).is_none());
         // A literal the type's input refuses drops out of the membership.
         let literals = Evaluation::new(
             ScalarType::UnknownLiteral,
@@ -2499,8 +2516,25 @@ mod tests {
                 PgValue::Text("abc".to_string()),
             ])),
         );
-        let read = super::reinterpreted_values(&literals, ScalarType::Numeric);
-        assert_eq!(read, Some(BTreeSet::from([PgValue::Numeric(PgNumeric::from(1))])));
+        let read = super::reinterpreted_as(&literals, ScalarType::Numeric);
+        assert_eq!(
+            read.as_ref().and_then(Evaluation::constant),
+            Some(&PgValue::Numeric(PgNumeric::from(1)))
+        );
+        // A `jsonb` `null` re-read as a scalar type is `NULL`.
+        let mixed = Evaluation::new(
+            ScalarType::Unknown,
+            false,
+            false,
+            Values::Listed(BTreeSet::from([
+                PgValue::Text("1".to_string()),
+                PgValue::Jsonb(sql_values::postgres::PgJsonb::parse("null").unwrap()),
+            ])),
+        );
+        let read = super::reinterpreted_as(&mixed, ScalarType::Integer(IntegerType::Integer))
+            .expect("every member casts");
+        assert!(read.may_be_null());
+        assert_eq!(read.constant_value(), Some(&PgValue::Integer(1)));
     }
 
     #[test]
