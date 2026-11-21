@@ -100,8 +100,8 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_expr_eval::{
-    Callee, Comparison, Context, EvalDialect, Evaluation, Guarantees, PostgreSqlOptions, Resolved,
-    ScalarType, evaluate,
+    Callee, Comparison, Context, EvalDialect, Evaluation, Guarantees, Order, PostgreSqlOptions,
+    Resolved, ScalarType, evaluate,
 };
 
 /// The engine a query runs under, chosen at runtime, holding the settings
@@ -124,6 +124,18 @@ impl EvalDialect for Engine {
         match self {
             Self::Postgres(dialect, options) => dialect.comparison(left, op, right, options),
             Self::Generic(dialect) => dialect.comparison(left, op, right, &()),
+        }
+    }
+
+    fn comparison_order(
+        &self,
+        left: ScalarType,
+        right: ScalarType,
+        _options: &(),
+    ) -> Option<Order> {
+        match self {
+            Self::Postgres(dialect, options) => dialect.comparison_order(left, right, options),
+            Self::Generic(dialect) => dialect.comparison_order(left, right, &()),
         }
     }
 

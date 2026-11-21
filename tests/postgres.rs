@@ -1,10 +1,12 @@
-//! PostgreSQL facts read through the public API, and the guarantees the
-//! backward pass places on the columns a condition names.
+//! PostgreSQL facts read through the public API, the guarantees the
+//! backward pass places on the columns a condition names, and the relations
+//! it keeps between two compared operands.
 
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser_expr_eval::{
-    Builtin, Callee, Evaluation, Guarantees, Interval, Outcomes, PostgreSqlOptions,
-    QueryEvaluation, Rows, ScalarType, TextRules, Values, evaluate, implied,
+    Builtin, Callee, Collation, Evaluation, Guarantees, Interval, Order, Outcomes,
+    PostgreSqlOptions, QueryEvaluation, Relation, Rows, ScalarType, Subject, TextRules, Values,
+    evaluate, implied,
     sql_values::postgres::{IntegerType, PgValue},
 };
 
@@ -259,4 +261,186 @@ fn a_null_concat_result_comes_from_no_input_reason() {
         Outcomes::NULL,
     );
     assert_eq!(guarantees.reference(&"x".to_string()), None);
+}
+
+const INTEGER: ScalarType = ScalarType::Integer(IntegerType::Integer);
+
+/// Integers `x`, `y` and `z` that are never `NULL` and a nullable integer
+/// `n`.
+fn integers() -> Ctx {
+    Ctx::with_columns(vec![
+        ("x".into(), column(INTEGER, false)),
+        ("y".into(), column(INTEGER, false)),
+        ("z".into(), column(INTEGER, false)),
+        ("n".into(), column(INTEGER, true)),
+    ])
+}
+
+/// The outcomes `sql` may take under `guarantees`.
+fn outcomes_under(mut context: Ctx, sql: &str, guarantees: &Guarantees<String>) -> Outcomes {
+    let dialect = PostgreSqlDialect {};
+    let options = PostgreSqlOptions::default();
+    evaluate(&parse(sql), &dialect, &options, &mut context, guarantees)
+        .expect("the context resolves")
+        .outcomes()
+}
+
+/// The outcomes `sql` may take with nothing guaranteed.
+fn outcomes(context: Ctx, sql: &str) -> Outcomes {
+    outcomes_under(context, sql, &Guarantees::new())
+}
+
+fn reference(name: &str) -> Subject<String> {
+    Subject::Reference(name.to_string())
+}
+
+#[test]
+fn contradicting_comparisons_of_one_pair_are_decided() {
+    for (sql, expected) in [
+        ("x < y AND y < x", Outcomes::FALSE),
+        ("x < y AND x >= y", Outcomes::FALSE),
+        ("x = y AND x <> y", Outcomes::FALSE),
+        ("x <= y AND x >= y AND x <> y", Outcomes::FALSE),
+        ("x < y OR x >= y", Outcomes::TRUE),
+        ("x < n OR x >= n", Outcomes::NOT_FALSE),
+        ("NOT (x < y) AND y > x", Outcomes::FALSE),
+        ("x < x", Outcomes::FALSE),
+        ("n < n", Outcomes::NOT_TRUE),
+        ("n <> n", Outcomes::NOT_TRUE),
+        ("n IS NOT NULL AND n <> n", Outcomes::FALSE),
+        ("n <= n", Outcomes::NOT_FALSE),
+        ("x BETWEEN y AND z AND z < y", Outcomes::FALSE),
+    ] {
+        assert_eq!(outcomes(integers(), sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn an_operand_computed_from_columns_keeps_no_relation() {
+    // `y + z` reads columns, so it is no subject, and a negative `z` makes
+    // the conjunction true.
+    assert!(outcomes(integers(), "x < y AND y + z < x").truth);
+}
+
+#[test]
+fn a_check_guarantee_decides_a_later_comparison() {
+    let check = restrict(integers(), "x < y", Outcomes::NOT_FALSE);
+    assert_eq!(outcomes_under(integers(), "x >= y", &check), Outcomes::FALSE);
+    assert_eq!(outcomes_under(integers(), "y > x", &check), Outcomes::TRUE);
+}
+
+#[test]
+fn a_relation_alone_narrows_no_values() {
+    // `numeric` has no type bounds for the comparison to narrow towards.
+    let numbers = || {
+        Ctx::with_columns(vec![
+            ("p".into(), column(ScalarType::Numeric, false)),
+            ("q".into(), column(ScalarType::Numeric, false)),
+        ])
+    };
+    let guarantees = restrict(numbers(), "p < q", Outcomes::TRUE);
+    for name in ["p", "q"] {
+        let evaluation = guarantees.reference(&name.to_string()).expect("the comparison names it");
+        assert!(evaluation.number_range().is_unbounded(), "{name}");
+    }
+    assert_eq!(
+        guarantees.relation(Order::Number, &reference("p"), &reference("q")),
+        Relation { less: true, equal: false, greater: false }
+    );
+    assert_eq!(outcomes_under(numbers(), "q > p", &guarantees), Outcomes::TRUE);
+}
+
+#[test]
+fn relations_compose_along_a_chain() {
+    assert_eq!(outcomes(integers(), "x < y AND y < z AND z < x"), Outcomes::FALSE);
+    let chain = restrict(integers(), "x < y AND y <= z", Outcomes::TRUE);
+    assert_eq!(outcomes_under(integers(), "x < z", &chain), Outcomes::TRUE);
+    let both_ways = restrict(integers(), "x <= y AND y <= x", Outcomes::TRUE);
+    assert_eq!(outcomes_under(integers(), "x = y", &both_ways), Outcomes::TRUE);
+}
+
+/// What a comparison operator answers on two values.
+type Holds = fn(&i32, &i32) -> bool;
+
+/// The six comparison operators with what each answers on two values.
+const OPERATORS: [(&str, Holds); 6] = [
+    ("<", i32::lt),
+    ("<=", i32::le),
+    ("=", i32::eq),
+    ("<>", i32::ne),
+    (">=", i32::ge),
+    (">", i32::gt),
+];
+
+/// The outcome of `left AND right`, or of `left OR right`, in three-valued
+/// logic.
+fn combine(left: Option<bool>, right: Option<bool>, and: bool) -> Option<bool> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if and { left && right } else { left || right }),
+        (Some(decided), None) | (None, Some(decided)) if decided != and => Some(decided),
+        _ => None,
+    }
+}
+
+#[test]
+fn every_pair_of_comparisons_takes_the_outcomes_of_every_row() {
+    for (left_null, right_null) in [(false, false), (true, false), (false, true), (true, true)] {
+        let context = || {
+            Ctx::with_columns(vec![
+                ("a".into(), column(INTEGER, left_null)),
+                ("b".into(), column(INTEGER, right_null)),
+            ])
+        };
+        let values =
+            |null: bool| [Some(1), Some(2), Some(3)].into_iter().chain(null.then_some(None));
+        for (first, first_holds) in OPERATORS {
+            for (second, second_holds) in OPERATORS {
+                for and in [true, false] {
+                    let mut expected = Outcomes::NONE;
+                    for a in values(left_null) {
+                        for b in values(right_null) {
+                            let compare = |holds: Holds| a.zip(b).map(|(a, b)| holds(&a, &b));
+                            expected = expected.union(
+                                match combine(compare(first_holds), compare(second_holds), and) {
+                                    Some(true) => Outcomes::TRUE,
+                                    Some(false) => Outcomes::FALSE,
+                                    None => Outcomes::NULL,
+                                },
+                            );
+                        }
+                    }
+                    let connective = if and { "AND" } else { "OR" };
+                    let sql = format!("a {first} b {connective} a {second} b");
+                    assert_eq!(
+                        outcomes(context(), &sql),
+                        expected,
+                        "{sql} with a nullable {left_null} and b nullable {right_null}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Text columns `a`, `b` and `c` under the default collation and `named`
+/// under another one, none of them ever `NULL`.
+fn texts() -> Ctx {
+    let named = TextRules { collation: Collation::Named(1), ..TextRules::DEFAULT };
+    Ctx::with_columns(vec![
+        ("a".into(), column(ScalarType::Text(TextRules::DEFAULT), false)),
+        ("b".into(), column(ScalarType::Text(TextRules::DEFAULT), false)),
+        ("c".into(), column(ScalarType::Text(TextRules::DEFAULT), false)),
+        ("named".into(), column(ScalarType::Text(named), false)),
+    ])
+}
+
+#[test]
+fn text_relations_compose_only_under_one_collation() {
+    assert_eq!(outcomes(texts(), "a < b AND b < c AND c < a"), Outcomes::FALSE);
+    // `named < a` and `c <= named` compare under the named collation and
+    // `a < c` under the default one, and two collations may order one pair
+    // of strings either way.
+    assert!(outcomes(texts(), "named < a AND a < c AND c <= named").truth);
+    // Under "C" 'B' sorts before 'a', and under a linguistic default after.
+    assert!(outcomes(texts(), r#"a COLLATE "C" < b AND b < a"#).truth);
 }

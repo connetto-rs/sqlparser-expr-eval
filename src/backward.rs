@@ -20,6 +20,7 @@ use super::{
     domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
     forward,
     guarantees::{Guarantees, Subject},
+    relation::Relation,
     scalar::ScalarType,
     support,
 };
@@ -330,7 +331,7 @@ fn shape<D: EvalDialect, C: Context>(
             let Some(op) = CmpOp::of(op) else {
                 return Ok(());
             };
-            comparison(state, left, right, op, Family::Single, outcomes)
+            comparison(state, left, right, op, outcomes)
         }
         Expr::AnyOp { left, compare_op, right, .. } => {
             any_all(state, left, right, compare_op, Family::Any, outcomes)
@@ -964,7 +965,7 @@ fn distinct<D: EvalDialect, C: Context>(
         let equal = branch(state, |s| {
             restrict_non_null(s, left)?;
             restrict_non_null(s, right)?;
-            comparison(s, left, right, CmpOp::Eq, Family::Single, Outcomes::TRUE)
+            comparison(s, left, right, CmpOp::Eq, Outcomes::TRUE)
         })?;
         merge(state, Vec::from([both_null, equal]));
         return Ok(());
@@ -981,21 +982,21 @@ fn distinct<D: EvalDialect, C: Context>(
     let different = branch(state, |s| {
         restrict_non_null(s, left)?;
         restrict_non_null(s, right)?;
-        comparison(s, left, right, CmpOp::Eq, Family::Single, Outcomes::FALSE)
+        comparison(s, left, right, CmpOp::Eq, Outcomes::FALSE)
     })?;
     merge(state, Vec::from([left_null, right_null, different]));
     Ok(())
 }
 
-/// The inputs of `left op right` taking one outcome.
+/// The inputs of `left op right`, two single values, taking one outcome.
 fn comparison<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     left: &Expr,
     right: &Expr,
     op: CmpOp,
-    family: Family,
     outcomes: Outcomes,
 ) -> Result<(), C::Error> {
+    let family = Family::Single;
     let (left, right) = (support::unnest(left), support::unnest(right));
     if outcomes.null {
         let branches = [side_null_branch(state, left)?, side_null_branch(state, right)?];
@@ -1026,6 +1027,33 @@ fn comparison<D: EvalDialect, C: Context>(
     {
         apply_length(state, arg, &length)?;
     }
+    let types = (left_evaluation.ty(), right_evaluation.ty());
+    relate(state, (left, right), types, op, outcomes.truth)
+}
+
+/// Records the relation `left op right` taking `is_true` leaves between two
+/// operands of the types `types` that hold a value, when both are subjects
+/// compared under one total order.
+fn relate<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    (left, right): (&Expr, &Expr),
+    (left_type, right_type): (ScalarType, ScalarType),
+    op: CmpOp,
+    is_true: bool,
+) -> Result<(), C::Error> {
+    if state.guarantees.is_impossible() {
+        return Ok(());
+    }
+    let Some(order) = state.dialect.comparison_order(left_type, right_type, state.options) else {
+        return Ok(());
+    };
+    let (Some(left), Some(right)) =
+        (support::subject(state.context, left)?, support::subject(state.context, right)?)
+    else {
+        return Ok(());
+    };
+    let relation = if is_true { op.relation() } else { op.relation().complement() };
+    state.guarantees.relate(order, left, right, relation);
     Ok(())
 }
 
@@ -1124,7 +1152,7 @@ fn side_null_branch<D: EvalDialect, C: Context>(
 
 /// The operator a comparison restricts with, the way the restriction reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CmpOp {
+pub(crate) enum CmpOp {
     /// `=`.
     Eq,
     /// `<>`.
@@ -1138,7 +1166,7 @@ enum CmpOp {
 impl CmpOp {
     /// The operator that `operator` reads as a value comparison, `None`
     /// where it compares no values, such as a `LIKE` pattern match.
-    fn of(operator: &BinaryOperator) -> Option<Self> {
+    pub(crate) fn of(operator: &BinaryOperator) -> Option<Self> {
         Some(match operator {
             BinaryOperator::Eq => CmpOp::Eq,
             BinaryOperator::NotEq => CmpOp::NotEq,
@@ -1157,6 +1185,19 @@ impl CmpOp {
             CmpOp::NotEq => CmpOp::NotEq,
             CmpOp::Less { strict } => CmpOp::Greater { strict },
             CmpOp::Greater { strict } => CmpOp::Less { strict },
+        }
+    }
+
+    /// The orders of the left operand to the right one that satisfy the
+    /// operator.
+    pub(crate) fn relation(self) -> Relation {
+        match self {
+            CmpOp::Eq => Relation::EQUAL,
+            CmpOp::NotEq => Relation::EQUAL.complement(),
+            CmpOp::Less { strict: true } => Relation::LESS,
+            CmpOp::Less { strict: false } => Relation::GREATER.complement(),
+            CmpOp::Greater { strict: true } => Relation::GREATER,
+            CmpOp::Greater { strict: false } => Relation::LESS.complement(),
         }
     }
 }

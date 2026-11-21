@@ -18,16 +18,57 @@ pub struct TextRules {
     /// Whether ordering is by byte, as the `"C"` and `"POSIX"` collations
     /// allow.
     pub byte_order: bool,
+    /// Which collation the rules belong to.
+    pub collation: Collation,
 }
 
 impl TextRules {
     /// The database's default collation, which PostgreSQL never lets be
-    /// nondeterministic: equality is by identity, ordering is not by byte.
-    pub const DEFAULT: TextRules = TextRules { identity_equality: true, byte_order: false };
-    /// The `"C"` and `"POSIX"` collations, which order by byte.
-    pub const BYTEWISE: TextRules = TextRules { identity_equality: true, byte_order: true };
+    /// nondeterministic and which the evaluator reads as not ordering by
+    /// byte.
+    pub const DEFAULT: TextRules =
+        TextRules { identity_equality: true, byte_order: false, collation: Collation::Default };
     /// A collation the evaluator cannot reason about.
-    pub const UNKNOWN: TextRules = TextRules { identity_equality: false, byte_order: false };
+    pub const UNKNOWN: TextRules =
+        TextRules { identity_equality: false, byte_order: false, collation: Collation::Unknown };
+
+    /// The rules a comparison between implicit collations `left` and `right`
+    /// resolves to, the way PostgreSQL derives it. One collation resolves to
+    /// itself and a collation other than the default wins over the default.
+    /// Two different collations other than the default make PostgreSQL raise,
+    /// and an unknown collation resolves to nothing known, so both give
+    /// `None`.
+    #[must_use]
+    pub(crate) fn resolved(left: Self, right: Self) -> Option<Self> {
+        match (left.collation, right.collation) {
+            (Collation::Unknown, _) | (_, Collation::Unknown) => None,
+            (one, other) if one == other => Some(left),
+            (Collation::Default, _) => Some(right),
+            (_, Collation::Default) => Some(left),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl TextRules {
+    /// The `"C"` collation, which orders by byte.
+    pub(crate) const BYTEWISE: TextRules =
+        TextRules { identity_equality: true, byte_order: true, collation: Collation::Named(0) };
+}
+
+/// Which collation a text value carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Collation {
+    /// The database's default collation.
+    Default,
+    /// Another collation, by an identity the context assigns. Two equal
+    /// identities name the same collation and two different ones different
+    /// collations.
+    Named(u32),
+    /// A collation the context cannot identify, which shares no order with
+    /// any other.
+    Unknown,
 }
 
 /// The scalar type a value or an expression's result carries.
@@ -690,6 +731,19 @@ mod tests {
     fn text_length_counts_characters() {
         assert_eq!(text_length(&text("héllo")), Some(5));
         assert_eq!(text_length(&PgValue::Integer(1)), None);
+    }
+
+    #[test]
+    fn a_comparison_resolves_its_collation_as_postgresql_derives_it() {
+        let named = |id| TextRules { collation: Collation::Named(id), ..TextRules::DEFAULT };
+        let default = TextRules::DEFAULT;
+        assert_eq!(TextRules::resolved(default, default), Some(default));
+        assert_eq!(TextRules::resolved(named(1), named(1)), Some(named(1)));
+        assert_eq!(TextRules::resolved(default, named(1)), Some(named(1)));
+        assert_eq!(TextRules::resolved(named(1), default), Some(named(1)));
+        assert_eq!(TextRules::resolved(named(1), named(2)), None);
+        assert_eq!(TextRules::resolved(TextRules::UNKNOWN, default), None);
+        assert_eq!(TextRules::resolved(default, TextRules::UNKNOWN), None);
     }
 
     /// An array's element is every scalar type but an array, an untyped

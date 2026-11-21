@@ -1,10 +1,10 @@
 //! What is known about the subjects an expression reads.
 
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 
 use sqlparser::ast::Expr;
 
-use super::Evaluation;
+use super::{Evaluation, Order, Relation, Values};
 
 /// What a guarantee is about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,16 +20,23 @@ pub enum Subject<R> {
     Expression(Expr),
 }
 
-/// The evaluations a set of subjects is known to stay within.
+/// The evaluations a set of subjects is known to stay within, and the
+/// relations pairs of them are known to stand in.
 ///
-/// A subject without an entry is unconstrained. The guarantees are
-/// impossible when no row satisfies them.
+/// A subject without an entry is unconstrained, and so is a pair without a
+/// relation. The guarantees are impossible when no row satisfies them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guarantees<R> {
     impossible: bool,
     references: BTreeMap<R, Evaluation>,
     expressions: BTreeMap<Expr, Evaluation>,
+    /// Per order, the relation of each subject to each other one, kept in
+    /// both directions so the neighbours of a subject read in one lookup.
+    relations: BTreeMap<Order, Network<R>>,
 }
+
+/// The relation of each subject to the subjects it is related to.
+type Network<R> = BTreeMap<Subject<R>, BTreeMap<Subject<R>, Relation>>;
 
 impl<R: Ord + Clone> Default for Guarantees<R> {
     fn default() -> Self {
@@ -41,13 +48,18 @@ impl<R: Ord + Clone> Guarantees<R> {
     /// No guarantee at all.
     #[must_use]
     pub fn new() -> Self {
-        Self { impossible: false, references: BTreeMap::new(), expressions: BTreeMap::new() }
+        Self {
+            impossible: false,
+            references: BTreeMap::new(),
+            expressions: BTreeMap::new(),
+            relations: BTreeMap::new(),
+        }
     }
 
     /// Guarantees no row satisfies.
     #[must_use]
     pub fn impossible() -> Self {
-        Self { impossible: true, references: BTreeMap::new(), expressions: BTreeMap::new() }
+        Self { impossible: true, ..Self::new() }
     }
 
     /// Whether no row satisfies the guarantees.
@@ -59,7 +71,115 @@ impl<R: Ord + Clone> Guarantees<R> {
     /// Whether the guarantees constrain nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.impossible && self.references.is_empty() && self.expressions.is_empty()
+        !self.impossible
+            && self.references.is_empty()
+            && self.expressions.is_empty()
+            && self.relations.is_empty()
+    }
+
+    /// Whether some pair of subjects stands in a known relation.
+    pub(crate) fn has_relations(&self) -> bool {
+        !self.relations.is_empty()
+    }
+
+    /// The orders `left` may stand in to `right` under `order` on the rows
+    /// where both hold a value. A subject stands equal to itself.
+    #[must_use]
+    pub fn relation(&self, order: Order, left: &Subject<R>, right: &Subject<R>) -> Relation {
+        if left == right {
+            return Relation::EQUAL;
+        }
+        self.relations
+            .get(&order)
+            .and_then(|network| network.get(left))
+            .and_then(|related| related.get(right))
+            .copied()
+            .unwrap_or(Relation::ANY)
+    }
+
+    /// Narrows the orders `left` may stand in to `right` under `order` to
+    /// `relation` as well, with every relation the narrowing implies.
+    ///
+    /// The relation of `a` to `c` narrows to its composition through `b`
+    /// whenever `b` cannot be `NULL`, since a row where `b` is `NULL` leaves
+    /// `a` and `c` free. A pair left with no order cannot both hold a value,
+    /// so the guarantees become impossible when neither side may be `NULL`,
+    /// and otherwise restrict the one side that may be `NULL` to `NULL`.
+    pub fn relate(
+        &mut self,
+        order: Order,
+        left: Subject<R>,
+        right: Subject<R>,
+        relation: Relation,
+    ) {
+        if self.impossible {
+            return;
+        }
+        let mut pending = Vec::from([(left, right, relation)]);
+        while let Some((left, right, relation)) = pending.pop() {
+            let known = self.relation(order, &left, &right);
+            let narrowed = known.intersection(relation);
+            if narrowed == known {
+                continue;
+            }
+            if narrowed.is_empty() {
+                self.separate(&left, &right);
+                if self.impossible {
+                    return;
+                }
+            }
+            if left == right {
+                continue;
+            }
+            let (left_non_null, right_non_null) = (self.non_null(&left), self.non_null(&right));
+            let network = self.relations.entry(order).or_default();
+            network.entry(left.clone()).or_default().insert(right.clone(), narrowed);
+            network.entry(right.clone()).or_default().insert(left.clone(), narrowed.mirrored());
+            if narrowed.is_empty() {
+                continue;
+            }
+            // Every triangle the narrowed pair belongs to narrows its other
+            // two sides through it.
+            if right_non_null {
+                for (other, beyond) in &network[&right] {
+                    let through = narrowed.composed(*beyond);
+                    if *other != left && through != Relation::ANY {
+                        pending.push((left.clone(), other.clone(), through));
+                    }
+                }
+            }
+            if left_non_null {
+                for (other, before) in &network[&left] {
+                    let through = before.mirrored().composed(narrowed);
+                    if *other != right && through != Relation::ANY {
+                        pending.push((other.clone(), right.clone(), through));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the guarantees hold `subject` to a value on every row.
+    fn non_null(&self, subject: &Subject<R>) -> bool {
+        self.get(subject).is_some_and(|evaluation| !evaluation.may_be_null())
+    }
+
+    /// Applies that `left` and `right` never both hold a value.
+    fn separate(&mut self, left: &Subject<R>, right: &Subject<R>) {
+        let to_null = match (self.non_null(left), self.non_null(right)) {
+            (true, true) => {
+                *self = Self::impossible();
+                return;
+            }
+            (true, false) => right,
+            (false, true) => left,
+            (false, false) if left == right => left,
+            (false, false) => return,
+        };
+        if let Some(evaluation) = self.get(to_null) {
+            let null = evaluation.clone().with_values(Values::none());
+            self.restrict(to_null.clone(), null);
+        }
     }
 
     /// The guarantee about `subject`, `None` when it is unconstrained.
@@ -133,11 +253,19 @@ impl<R: Ord + Clone> Guarantees<R> {
         for (expression, evaluation) in &other.expressions {
             met.restrict(Subject::Expression(expression.clone()), evaluation.clone());
         }
+        for (order, network) in &other.relations {
+            for (left, related) in network {
+                for (right, relation) in related.range(left..) {
+                    met.relate(*order, left.clone(), right.clone(), *relation);
+                }
+            }
+        }
         met
     }
 
     /// The guarantees holding when either holds: a subject only one side
-    /// constrains is left unconstrained.
+    /// constrains is left unconstrained, and so is a pair only one side
+    /// relates.
     #[must_use]
     pub fn join(&self, other: &Self) -> Self {
         if self.impossible {
@@ -168,6 +296,28 @@ impl<R: Ord + Clone> Guarantees<R> {
                         .map(|theirs| (expression.clone(), evaluation.join(theirs)))
                 })
                 .collect(),
+            relations: self
+                .relations
+                .iter()
+                .filter_map(|(order, network)| {
+                    let theirs = other.relations.get(order)?;
+                    let joined: Network<R> = network
+                        .iter()
+                        .filter_map(|(left, related)| {
+                            let their_related = theirs.get(left)?;
+                            let joined: BTreeMap<_, _> = related
+                                .iter()
+                                .filter_map(|(right, relation)| {
+                                    let union = relation.union(*their_related.get(right)?);
+                                    (union != Relation::ANY).then(|| (right.clone(), union))
+                                })
+                                .collect();
+                            (!joined.is_empty()).then(|| (left.clone(), joined))
+                        })
+                        .collect();
+                    (!joined.is_empty()).then_some((*order, joined))
+                })
+                .collect(),
         }
     }
 }
@@ -195,6 +345,115 @@ mod tests {
         assert!(Guarantees::<String>::new().is_empty());
         assert!(Guarantees::<String>::impossible().is_impossible());
         assert!(!Guarantees::<String>::impossible().is_empty());
+    }
+
+    /// Guarantees holding each named integer to a value, never `NULL` unless
+    /// its name is listed in `nullable`.
+    fn integers(names: &[&str], nullable: &[&str]) -> Guarantees<String> {
+        let mut guarantees = Guarantees::new();
+        for name in names {
+            let null = nullable.contains(name);
+            let evaluation = Evaluation::new(
+                ScalarType::Integer(IntegerType::Integer),
+                null,
+                false,
+                Values::Unlisted(crate::Unlisted::any()),
+            );
+            guarantees.restrict(ref_subject(name), evaluation);
+        }
+        guarantees
+    }
+
+    #[test]
+    fn relations_compose_only_through_an_operand_holding_a_value() {
+        for (nullable, expected) in [(&[][..], Relation::LESS), (&["b"][..], Relation::ANY)] {
+            let mut guarantees = integers(&["a", "b", "c"], nullable);
+            guarantees.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::LESS);
+            guarantees.relate(Order::Number, ref_subject("b"), ref_subject("c"), Relation::LESS);
+            let derived = guarantees.relation(Order::Number, &ref_subject("a"), &ref_subject("c"));
+            assert_eq!(derived, expected, "b nullable: {nullable:?}");
+            assert_eq!(
+                guarantees.relation(Order::Number, &ref_subject("c"), &ref_subject("a")),
+                expected.mirrored()
+            );
+            // Another order keeps nothing of these.
+            assert_eq!(
+                guarantees.relation(Order::Time, &ref_subject("a"), &ref_subject("c")),
+                Relation::ANY
+            );
+        }
+    }
+
+    #[test]
+    fn an_emptied_relation_leaves_the_nullable_side_null() {
+        let held_null = |guarantees: &Guarantees<String>, name: &str| {
+            guarantees.reference(&name.to_string()).is_some_and(|evaluation| {
+                evaluation.values().is_empty() && evaluation.may_be_null()
+            })
+        };
+        // The nullable side goes `NULL` whichever side of the pair it is on.
+        for (left, right) in [("a", "n"), ("n", "a")] {
+            let mut guarantees = integers(&["a", "n"], &["n"]);
+            guarantees.relate(Order::Number, ref_subject(left), ref_subject(right), Relation::LESS);
+            guarantees.relate(
+                Order::Number,
+                ref_subject(left),
+                ref_subject(right),
+                Relation::GREATER,
+            );
+            assert!(!guarantees.is_impossible());
+            assert!(held_null(&guarantees, "n"), "{left} then {right}");
+            assert!(!held_null(&guarantees, "a"));
+        }
+        // A nullable subject unequal to itself is `NULL`.
+        let mut guarantees = integers(&["n"], &["n"]);
+        guarantees.relate(Order::Number, ref_subject("n"), ref_subject("n"), Relation::LESS);
+        assert!(held_null(&guarantees, "n"));
+        // Two nullable sides, or a side nothing is guaranteed about, only
+        // keep that no row holds both.
+        for guarantees in [integers(&["n", "m"], &["n", "m"]), integers(&["n"], &[])] {
+            let mut guarantees = guarantees;
+            guarantees.relate(Order::Number, ref_subject("n"), ref_subject("m"), Relation::LESS);
+            guarantees.relate(Order::Number, ref_subject("n"), ref_subject("m"), Relation::EQUAL);
+            assert!(!guarantees.is_impossible());
+            assert!(!held_null(&guarantees, "m"));
+            assert_eq!(
+                guarantees.relation(Order::Number, &ref_subject("n"), &ref_subject("m")),
+                Relation::NONE
+            );
+        }
+        // Two sides holding a value make the guarantees impossible, and an
+        // impossible guarantee keeps no relation.
+        let mut guarantees = integers(&["a", "b"], &[]);
+        guarantees.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::LESS);
+        guarantees.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::GREATER);
+        assert!(guarantees.is_impossible());
+        guarantees.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::LESS);
+        assert_eq!(
+            guarantees.relation(Order::Number, &ref_subject("a"), &ref_subject("b")),
+            Relation::ANY
+        );
+    }
+
+    #[test]
+    fn join_unites_shared_relations_and_meet_closes_them() {
+        let less_or_equal = Relation::LESS.union(Relation::EQUAL);
+        let mut left = integers(&["a", "b", "c"], &[]);
+        left.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::LESS);
+        left.relate(Order::Number, ref_subject("b"), ref_subject("c"), Relation::LESS);
+        let mut right = integers(&["a", "b", "c"], &[]);
+        right.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::EQUAL);
+        let joined = left.join(&right);
+        let relation = |guarantees: &Guarantees<String>, from: &str, to: &str| {
+            guarantees.relation(Order::Number, &ref_subject(from), &ref_subject(to))
+        };
+        assert_eq!(relation(&joined, "a", "b"), less_or_equal);
+        assert_eq!(relation(&joined, "b", "c"), Relation::ANY);
+        let mut other = integers(&[], &[]);
+        other.relate(Order::Number, ref_subject("c"), ref_subject("a"), less_or_equal);
+        assert!(left.meet(&other).is_impossible());
+        assert_eq!(relation(&right.meet(&other), "c", "b"), less_or_equal);
+        assert!(!other.is_empty());
     }
 
     #[test]

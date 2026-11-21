@@ -13,6 +13,7 @@ mod domain;
 mod forward;
 mod guarantees;
 mod postgres;
+mod relation;
 mod scalar;
 mod support;
 #[cfg(test)]
@@ -30,5 +31,6 @@ pub use forward::{
 };
 pub use guarantees::{Guarantees, Subject};
 pub use postgres::PostgreSqlOptions;
-pub use scalar::{ArrayElement, ScalarType, TextRules};
+pub use relation::{Order, Relation};
+pub use scalar::{ArrayElement, Collation, ScalarType, TextRules};
 pub use sql_values;
