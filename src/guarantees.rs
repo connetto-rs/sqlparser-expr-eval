@@ -112,11 +112,11 @@ impl<R: Ord + Clone> Guarantees<R> {
         right: Subject<R>,
         relation: Relation,
     ) {
+        if self.impossible {
+            return;
+        }
         let mut pending = Vec::from([(left, right, relation)]);
         while let Some((left, right, relation)) = pending.pop() {
-            if self.impossible {
-                return;
-            }
             let known = self.relation(order, &left, &right);
             let narrowed = known.intersection(relation);
             if narrowed == known {
@@ -124,8 +124,11 @@ impl<R: Ord + Clone> Guarantees<R> {
             }
             if narrowed.is_empty() {
                 self.separate(&left, &right);
+                if self.impossible {
+                    return;
+                }
             }
-            if left == right || self.impossible {
+            if left == right {
                 continue;
             }
             let (left_non_null, right_non_null) = (self.non_null(&left), self.non_null(&right));
@@ -383,17 +386,53 @@ mod tests {
 
     #[test]
     fn an_emptied_relation_leaves_the_nullable_side_null() {
-        let mut guarantees = integers(&["a", "n"], &["n"]);
-        guarantees.relate(Order::Number, ref_subject("a"), ref_subject("n"), Relation::LESS);
-        guarantees.relate(Order::Number, ref_subject("n"), ref_subject("a"), Relation::LESS);
-        assert!(!guarantees.is_impossible());
-        let n = guarantees.reference(&"n".to_string()).expect("n is guaranteed");
-        assert!(n.values().is_empty());
-        assert!(n.may_be_null());
+        let held_null = |guarantees: &Guarantees<String>, name: &str| {
+            guarantees.reference(&name.to_string()).is_some_and(|evaluation| {
+                evaluation.values().is_empty() && evaluation.may_be_null()
+            })
+        };
+        // The nullable side goes `NULL` whichever side of the pair it is on.
+        for (left, right) in [("a", "n"), ("n", "a")] {
+            let mut guarantees = integers(&["a", "n"], &["n"]);
+            guarantees.relate(Order::Number, ref_subject(left), ref_subject(right), Relation::LESS);
+            guarantees.relate(
+                Order::Number,
+                ref_subject(left),
+                ref_subject(right),
+                Relation::GREATER,
+            );
+            assert!(!guarantees.is_impossible());
+            assert!(held_null(&guarantees, "n"), "{left} then {right}");
+            assert!(!held_null(&guarantees, "a"));
+        }
+        // A nullable subject unequal to itself is `NULL`.
+        let mut guarantees = integers(&["n"], &["n"]);
+        guarantees.relate(Order::Number, ref_subject("n"), ref_subject("n"), Relation::LESS);
+        assert!(held_null(&guarantees, "n"));
+        // Two nullable sides, or a side nothing is guaranteed about, only
+        // keep that no row holds both.
+        for guarantees in [integers(&["n", "m"], &["n", "m"]), integers(&["n"], &[])] {
+            let mut guarantees = guarantees;
+            guarantees.relate(Order::Number, ref_subject("n"), ref_subject("m"), Relation::LESS);
+            guarantees.relate(Order::Number, ref_subject("n"), ref_subject("m"), Relation::EQUAL);
+            assert!(!guarantees.is_impossible());
+            assert!(!held_null(&guarantees, "m"));
+            assert_eq!(
+                guarantees.relation(Order::Number, &ref_subject("n"), &ref_subject("m")),
+                Relation::NONE
+            );
+        }
+        // Two sides holding a value make the guarantees impossible, and an
+        // impossible guarantee keeps no relation.
         let mut guarantees = integers(&["a", "b"], &[]);
         guarantees.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::LESS);
         guarantees.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::GREATER);
         assert!(guarantees.is_impossible());
+        guarantees.relate(Order::Number, ref_subject("a"), ref_subject("b"), Relation::LESS);
+        assert_eq!(
+            guarantees.relation(Order::Number, &ref_subject("a"), &ref_subject("b")),
+            Relation::ANY
+        );
     }
 
     #[test]

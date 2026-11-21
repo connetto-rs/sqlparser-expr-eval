@@ -316,6 +316,13 @@ fn contradicting_comparisons_of_one_pair_are_decided() {
 }
 
 #[test]
+fn an_operand_computed_from_columns_keeps_no_relation() {
+    // `y + z` reads columns, so it is no subject, and a negative `z` makes
+    // the conjunction true.
+    assert!(outcomes(integers(), "x < y AND y + z < x").truth);
+}
+
+#[test]
 fn a_check_guarantee_decides_a_later_comparison() {
     let check = restrict(integers(), "x < y", Outcomes::NOT_FALSE);
     assert_eq!(outcomes_under(integers(), "x >= y", &check), Outcomes::FALSE);

@@ -733,6 +733,19 @@ mod tests {
         assert_eq!(text_length(&PgValue::Integer(1)), None);
     }
 
+    #[test]
+    fn a_comparison_resolves_its_collation_as_postgresql_derives_it() {
+        let named = |id| TextRules { collation: Collation::Named(id), ..TextRules::DEFAULT };
+        let default = TextRules::DEFAULT;
+        assert_eq!(TextRules::resolved(default, default), Some(default));
+        assert_eq!(TextRules::resolved(named(1), named(1)), Some(named(1)));
+        assert_eq!(TextRules::resolved(default, named(1)), Some(named(1)));
+        assert_eq!(TextRules::resolved(named(1), default), Some(named(1)));
+        assert_eq!(TextRules::resolved(named(1), named(2)), None);
+        assert_eq!(TextRules::resolved(TextRules::UNKNOWN, default), None);
+        assert_eq!(TextRules::resolved(default, TextRules::UNKNOWN), None);
+    }
+
     /// An array's element is every scalar type but an array, an untyped
     /// literal's element is `text`, and an array of an array is the array.
     #[test]

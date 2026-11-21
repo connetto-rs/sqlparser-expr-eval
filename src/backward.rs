@@ -331,7 +331,7 @@ fn shape<D: EvalDialect, C: Context>(
             let Some(op) = CmpOp::of(op) else {
                 return Ok(());
             };
-            comparison(state, left, right, op, Family::Single, outcomes)
+            comparison(state, left, right, op, outcomes)
         }
         Expr::AnyOp { left, compare_op, right, .. } => {
             any_all(state, left, right, compare_op, Family::Any, outcomes)
@@ -965,7 +965,7 @@ fn distinct<D: EvalDialect, C: Context>(
         let equal = branch(state, |s| {
             restrict_non_null(s, left)?;
             restrict_non_null(s, right)?;
-            comparison(s, left, right, CmpOp::Eq, Family::Single, Outcomes::TRUE)
+            comparison(s, left, right, CmpOp::Eq, Outcomes::TRUE)
         })?;
         merge(state, Vec::from([both_null, equal]));
         return Ok(());
@@ -982,21 +982,21 @@ fn distinct<D: EvalDialect, C: Context>(
     let different = branch(state, |s| {
         restrict_non_null(s, left)?;
         restrict_non_null(s, right)?;
-        comparison(s, left, right, CmpOp::Eq, Family::Single, Outcomes::FALSE)
+        comparison(s, left, right, CmpOp::Eq, Outcomes::FALSE)
     })?;
     merge(state, Vec::from([left_null, right_null, different]));
     Ok(())
 }
 
-/// The inputs of `left op right` taking one outcome.
+/// The inputs of `left op right`, two single values, taking one outcome.
 fn comparison<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     left: &Expr,
     right: &Expr,
     op: CmpOp,
-    family: Family,
     outcomes: Outcomes,
 ) -> Result<(), C::Error> {
+    let family = Family::Single;
     let (left, right) = (support::unnest(left), support::unnest(right));
     if outcomes.null {
         let branches = [side_null_branch(state, left)?, side_null_branch(state, right)?];
@@ -1026,10 +1026,6 @@ fn comparison<D: EvalDialect, C: Context>(
             length_restriction(family, op.flipped(), outcomes.truth, &left_evaluation)
     {
         apply_length(state, arg, &length)?;
-    }
-    // A quantified right side relates the left operand to no single value.
-    if family != Family::Single {
-        return Ok(());
     }
     let types = (left_evaluation.ty(), right_evaluation.ty());
     relate(state, (left, right), types, op, outcomes.truth)
