@@ -215,7 +215,7 @@ fn fold_case(builtin: Builtin, arguments: &[Evaluation]) -> Option<Evaluation> {
             }
         })
         .collect();
-    Some(Evaluation::known(PgValue::Text(mapped), ScalarType::Text(TextRules::BYTEWISE)))
+    Some(Evaluation::known(PgValue::Text(mapped), ScalarType::Text(rules)))
 }
 
 /// The `btrim` fold of a constant text argument.

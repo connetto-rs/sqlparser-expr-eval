@@ -8,7 +8,7 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    Callee, Comparison, Evaluation, ScalarType, Unlisted, Values,
+    Callee, Comparison, Evaluation, Order, ScalarType, Unlisted, Values,
     forward::fold::{arithmetic_type, interval_contains_zero, standard_comparison},
     support::number_bounds,
 };
@@ -38,6 +38,19 @@ pub trait EvalDialect {
         let _ = options;
         let error = left.may_raise() || right.may_raise();
         standard_comparison(&left, op, &right, error)
+    }
+
+    /// The total order every comparison between a `left` and a `right`
+    /// value follows, `None` when the types share none. Relations between
+    /// operands are kept and composed only within one order.
+    fn comparison_order(
+        &self,
+        left: ScalarType,
+        right: ScalarType,
+        options: &Self::Options,
+    ) -> Option<Order> {
+        let _ = (left, right, options);
+        None
     }
 
     /// The result of `left || right` when the dialect folds it, `None` when

@@ -17,7 +17,7 @@ use sqlparser::{
 };
 
 use crate::{
-    Comparison,
+    Comparison, Order,
     context::{Builtin, Callee},
     dialect::EvalDialect,
     domain::{Evaluation, Values},
@@ -48,6 +48,29 @@ impl EvalDialect for PostgreSqlDialect {
     ) -> Comparison {
         let _ = options;
         comparison::comparison(left, op, right)
+    }
+
+    fn comparison_order(
+        &self,
+        left: ScalarType,
+        right: ScalarType,
+        options: &PostgreSqlOptions,
+    ) -> Option<Order> {
+        let _ = options;
+        match (left, right) {
+            _ if left.is_number() && right.is_number() => Some(Order::Number),
+            (ScalarType::Boolean, ScalarType::Boolean) => Some(Order::Boolean),
+            (
+                ScalarType::Date | ScalarType::Timestamp,
+                ScalarType::Date | ScalarType::Timestamp,
+            ) => Some(Order::Time),
+            (ScalarType::Text(left), ScalarType::Text(right)) => {
+                TextRules::resolved(left, right)
+                    .filter(|rules| rules.identity_equality)
+                    .map(|rules| Order::Text(rules.collation))
+            }
+            _ => None,
+        }
     }
 
     fn concat(

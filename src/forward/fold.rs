@@ -8,6 +8,7 @@ use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
 
 use super::{
     super::{
+        backward::CmpOp,
         context::Context,
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
@@ -617,10 +618,44 @@ pub(super) fn comparison<D: EvalDialect, C: Context>(
     op: &BinaryOperator,
     right: &Expr,
 ) -> Result<Evaluation, C::Error> {
-    let left = forward(state, left)?;
-    let right = forward(state, right)?;
-    let comparison = comparison_evals(state, left, op, right);
+    let left_evaluation = forward(state, left)?;
+    let right_evaluation = forward(state, right)?;
+    let comparison = related(state, (left, left_evaluation), op, (right, right_evaluation))?;
     Ok(Evaluation::condition(comparison.outcomes(), comparison.error))
+}
+
+/// The comparison of the operands `left` and `right` read as their
+/// evaluations, kept to the orders the guarantees relate the two operands
+/// in.
+fn related<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    (left, left_evaluation): (&Expr, Evaluation),
+    op: &BinaryOperator,
+    (right, right_evaluation): (&Expr, Evaluation),
+) -> Result<Compared, C::Error> {
+    let order =
+        state.dialect.comparison_order(left_evaluation.ty(), right_evaluation.ty(), state.options);
+    let mut compared = comparison_evals(state, left_evaluation, op, right_evaluation);
+    let (left, right) = (support::unnest(left), support::unnest(right));
+    let (Some(order), Some(operator)) = (order, CmpOp::of(op).map(CmpOp::relation)) else {
+        return Ok(compared);
+    };
+    // An operand stands equal to itself even where no relation is kept.
+    if !state.guarantees.has_relations() && left != right {
+        return Ok(compared);
+    }
+    let (Some(left), Some(right)) =
+        (support::subject(state.context, left)?, support::subject(state.context, right)?)
+    else {
+        return Ok(compared);
+    };
+    let relation = state.guarantees.relation(order, &left, &right);
+    compared.rows = RowKinds {
+        all_true: compared.rows.may_be_true() && !relation.intersection(operator).is_empty(),
+        all_false: compared.rows.may_be_false() && !relation.is_subset(operator),
+        mixed: false,
+    };
+    Ok(compared)
 }
 
 /// `[ NOT ] BETWEEN`, forward.
@@ -632,10 +667,10 @@ pub(super) fn between<D: EvalDialect, C: Context>(
     negated: bool,
 ) -> Result<Evaluation, C::Error> {
     let x = forward(state, expr)?;
-    let low = forward(state, low)?;
-    let high = forward(state, high)?;
-    let low_cmp = comparison_evals(state, x.clone(), &BinaryOperator::GtEq, low);
-    let high_cmp = comparison_evals(state, x, &BinaryOperator::LtEq, high);
+    let low_evaluation = forward(state, low)?;
+    let high_evaluation = forward(state, high)?;
+    let low_cmp = related(state, (expr, x.clone()), &BinaryOperator::GtEq, (low, low_evaluation))?;
+    let high_cmp = related(state, (expr, x), &BinaryOperator::LtEq, (high, high_evaluation))?;
     let outcomes = support::and_outcomes(low_cmp.outcomes(), high_cmp.outcomes());
     let outcomes = if negated { support::not_outcomes(outcomes) } else { outcomes };
     Ok(Evaluation::condition(outcomes, low_cmp.error || high_cmp.error))
