@@ -16,7 +16,6 @@ mod common;
 use common::{Ctx, builtin_callee, column, parse};
 
 /// Reads `sql` under the conservative generic dialect, with no settings.
-#[expect(clippy::expect_used, reason = "a context error fails the test")]
 fn read(mut context: Ctx, sql: &str) -> Evaluation {
     evaluate(
         &parse(sql),
@@ -35,7 +34,6 @@ fn context() -> Ctx {
 
 /// Reads `sql`'s guarantee under the given outcomes, in the conservative
 /// dialect.
-#[expect(clippy::expect_used, reason = "a context error fails the test")]
 fn imply(mut context: Ctx, sql: &str, outcomes: Outcomes) -> Guarantees<String> {
     implied(
         &parse(sql),

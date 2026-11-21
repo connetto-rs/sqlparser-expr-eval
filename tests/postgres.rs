@@ -21,7 +21,6 @@ impl Ctx {
 }
 
 /// Reads `sql` under PostgreSQL with no settings.
-#[expect(clippy::expect_used, reason = "a context error fails the test")]
 fn read(mut context: Ctx, sql: &str) -> Evaluation {
     let dialect = PostgreSqlDialect {};
     let options = PostgreSqlOptions::default();
@@ -30,7 +29,6 @@ fn read(mut context: Ctx, sql: &str) -> Evaluation {
 }
 
 /// Reads `sql` and returns the guarantee it places under the given outcomes.
-#[expect(clippy::expect_used, reason = "a context error fails the test")]
 fn restrict(mut context: Ctx, sql: &str, outcomes: Outcomes) -> Guarantees<String> {
     let dialect = PostgreSqlDialect {};
     let options = PostgreSqlOptions::default();
