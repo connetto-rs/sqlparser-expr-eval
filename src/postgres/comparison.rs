@@ -60,6 +60,13 @@ pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluatio
     if !valid_op {
         return Comparison::new(RowKinds::NONE, true);
     }
+    // Two different implicit collations leave the comparison without a
+    // collation, so PostgreSQL raises on every pair of values it compares.
+    if let Category::Text(rules_left, rules_right) = category
+        && TextRules::conflicting(rules_left, rules_right)
+    {
+        return Comparison::new(RowKinds::NONE, true);
+    }
     let refused = text_arrays(&category);
     Comparison::new(pair_analysis(&left, &right, &category, op), error || refused)
 }

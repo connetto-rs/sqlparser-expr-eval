@@ -444,3 +444,50 @@ fn text_relations_compose_only_under_one_collation() {
     // Under "C" 'B' sorts before 'a', and under a linguistic default after.
     assert!(outcomes(texts(), r#"a COLLATE "C" < b AND b < a"#).truth);
 }
+
+/// Text columns `icu` and `bytes` under two different collations other than
+/// the default, `nullable` under the collation of `bytes` and `plain` under
+/// the default, and `unknown` under a collation the context cannot identify.
+fn conflicting_texts() -> Ctx {
+    let icu = TextRules { collation: Collation::Named(0), ..TextRules::DEFAULT };
+    let bytes =
+        TextRules { identity_equality: true, byte_order: true, collation: Collation::Named(1) };
+    Ctx::with_columns(vec![
+        ("icu".into(), column(ScalarType::Text(icu), false)),
+        ("bytes".into(), column(ScalarType::Text(bytes), false)),
+        ("nullable".into(), column(ScalarType::Text(bytes), true)),
+        ("plain".into(), column(ScalarType::Text(TextRules::DEFAULT), false)),
+        ("unknown".into(), column(ScalarType::Text(TextRules::UNKNOWN), false)),
+    ])
+}
+
+#[test]
+fn comparing_two_implicit_collations_raises() {
+    // PostgreSQL cannot determine the collation of a comparison between two
+    // different implicit collations and raises on every pair of values.
+    for sql in [
+        "icu < bytes AND bytes < icu",
+        "icu = bytes",
+        "icu <> bytes",
+        "icu BETWEEN bytes AND bytes",
+        "icu IN (bytes)",
+        "icu IS DISTINCT FROM bytes",
+    ] {
+        let evaluation = read(conflicting_texts(), sql);
+        assert!(evaluation.may_raise(), "{sql}");
+        assert!(!evaluation.may_be_true() && !evaluation.may_be_false(), "{sql}");
+    }
+    // An array whose members the evaluator does not list may hold none to
+    // compare, but any member it holds raises.
+    assert!(read(conflicting_texts(), "icu = ANY (ARRAY[bytes])").may_raise());
+    // A nullable operand raises on the rows where it holds a value and
+    // reads `NULL` on the others.
+    let evaluation = read(conflicting_texts(), "icu < nullable");
+    assert!(evaluation.may_raise());
+    assert_eq!(evaluation.outcomes(), Outcomes::NULL);
+    // The default collation and an untyped literal each settle the
+    // comparison's collation, and an unknown collation may be either side's.
+    for sql in ["icu < plain", "icu < 'x'", "icu < unknown"] {
+        assert!(!read(conflicting_texts(), sql).may_raise(), "{sql}");
+    }
+}
