@@ -67,6 +67,15 @@ fn arithmetic_stays_unknown_but_may_raise() {
     assert!(matches!(evaluation.values(), Values::Unlisted(_)));
 }
 
+/// Only an engine known to fold a deciding constant before it runs the
+/// chain drops the raise of the other terms.
+#[test]
+fn a_deciding_constant_keeps_the_raise_of_the_other_terms() {
+    let evaluation = read(context(), "x + 1 = 2 OR true");
+    assert_eq!(evaluation.outcomes(), Outcomes::TRUE);
+    assert!(evaluation.may_raise());
+}
+
 #[test]
 fn a_constant_division_by_zero_may_be_null_and_may_raise() {
     let evaluation = read(context(), "1 / 0");

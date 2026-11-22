@@ -20,6 +20,12 @@ impl Ctx {
         self.query = Some(query);
         self
     }
+
+    /// The context with the collation `name` carrying `rules`.
+    fn with_collation(mut self, name: &str, rules: TextRules) -> Self {
+        self.collations.push((name.to_string(), rules));
+        self
+    }
 }
 
 /// Reads `sql` under PostgreSQL with no settings.
@@ -448,10 +454,16 @@ fn text_relations_compose_only_under_one_collation() {
 /// Text columns `icu` and `bytes` under two different collations other than
 /// the default, `nullable` under the collation of `bytes` and `plain` under
 /// the default, and `unknown` under a collation the context cannot identify.
+/// The collation `"und-x-icu"` is the one of `icu`, `"POSIX"` the one of
+/// `bytes`, and `"C"` the built-in one.
 fn conflicting_texts() -> Ctx {
     let icu = TextRules { collation: Collation::Named(0), ..TextRules::DEFAULT };
-    let bytes =
-        TextRules { identity_equality: true, byte_order: true, collation: Collation::Named(1) };
+    let bytes = TextRules {
+        identity_equality: true,
+        byte_order: true,
+        collation: Collation::Named(1),
+        explicit: false,
+    };
     Ctx::with_columns(vec![
         ("icu".into(), column(ScalarType::Text(icu), false)),
         ("bytes".into(), column(ScalarType::Text(bytes), false)),
@@ -459,6 +471,9 @@ fn conflicting_texts() -> Ctx {
         ("plain".into(), column(ScalarType::Text(TextRules::DEFAULT), false)),
         ("unknown".into(), column(ScalarType::Text(TextRules::UNKNOWN), false)),
     ])
+    .with_collation("und-x-icu", icu)
+    .with_collation("POSIX", bytes)
+    .with_collation("C", TextRules::C)
 }
 
 #[test]
@@ -536,4 +551,64 @@ fn the_current_user_raises_against_another_named_collation() {
     assert!(read(conflicting_texts(), "icu = current_user").may_raise());
     assert!(read(conflicting_texts(), "current_user < bytes").may_raise());
     assert!(!read(conflicting_texts(), "plain = current_user").may_raise());
+}
+
+#[test]
+fn an_explicit_collation_settles_the_comparison() {
+    // An explicit collation wins over the implicit one of the other operand,
+    // so the comparison has a collation and never raises, even under a
+    // collation the context cannot identify.
+    for sql in [
+        r#"icu < bytes COLLATE "C""#,
+        r#"icu COLLATE "C" < bytes"#,
+        r#"icu COLLATE "und-x-icu" = bytes"#,
+        r#"icu < bytes COLLATE "unlisted""#,
+    ] {
+        let evaluation = read(conflicting_texts(), sql);
+        assert!(!evaluation.may_raise(), "{sql}");
+        assert_eq!(evaluation.outcomes(), Outcomes { null: false, ..Outcomes::ANY }, "{sql}");
+    }
+    let evaluation = read(conflicting_texts(), r#"(icu < bytes COLLATE "C") IS NOT NULL"#);
+    assert_eq!((evaluation.outcomes(), evaluation.may_raise()), (Outcomes::TRUE, false));
+    // PostgreSQL refuses two different explicit collations.
+    let mismatch = r#"icu COLLATE "und-x-icu" < bytes COLLATE "C""#;
+    assert!(read(conflicting_texts(), mismatch).always_raises());
+    // The comparison runs under the explicit collation, which orders by
+    // byte here although the other side carries the default collation.
+    let ordered = read(conflicting_texts(), r#"'B' COLLATE "C" < CAST('a' AS TEXT)"#);
+    assert_eq!((ordered.outcomes(), ordered.may_raise()), (Outcomes::TRUE, false));
+}
+
+#[test]
+fn a_collation_applies_to_text_alone() {
+    let null = read(conflicting_texts(), r#"NULL COLLATE "C""#);
+    assert!(null.is_always_null());
+    assert!(matches!(null.ty(), ScalarType::Text(rules) if rules.explicit));
+    let literal = read(conflicting_texts(), r#"'a' COLLATE "C""#);
+    assert_eq!(literal.constant(), Some(&PgValue::Text("a".into())));
+    assert!(!literal.may_raise());
+    assert!(read(conflicting_texts(), r#"1 COLLATE "C""#).may_raise());
+}
+
+#[test]
+fn a_deciding_constant_folds_the_chain_before_it_runs() {
+    // PostgreSQL's planner reduces a chain holding `true` under `OR`, or
+    // `false` under `AND`, to that constant, so the other terms never run.
+    for (sql, decided) in [
+        ("icu < bytes OR true", Outcomes::TRUE),
+        ("true OR icu < bytes", Outcomes::TRUE),
+        ("icu < bytes OR 1 = 1", Outcomes::TRUE),
+        ("icu < bytes OR (plain < icu OR NOT false)", Outcomes::TRUE),
+        ("icu < bytes AND false", Outcomes::FALSE),
+    ] {
+        let evaluation = read(conflicting_texts(), sql);
+        assert_eq!((evaluation.outcomes(), evaluation.may_raise()), (decided, false), "{sql}");
+    }
+    // The planner folds every constant before the deciding one, and a
+    // constant that raises raises there, but never reaches one after it.
+    assert!(read(context(), "1 / 0 = 1 OR true").may_raise());
+    assert!(read(context(), "id > 1 / 0 OR true").may_raise());
+    assert!(!read(context(), "true OR 1 / 0 = 1").may_raise());
+    // A term that reads a column is not folded, whatever it evaluates to.
+    assert!(read(conflicting_texts(), "icu < bytes OR plain = plain").may_raise());
 }

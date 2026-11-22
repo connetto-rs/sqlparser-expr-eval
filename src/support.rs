@@ -42,9 +42,8 @@ pub(crate) fn resolve_reference<C: Context>(
 /// under it.
 ///
 /// An expression other than a reference is a subject only when every
-/// evaluation in one statement gives it one value. It is built from literals,
-/// operators, casts, `CASE`, lists and calls of immutable or stable ordinary
-/// functions alone, so it reads no column and holds no subquery. Two calls of
+/// evaluation in one statement gives it one value, which a [`fixed`]
+/// expression over immutable or stable functions does. Two calls of
 /// `random()` differ, and a column named alike in a subquery may be another
 /// column.
 pub(crate) fn subject<C: Context>(
@@ -55,28 +54,42 @@ pub(crate) fn subject<C: Context>(
     if let Some(resolved) = resolve_reference(context, expression)? {
         return Ok(Some(Subject::Reference(resolved.reference)));
     }
+    let fixed = fixed(context, expression, Volatility::Stable)?;
+    Ok(fixed.then(|| Subject::Expression(expression.clone())))
+}
+
+/// Whether `expression` is built from literals, operators, casts,
+/// collations, `CASE`, lists and calls of ordinary functions no more volatile
+/// than `most_volatile` alone, so it reads no column and holds no subquery.
+pub(crate) fn fixed<C: Context>(
+    context: &mut C,
+    expression: &Expr,
+    most_volatile: Volatility,
+) -> Result<bool, C::Error> {
     // The walk keeps its own stack, so a long left-deep chain costs no
     // recursion.
     let mut stack = vec![expression];
     while let Some(node) = stack.pop() {
-        if !push_fixed_children(context, &mut stack, node)? {
-            return Ok(None);
+        let fixed = match node {
+            Expr::Function(call) => push_fixed_call(context, &mut stack, call, most_volatile)?,
+            _ => push_operands(&mut stack, node),
+        };
+        if !fixed {
+            return Ok(false);
         }
     }
-    Ok(Some(Subject::Expression(expression.clone())))
+    Ok(true)
 }
 
-/// Pushes the children of `node` when `node` itself gives one value per
-/// statement, answering `false` for any other node.
-fn push_fixed_children<'a, C: Context>(
-    context: &mut C,
-    stack: &mut Vec<&'a Expr>,
-    node: &'a Expr,
-) -> Result<bool, C::Error> {
+/// Pushes the operands of `node` when it is a literal, or an operator, a
+/// cast, a collation, a test, a list or a `CASE` over operands, answering
+/// `false` for any other node.
+pub(crate) fn push_operands<'a>(stack: &mut Vec<&'a Expr>, node: &'a Expr) -> bool {
     match node {
         Expr::Value(_) | Expr::TypedString(_) => {}
         Expr::Nested(value)
         | Expr::Cast { expr: value, .. }
+        | Expr::Collate { expr: value, .. }
         | Expr::UnaryOp { expr: value, .. }
         | Expr::IsNull(value)
         | Expr::IsNotNull(value)
@@ -103,18 +116,18 @@ fn push_fixed_children<'a, C: Context>(
                 stack.extend([&when.condition, &when.result]);
             }
         }
-        Expr::Function(call) => return push_fixed_call(context, stack, call),
-        _ => return Ok(false),
+        _ => return false,
     }
-    Ok(true)
+    true
 }
 
 /// Pushes the arguments of `call` when it is a plain call whose every callee
-/// is an immutable or stable ordinary function.
+/// is an ordinary function no more volatile than `most_volatile`.
 fn push_fixed_call<'a, C: Context>(
     context: &mut C,
     stack: &mut Vec<&'a Expr>,
     call: &'a Function,
+    most_volatile: Volatility,
 ) -> Result<bool, C::Error> {
     let arguments = match &call.args {
         FunctionArguments::None => &[][..],
@@ -140,9 +153,9 @@ fn push_fixed_call<'a, C: Context>(
     }
     let callees = context.callees(call)?;
     Ok(!callees.is_empty()
-        && callees.iter().all(|callee| {
-            callee.kind == CalleeKind::Normal && callee.volatility != Volatility::Volatile
-        }))
+        && callees
+            .iter()
+            .all(|callee| callee.kind == CalleeKind::Normal && callee.volatility <= most_volatile))
 }
 
 /// `expression` without the parentheses around it.

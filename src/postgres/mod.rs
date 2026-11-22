@@ -211,6 +211,13 @@ impl EvalDialect for PostgreSqlDialect {
             && callees.iter().all(|callee| callee.builtin == Some(Builtin::Length));
         builtin.then_some(0)
     }
+
+    /// `eval_const_expressions` simplifies every argument of an `AND` or an
+    /// `OR` in order and returns at the first constant that decides it.
+    fn folds_deciding_constants(&self, options: &PostgreSqlOptions) -> bool {
+        let _ = options;
+        true
+    }
 }
 
 /// The text `||` reads a value as, which for a `boolean` is its text cast.

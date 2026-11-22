@@ -20,45 +20,78 @@ pub struct TextRules {
     pub byte_order: bool,
     /// Which collation the rules belong to.
     pub collation: Collation,
+    /// Whether a `COLLATE` clause names the collation, which a comparison
+    /// then takes over the implicit collation of its other operand.
+    pub explicit: bool,
 }
 
 impl TextRules {
     /// The database's default collation, which PostgreSQL never lets be
     /// nondeterministic and which the evaluator reads as not ordering by
     /// byte.
-    pub const DEFAULT: TextRules =
-        TextRules { identity_equality: true, byte_order: false, collation: Collation::Default };
+    pub const DEFAULT: TextRules = TextRules {
+        identity_equality: true,
+        byte_order: false,
+        collation: Collation::Default,
+        explicit: false,
+    };
     /// A collation the evaluator cannot reason about.
-    pub const UNKNOWN: TextRules =
-        TextRules { identity_equality: false, byte_order: false, collation: Collation::Unknown };
+    pub const UNKNOWN: TextRules = TextRules {
+        identity_equality: false,
+        byte_order: false,
+        collation: Collation::Unknown,
+        explicit: false,
+    };
     /// PostgreSQL's `"C"` collation, the one the `name` type carries.
-    pub const C: TextRules =
-        TextRules { identity_equality: true, byte_order: true, collation: Collation::C };
+    pub const C: TextRules = TextRules {
+        identity_equality: true,
+        byte_order: true,
+        collation: Collation::C,
+        explicit: false,
+    };
 
-    /// The rules a comparison between implicit collations `left` and `right`
-    /// resolves to, the way PostgreSQL derives it. One collation resolves to
-    /// itself and a collation other than the default wins over the default.
-    /// Two [`conflicting`](Self::conflicting) collations and an unknown
+    /// The rules a comparison between `left` and `right` resolves to, the
+    /// way PostgreSQL derives it. An explicit collation wins over an implicit
+    /// one, one collation resolves to itself and an implicit collation other
+    /// than the default wins over the default. Two
+    /// [`conflicting`](Self::conflicting) collations and an unknown
     /// collation resolve to nothing known, so both give `None`.
     #[must_use]
     pub(crate) fn resolved(left: Self, right: Self) -> Option<Self> {
-        match (left.collation, right.collation) {
-            (Collation::Unknown, _) | (_, Collation::Unknown) => None,
-            (one, other) if one == other => Some(left),
-            (Collation::Default, _) => Some(right),
-            (_, Collation::Default) => Some(left),
-            _ => None,
-        }
+        let resolved = match (left.explicit, right.explicit) {
+            (true, false) => left,
+            (false, true) => right,
+            _ => {
+                match (left.collation, right.collation) {
+                    (one, other) if one == other => left,
+                    (Collation::Default, _) if !left.explicit => right,
+                    (_, Collation::Default) if !left.explicit => left,
+                    _ => return None,
+                }
+            }
+        };
+        (resolved.collation != Collation::Unknown).then_some(resolved)
     }
 
-    /// Whether `left` and `right` are two different implicit collations
-    /// other than the default, which leave a comparison between them without
-    /// a collation, so PostgreSQL raises on every pair of values it compares.
+    /// Whether no collation settles a comparison between `left` and `right`.
+    /// Two different implicit collations other than the default leave it
+    /// without one, so PostgreSQL raises on every pair of values it
+    /// compares, and it refuses two different explicit collations outright.
+    /// An unknown collation may be the other one, so it conflicts with none.
     #[must_use]
     pub(crate) fn conflicting(left: Self, right: Self) -> bool {
-        match (left.collation, right.collation) {
-            (Collation::Named(one), Collation::Named(other)) => one != other,
-            (Collation::Named(_), Collation::C) | (Collation::C, Collation::Named(_)) => true,
+        let known = |rules: Self| rules.collation != Collation::Unknown;
+        match (left.explicit, right.explicit) {
+            (false, false) => {
+                match (left.collation, right.collation) {
+                    (Collation::Named(one), Collation::Named(other)) => one != other,
+                    (Collation::Named(_), Collation::C) | (Collation::C, Collation::Named(_)) => {
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            (true, true) => left.collation != right.collation && known(left) && known(right),
             _ => false,
         }
     }
@@ -757,6 +790,34 @@ mod tests {
         assert_eq!(TextRules::resolved(default, TextRules::C), Some(TextRules::C));
         assert_eq!(TextRules::resolved(TextRules::C, TextRules::C), Some(TextRules::C));
         assert_eq!(TextRules::resolved(named(1), TextRules::C), None);
+    }
+
+    #[test]
+    fn an_explicit_collation_wins_over_an_implicit_one() {
+        let named = |id| TextRules { collation: Collation::Named(id), ..TextRules::DEFAULT };
+        let explicit = |rules: TextRules| TextRules { explicit: true, ..rules };
+        let (default, unknown) = (TextRules::DEFAULT, TextRules::UNKNOWN);
+        for (left, right, resolved) in [
+            (explicit(named(1)), named(2), Some(explicit(named(1)))),
+            (named(2), explicit(named(1)), Some(explicit(named(1)))),
+            (explicit(default), named(2), Some(explicit(default))),
+            (explicit(named(1)), unknown, Some(explicit(named(1)))),
+            (explicit(unknown), named(1), None),
+            (explicit(named(1)), explicit(named(1)), Some(explicit(named(1)))),
+            (explicit(named(1)), explicit(default), None),
+        ] {
+            assert_eq!(TextRules::resolved(left, right), resolved, "{left:?} {right:?}");
+        }
+        for (left, right, conflicting) in [
+            (named(1), named(2), true),
+            (explicit(named(1)), named(2), false),
+            (explicit(named(1)), explicit(named(2)), true),
+            (explicit(default), explicit(named(2)), true),
+            (explicit(named(1)), explicit(unknown), false),
+            (explicit(named(1)), explicit(named(1)), false),
+        ] {
+            assert_eq!(TextRules::conflicting(left, right), conflicting, "{left:?} {right:?}");
+        }
     }
 
     /// An array's element is every scalar type but an array, an untyped

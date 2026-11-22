@@ -175,6 +175,16 @@ pub trait EvalDialect {
         let _ = (call, callees, options);
         None
     }
+
+    /// Whether the engine reduces an `AND` chain holding a `false` term, or
+    /// an `OR` chain holding a `true` one, to that constant before it runs
+    /// the chain, when the term reads no column, holds no subquery and calls
+    /// immutable functions alone. The constants of the terms before it fold
+    /// first and those after it never.
+    fn folds_deciding_constants(&self, options: &Self::Options) -> bool {
+        let _ = options;
+        false
+    }
 }
 
 /// Implements [`EvalDialect`] with the default bodies and no settings on a

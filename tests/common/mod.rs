@@ -2,27 +2,28 @@
 //! the public API through.
 
 use sqlparser::{
-    ast::{Expr, Function, ObjectNamePart, Query, SelectItem, SetExpr, Statement},
+    ast::{Expr, Function, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Statement},
     dialect::PostgreSqlDialect,
     parser::{Parser, ParserError},
 };
 use sqlparser_expr_eval::{
     Builtin, Callee, CalleeKind, Context, Evaluation, Guarantees, NullInput, QueryEvaluation,
-    Resolved, ScalarType, Unlisted, Values, Volatility,
+    Resolved, ScalarType, TextRules, Unlisted, Values, Volatility,
 };
 
-/// A context that resolves a fixed set of columns and callees and one nested
-/// query.
+/// A context that resolves a fixed set of columns, callees and collations
+/// and one nested query.
 pub struct Ctx {
     pub columns: Vec<(String, Evaluation)>,
     pub callees: Vec<(String, Callee)>,
+    pub collations: Vec<(String, TextRules)>,
     pub query: Option<QueryEvaluation>,
 }
 
 impl Ctx {
     /// A context resolving `columns` and nothing else.
     pub fn with_columns(columns: Vec<(String, Evaluation)>) -> Self {
-        Self { columns, callees: Vec::new(), query: None }
+        Self { columns, callees: Vec::new(), collations: Vec::new(), query: None }
     }
 
     /// The context with `callee` resolving calls to `name`.
@@ -72,6 +73,15 @@ impl Context for Ctx {
         _guarantees: &Guarantees<Self::Reference>,
     ) -> Result<QueryEvaluation, Self::Error> {
         Ok(self.query.clone().unwrap_or_else(QueryEvaluation::unknown))
+    }
+
+    fn collation(&mut self, name: &ObjectName) -> Result<TextRules, Self::Error> {
+        let name = name.0.last().and_then(ObjectNamePart::as_ident);
+        Ok(self
+            .collations
+            .iter()
+            .find(|(known, _)| name.is_some_and(|name| name.value == *known))
+            .map_or(TextRules::UNKNOWN, |(_, rules)| *rules))
     }
 }
 

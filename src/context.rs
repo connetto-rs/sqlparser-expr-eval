@@ -3,9 +3,9 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
-use sqlparser::ast::{DataType, Expr, Function, Query};
+use sqlparser::ast::{DataType, Expr, Function, ObjectName, Query};
 
-use super::{Evaluation, Guarantees, ScalarType};
+use super::{Evaluation, Guarantees, ScalarType, TextRules};
 
 /// A reference the context resolved, with what it can hold.
 #[derive(Debug, Clone)]
@@ -36,8 +36,9 @@ impl NullInput {
     }
 }
 
-/// How a function's result may change between calls with equal arguments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a function's result may change between calls with equal arguments,
+/// ordered from the least volatile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Volatility {
     /// Fixed by the arguments.
     Immutable,
@@ -234,6 +235,19 @@ pub trait Context {
     fn data_type(&self, data_type: &DataType) -> ScalarType {
         ScalarType::of(data_type)
     }
+
+    /// The rules of the collation `name` names, under the identity a column
+    /// declared with it carries, [`TextRules::UNKNOWN`] when the context
+    /// cannot identify it. The evaluator marks them
+    /// [`explicit`](TextRules::explicit) itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's error when resolution fails.
+    fn collation(&mut self, name: &ObjectName) -> Result<TextRules, Self::Error> {
+        let _ = name;
+        Ok(TextRules::UNKNOWN)
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +320,22 @@ mod tests {
         assert!(evaluation.may_be_null());
         assert!(!evaluation.may_raise());
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
+    }
+
+    /// A context that names no collation leaves an explicit one unknown,
+    /// over text and over a text array alike.
+    #[test]
+    fn an_unnamed_collation_is_unknown() {
+        let explicit = TextRules { explicit: true, ..TextRules::UNKNOWN };
+        for (sql, ty) in [
+            (r#"x COLLATE "C""#, ScalarType::Text(explicit)),
+            (r#"ARRAY[x] COLLATE "C""#, ScalarType::Array(crate::ArrayElement::Text(explicit))),
+        ] {
+            let evaluation =
+                evaluate(&parse(sql), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
+                    .unwrap();
+            assert_eq!(evaluation.ty(), ty, "{sql}");
+        }
     }
 
     #[test]
