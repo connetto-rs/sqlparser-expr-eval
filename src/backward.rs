@@ -1053,7 +1053,7 @@ fn relate<D: EvalDialect, C: Context>(
         return Ok(());
     };
     let relation = if is_true { op.relation() } else { op.relation().complement() };
-    state.guarantees.relate(order, left, right, relation);
+    state.guarantees.relate(order, &left, &right, relation);
     Ok(())
 }
 
