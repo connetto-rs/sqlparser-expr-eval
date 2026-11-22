@@ -15,24 +15,24 @@ use crate::{
 pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluation) -> Comparison {
     let error = left.may_raise() || right.may_raise();
     let literal =
-        left.ty() == ScalarType::UnknownLiteral || right.ty() == ScalarType::UnknownLiteral;
+        *left.ty() == ScalarType::UnknownLiteral || *right.ty() == ScalarType::UnknownLiteral;
     let (left, right) = resolve_unknown_sides(left, right);
     // Resolving an untyped literal against the other side may raise.
     let error = error || left.may_raise() || right.may_raise();
     // A `date` compares with a `timestamp` through `date_cmp_timestamp`,
     // which never raises, so the date side only takes the timestamp type.
     let (mut left, mut right) = (left, right);
-    if left.ty() == ScalarType::Date && right.ty() == ScalarType::Timestamp {
+    if *left.ty() == ScalarType::Date && *right.ty() == ScalarType::Timestamp {
         left = left.with_type(ScalarType::Timestamp);
     }
-    if right.ty() == ScalarType::Date && left.ty() == ScalarType::Timestamp {
+    if *right.ty() == ScalarType::Date && *left.ty() == ScalarType::Timestamp {
         right = right.with_type(ScalarType::Timestamp);
     }
     let modelled = !left.ty().is_unmodelled() && !right.ty().is_unmodelled();
     // The evaluator reads `varchar` as `text`, and PostgreSQL compares a
     // `varchar` array with no `text` array, save an untyped literal that
     // takes the other side's type.
-    let text_arrays = |category: &Category| {
+    let text_arrays = |category: &Category<'_>| {
         matches!(category, Category::Array(element) if element.is_text()) && !literal
     };
     if left.is_always_null() || right.is_always_null() {
@@ -75,19 +75,21 @@ pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluatio
 /// operand, and both untyped operands read as text under the default
 /// collation.
 fn resolve_unknown_sides(left: Evaluation, right: Evaluation) -> (Evaluation, Evaluation) {
-    let unknown = |ty: ScalarType| matches!(ty, ScalarType::Unknown | ScalarType::UnknownLiteral);
-    match (unknown(left.ty()), unknown(right.ty())) {
+    match (left.ty().is_untyped(), right.ty().is_untyped()) {
         (true, false) => (reinterpret_unknown(left, right.ty()), right),
         (false, true) => {
-            let ty = left.ty();
-            (left, reinterpret_unknown(right, ty))
+            let right = reinterpret_unknown(right, left.ty());
+            (left, right)
         }
         (true, true) => {
-            let text = ScalarType::Text(TextRules::DEFAULT);
-            let left =
-                if left.ty() == ScalarType::UnknownLiteral { left.with_type(text) } else { left };
-            let right = if right.ty() == ScalarType::UnknownLiteral {
-                right.with_type(text)
+            let text = || ScalarType::Text(TextRules::DEFAULT);
+            let left = if *left.ty() == ScalarType::UnknownLiteral {
+                left.with_type(text())
+            } else {
+                left
+            };
+            let right = if *right.ty() == ScalarType::UnknownLiteral {
+                right.with_type(text())
             } else {
                 right
             };
@@ -563,7 +565,7 @@ mod tests {
             Evaluation::new(ScalarType::UnknownLiteral, false, false, Values::Listed(values));
         let resolved = crate::forward::fold::reinterpret_unknown(
             literal,
-            ScalarType::Integer(IntegerType::Integer),
+            &ScalarType::Integer(IntegerType::Integer),
         );
         let Values::Listed(listed) = resolved.values() else { panic!("the literal is listed") };
         assert_eq!(listed, &BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)]));
@@ -575,7 +577,7 @@ mod tests {
         );
         let resolved = crate::forward::fold::reinterpret_unknown(
             literal,
-            ScalarType::Integer(IntegerType::Integer),
+            &ScalarType::Integer(IntegerType::Integer),
         );
         assert!(matches!(resolved.values(), Values::Unlisted(_)));
         assert!(resolved.may_be_null());

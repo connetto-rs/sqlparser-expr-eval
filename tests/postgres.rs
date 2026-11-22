@@ -2,9 +2,11 @@
 //! backward pass places on the columns a condition names, and the relations
 //! it keeps between two compared operands.
 
+use std::sync::Arc;
+
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser_expr_eval::{
-    Builtin, Callee, Collation, Evaluation, Guarantees, Interval, Order, Outcomes,
+    Builtin, Callee, Collation, EnumType, Evaluation, Guarantees, Interval, Order, Outcomes,
     PostgreSqlOptions, QueryEvaluation, Relation, Rows, ScalarType, Subject, TextRules, Values,
     evaluate, implied,
     sql_values::postgres::{IntegerType, PgValue},
@@ -55,7 +57,7 @@ fn context() -> Ctx {
 #[test]
 fn int4_max_literal_is_typed_int4() {
     let evaluation = read(context(), "2147483647");
-    assert_eq!(evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
+    assert_eq!(*evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
     assert!(evaluation.constant().is_some());
     assert!(!evaluation.may_be_null());
 }
@@ -63,7 +65,7 @@ fn int4_max_literal_is_typed_int4() {
 #[test]
 fn an_int4_overflow_literal_is_typed_int8() {
     let evaluation = read(context(), "2147483648");
-    assert_eq!(evaluation.ty(), ScalarType::Integer(IntegerType::Bigint));
+    assert_eq!(*evaluation.ty(), ScalarType::Integer(IntegerType::Bigint));
 }
 
 #[test]
@@ -509,14 +511,14 @@ fn comparing_two_implicit_collations_raises() {
 
 #[test]
 fn sql_value_functions_take_their_type_and_never_raise() {
-    let name = ScalarType::Text(TextRules::C);
+    let name = || ScalarType::Text(TextRules::C);
     for (sql, ty, null) in [
-        ("current_user", name, false),
-        ("CURRENT_ROLE", name, false),
-        ("session_user", name, false),
-        ("user", name, false),
-        ("current_catalog", name, false),
-        ("current_schema", name, true),
+        ("current_user", name(), false),
+        ("CURRENT_ROLE", name(), false),
+        ("session_user", name(), false),
+        ("user", name(), false),
+        ("current_catalog", name(), false),
+        ("current_schema", name(), true),
         ("system_user", ScalarType::Text(TextRules::DEFAULT), true),
         ("current_date", ScalarType::Date, false),
         ("current_time", ScalarType::Other, false),
@@ -529,7 +531,7 @@ fn sql_value_functions_take_their_type_and_never_raise() {
         ("localtimestamp(3)", ScalarType::Timestamp, false),
     ] {
         let evaluation = read(context(), sql);
-        assert_eq!(evaluation.ty(), ty, "{sql}");
+        assert_eq!(*evaluation.ty(), ty, "{sql}");
         assert_eq!(evaluation.may_be_null(), null, "{sql}");
         assert!(!evaluation.may_raise(), "{sql}");
     }
@@ -611,4 +613,86 @@ fn a_deciding_constant_folds_the_chain_before_it_runs() {
     assert!(!read(context(), "true OR 1 / 0 = 1").may_raise());
     // A term that reads a column is not folded, whatever it evaluates to.
     assert!(read(conflicting_texts(), "icu < bytes OR plain = plain").may_raise());
+}
+
+/// An enum type `name` declaring `project`, `note` and `folder` in that
+/// order.
+fn kind_type(name: &str) -> ScalarType {
+    ScalarType::Enum(Arc::new(EnumType::new(name, ["project", "note", "folder"])))
+}
+
+/// A context typing `resource_kind` and `mirror_kind`, two enums declaring
+/// the same labels, with a non-null `kind` of `resource_kind` holding
+/// `labels`, every label when `labels` is `None`, and a non-null `mirror`
+/// of `mirror_kind`.
+fn kinds(labels: Option<&[&str]>) -> Ctx {
+    let kind = match labels {
+        Some(labels) => {
+            let labels = labels.iter().map(|label| PgValue::Text((*label).into())).collect();
+            Evaluation::new(kind_type("resource_kind"), false, false, Values::Listed(labels))
+        }
+        None => column(kind_type("resource_kind"), false),
+    };
+    let mut context = Ctx::with_columns(vec![
+        ("kind".into(), kind),
+        ("mirror".into(), column(kind_type("mirror_kind"), false)),
+    ]);
+    context.types = vec![
+        ("resource_kind".into(), kind_type("resource_kind")),
+        ("mirror_kind".into(), kind_type("mirror_kind")),
+    ];
+    context
+}
+
+#[test]
+fn an_enum_column_narrowed_to_one_label_decides_an_equality() {
+    let note = || kinds(Some(&["note"]));
+    let other = read(note(), "kind = 'project'");
+    assert_eq!((other.outcomes(), other.may_raise()), (Outcomes::FALSE, false));
+    let same = read(note(), "kind = 'note'");
+    assert_eq!((same.outcomes(), same.may_raise()), (Outcomes::TRUE, false));
+    let unnarrowed = read(kinds(None), "kind = 'project'");
+    assert_eq!(unnarrowed.outcomes(), Outcomes { null: false, ..Outcomes::ANY });
+    assert!(!unnarrowed.may_raise());
+}
+
+#[test]
+fn an_enum_check_narrows_the_column_to_its_labels() {
+    for check in ["kind = 'project'", "kind IN ('project', 'folder')", "kind <> 'note'"] {
+        let guarantees = restrict(kinds(None), check, Outcomes::NOT_FALSE);
+        let note = outcomes_under(kinds(None), "kind = 'note'", &guarantees);
+        assert_eq!(note, Outcomes::FALSE, "{check}");
+    }
+}
+
+#[test]
+fn an_enum_cast_reads_a_declared_label_and_raises_on_any_other() {
+    let note = read(kinds(None), "'note'::resource_kind");
+    assert_eq!(note.constant(), Some(&PgValue::Text("note".into())));
+    assert_eq!(*note.ty(), kind_type("resource_kind"));
+    assert!(read(kinds(None), "'bogus'::resource_kind").always_raises());
+    assert!(read(kinds(None), "kind = 'bogus'").always_raises());
+    let printed = read(kinds(Some(&["folder"])), "kind::text");
+    assert_eq!(printed.constant(), Some(&PgValue::Text("folder".into())));
+    assert!(read(kinds(None), "'note'::resource_kind::mirror_kind").always_raises());
+    assert!(read(kinds(None), "1::resource_kind").always_raises());
+}
+
+#[test]
+fn enum_labels_order_by_declaration() {
+    // `project` sorts after `folder` as text and before it as a label.
+    let project = || kinds(Some(&["project"]));
+    assert_eq!(read(project(), "kind < 'folder'").outcomes(), Outcomes::TRUE);
+    assert_eq!(read(project(), "kind > 'note'").outcomes(), Outcomes::FALSE);
+    let narrowed = read(kinds(Some(&["note", "folder"])), "kind >= 'note'");
+    assert_eq!(narrowed.outcomes(), Outcomes::TRUE);
+}
+
+#[test]
+fn an_enum_compares_with_no_other_type() {
+    // PostgreSQL has no operator between two enums or an enum and text, and
+    // no implicit cast to reach one.
+    assert!(read(kinds(None), "kind = mirror").always_raises());
+    assert!(read(kinds(None), "kind = 'note'::text").always_raises());
+    assert!(read(kinds(None), "kind = 'note'::resource_kind").outcomes().truth);
 }

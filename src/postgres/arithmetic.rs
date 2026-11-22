@@ -22,12 +22,14 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
         return result;
     }
     // An untyped `NULL` reads as the type of a number on the other side.
-    let number = |side: &Evaluation| side.ty().is_number() || side.ty() == ScalarType::Float;
+    let number = |side: &Evaluation| side.ty().is_number() || *side.ty() == ScalarType::Float;
     if left.is_untyped_null() && number(right) {
-        return arithmetic(&Evaluation::null(right.ty()).with_error(left.may_raise()), op, right);
+        let typed = Evaluation::null(right.ty().clone()).with_error(left.may_raise());
+        return arithmetic(&typed, op, right);
     }
     if right.is_untyped_null() && number(left) {
-        return arithmetic(left, op, &Evaluation::null(left.ty()).with_error(right.may_raise()));
+        let typed = Evaluation::null(left.ty().clone()).with_error(right.may_raise());
+        return arithmetic(left, op, &typed);
     }
     let ty = arithmetic_type(left.ty(), right.ty());
     if !arithmetic_has_operator(left.ty(), op, right.ty()) {
@@ -43,7 +45,7 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
     // A `date` and a `timestamp` subtract into an `interval`, which the
     // reading leaves open and which raises past the `interval` range, or for
     // a date past the `timestamp` range.
-    let temporal = |ty: ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
+    let temporal = |ty: &ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
     if temporal(left.ty()) && temporal(right.ty()) {
         return Evaluation::new(ScalarType::Other, null, true, Values::Unlisted(Unlisted::any()));
     }
@@ -54,7 +56,7 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
         let widened = ty == ScalarType::Float
             && [left, right]
                 .iter()
-                .any(|side| side.ty() == ScalarType::Numeric && !side.is_always_null());
+                .any(|side| *side.ty() == ScalarType::Numeric && !side.is_always_null());
         return Evaluation::null(ty).with_error(error || widened);
     }
     // Never folded, and a float may overflow or divide by zero.
@@ -71,13 +73,13 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
     }
     let left_interval = number_bounds(left.values());
     let right_interval = number_bounds(right.values());
-    let (values, arith_error) = interval_values(op, ty, &left_interval, &right_interval, error);
+    let (values, arith_error) = interval_values(op, &ty, &left_interval, &right_interval, error);
     Evaluation::new(ty, null, arith_error, values)
 }
 
 /// Whether the reading knows every arithmetic operator PostgreSQL has for
-/// the type, an array having none.
-fn modelled(ty: ScalarType) -> bool {
+/// the type, an array and an enum having none.
+fn modelled(ty: &ScalarType) -> bool {
     matches!(
         ty,
         ScalarType::Boolean
@@ -87,6 +89,7 @@ fn modelled(ty: ScalarType) -> bool {
             | ScalarType::Text(_)
             | ScalarType::Date
             | ScalarType::Timestamp
+            | ScalarType::Enum(_)
             | ScalarType::Array(_)
     )
 }
@@ -96,12 +99,12 @@ fn modelled(ty: ScalarType) -> bool {
 /// `double precision`, and a `date` and a `timestamp` subtract into an
 /// `interval`. The `date` and `integer` pairs a `date_days` reading covers
 /// are handled before this question is asked.
-fn arithmetic_has_operator(left: ScalarType, op: &BinaryOperator, right: ScalarType) -> bool {
-    let numeric = |ty: ScalarType| ty.is_number() || ty == ScalarType::Float;
-    let temporal = |ty: ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
+fn arithmetic_has_operator(left: &ScalarType, op: &BinaryOperator, right: &ScalarType) -> bool {
+    let numeric = |ty: &ScalarType| ty.is_number() || *ty == ScalarType::Float;
+    let temporal = |ty: &ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
     if numeric(left) && numeric(right) {
         return *op != BinaryOperator::Modulo
-            || (left != ScalarType::Float && right != ScalarType::Float);
+            || (*left != ScalarType::Float && *right != ScalarType::Float);
     }
     temporal(left) && temporal(right) && *op == BinaryOperator::Minus
 }
@@ -272,7 +275,7 @@ fn fold_arithmetic(
 /// it adds.
 fn interval_values(
     op: &BinaryOperator,
-    ty: ScalarType,
+    ty: &ScalarType,
     left: &Interval<PgNumeric>,
     right: &Interval<PgNumeric>,
     error: bool,
@@ -608,7 +611,7 @@ mod tests {
     }
 
     /// A raising result of the right type.
-    fn raised(result: &Evaluation, ty: ScalarType) {
+    fn raised(result: &Evaluation, ty: &ScalarType) {
         assert_eq!(result.ty(), ty);
         assert!(result.may_raise());
     }
@@ -619,7 +622,7 @@ mod tests {
         let float =
             Evaluation::new(ScalarType::Float, false, false, Values::Unlisted(Unlisted::any()));
         let result = arithmetic(&float, &BinaryOperator::Plus, &float);
-        assert_eq!(result.ty(), ScalarType::Float);
+        assert_eq!(*result.ty(), ScalarType::Float);
         assert!(result.may_raise());
         let one = known_int(1, IntegerType::Integer);
         assert!(arithmetic(&one, &BinaryOperator::Divide, &float).may_raise());
@@ -650,12 +653,12 @@ mod tests {
             BinaryOperator::Modulo,
         ] {
             let result = arithmetic(&date, &op, &date);
-            raised(&result, ScalarType::Unknown);
+            raised(&result, &ScalarType::Unknown);
         }
         // `date + float` has no operator either
         let float =
             Evaluation::new(ScalarType::Float, false, false, Values::Unlisted(Unlisted::any()));
-        raised(&arithmetic(&date, &BinaryOperator::Plus, &float), ScalarType::Unknown);
+        raised(&arithmetic(&date, &BinaryOperator::Plus, &float), &ScalarType::Unknown);
         let text = Evaluation::new(
             ScalarType::Text(TextRules::DEFAULT),
             false,
@@ -665,23 +668,23 @@ mod tests {
         // Neither `int4 + text` nor `text + text` has an operator
         raised(
             &arithmetic(&known_int(1, IntegerType::Integer), &BinaryOperator::Plus, &text),
-            ScalarType::Unknown,
+            &ScalarType::Unknown,
         );
-        raised(&arithmetic(&text, &BinaryOperator::Plus, &text), ScalarType::Unknown);
+        raised(&arithmetic(&text, &BinaryOperator::Plus, &text), &ScalarType::Unknown);
         // Two `timestamp`s have no operator between them
         let timestamp =
             Evaluation::new(ScalarType::Timestamp, false, false, Values::Unlisted(Unlisted::any()));
-        raised(&arithmetic(&timestamp, &BinaryOperator::Plus, &timestamp), ScalarType::Unknown);
+        raised(&arithmetic(&timestamp, &BinaryOperator::Plus, &timestamp), &ScalarType::Unknown);
         let boolean =
             Evaluation::new(ScalarType::Boolean, false, false, Values::Unlisted(Unlisted::any()));
         raised(
             &arithmetic(&boolean, &BinaryOperator::Plus, &known_int(1, IntegerType::Integer)),
-            ScalarType::Unknown,
+            &ScalarType::Unknown,
         );
         // `double precision` has no `%`
         raised(
             &arithmetic(&float, &BinaryOperator::Modulo, &known_int(2, IntegerType::Integer)),
-            ScalarType::Unknown,
+            &ScalarType::Unknown,
         );
     }
 
@@ -693,7 +696,7 @@ mod tests {
         let date = Evaluation::null(ScalarType::Date);
         raised(
             &arithmetic(&date, &BinaryOperator::Plus, &known_date("2020-01-01")),
-            ScalarType::Unknown,
+            &ScalarType::Unknown,
         );
     }
 
@@ -707,7 +710,7 @@ mod tests {
             arithmetic(&null, &BinaryOperator::Plus, &known_int(1, IntegerType::Integer));
         assert!(!plus_one.may_raise());
         assert!(plus_one.may_be_null());
-        assert_eq!(plus_one.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*plus_one.ty(), ScalarType::Integer(IntegerType::Integer));
         let float =
             Evaluation::new(ScalarType::Float, true, false, Values::Unlisted(Unlisted::any()));
         assert!(arithmetic(&float, &BinaryOperator::Modulo, &null).always_raises());
@@ -732,7 +735,7 @@ mod tests {
             (&timestamp, &known_date("2020-01-01")),
         ] {
             let difference = arithmetic(left, &BinaryOperator::Minus, right);
-            assert_eq!(difference.ty(), ScalarType::Other);
+            assert_eq!(*difference.ty(), ScalarType::Other);
             assert!(difference.may_raise());
             assert!(matches!(difference.values(), Values::Unlisted(_)));
         }
@@ -761,7 +764,7 @@ mod tests {
             Values::Unlisted(Unlisted::any()),
         );
         let result = arithmetic(&x, &BinaryOperator::Plus, &known_int(1, IntegerType::Integer));
-        assert_eq!(result.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*result.ty(), ScalarType::Integer(IntegerType::Integer));
         assert!(result.may_raise());
     }
 
@@ -804,13 +807,13 @@ mod tests {
             &BinaryOperator::Plus,
             &known_int(1, IntegerType::Smallint),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Smallint));
+        raised(&result, &ScalarType::Integer(IntegerType::Smallint));
         let result = arithmetic(
             &known_int(i64::from(i16::MIN), IntegerType::Smallint),
             &BinaryOperator::Plus,
             &known_int(-1, IntegerType::Smallint),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Smallint));
+        raised(&result, &ScalarType::Integer(IntegerType::Smallint));
         let result = arithmetic(
             &known_int(i64::from(i16::MIN), IntegerType::Smallint),
             &BinaryOperator::Modulo,
@@ -823,13 +826,13 @@ mod tests {
             &BinaryOperator::Plus,
             &known_int(1, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Integer));
+        raised(&result, &ScalarType::Integer(IntegerType::Integer));
         let result = arithmetic(
             &known_int(2_147_483_647, IntegerType::Integer),
             &BinaryOperator::Multiply,
             &known_int(2, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Integer));
+        raised(&result, &ScalarType::Integer(IntegerType::Integer));
         // the `int4` operand widens the pair to `int8`, whose range the
         // sum fits
         assert_eq!(
@@ -847,7 +850,7 @@ mod tests {
             &BinaryOperator::Divide,
             &known_int(-1, IntegerType::Bigint),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Bigint));
+        raised(&result, &ScalarType::Integer(IntegerType::Bigint));
         let result = arithmetic(
             &known_int(i64::MIN, IntegerType::Bigint),
             &BinaryOperator::Modulo,
@@ -886,13 +889,13 @@ mod tests {
             &BinaryOperator::Divide,
             &known_int(0, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Integer));
+        raised(&result, &ScalarType::Integer(IntegerType::Integer));
         let result = arithmetic(
             &known_int(7, IntegerType::Integer),
             &BinaryOperator::Modulo,
             &known_int(0, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Integer));
+        raised(&result, &ScalarType::Integer(IntegerType::Integer));
 
         // a non-arithmetic operator on integers raises, as PostgreSQL's
         // `operator does not exist` does
@@ -901,7 +904,7 @@ mod tests {
             &BinaryOperator::And,
             &known_int(2, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Integer(IntegerType::Integer));
+        raised(&result, &ScalarType::Integer(IntegerType::Integer));
     }
 
     /// Constant numeric pairs fold at the numeric scale rules, and a pair
@@ -929,15 +932,15 @@ mod tests {
             PgValue::Numeric(number("1.5"))
         );
         let result = arithmetic(&known_number("1.5"), &BinaryOperator::Divide, &known_number("0"));
-        raised(&result, ScalarType::Numeric);
+        raised(&result, &ScalarType::Numeric);
 
         let big = known_number(&"9".repeat(131_072));
         let result = arithmetic(&big, &BinaryOperator::Plus, &known_number("1"));
-        raised(&result, ScalarType::Numeric);
+        raised(&result, &ScalarType::Numeric);
 
         // a non-arithmetic operator on numerics leaves the values undecided
         let result = arithmetic(&known_number("1.5"), &BinaryOperator::Or, &known_number("2.0"));
-        assert_eq!(result.ty(), ScalarType::Numeric);
+        assert_eq!(*result.ty(), ScalarType::Numeric);
         assert!(!result.may_raise());
         assert!(matches!(result.values(), Values::Unlisted(_)));
     }
@@ -951,7 +954,7 @@ mod tests {
             &BinaryOperator::Plus,
             &known_int(1, IntegerType::Integer),
         );
-        assert_eq!(result.ty(), ScalarType::Date);
+        assert_eq!(*result.ty(), ScalarType::Date);
         assert!(!result.may_raise());
         assert_eq!(
             result.constant(),
@@ -982,7 +985,7 @@ mod tests {
             &BinaryOperator::Minus,
             &known_date("2020-01-01"),
         );
-        assert_eq!(result.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*result.ty(), ScalarType::Integer(IntegerType::Integer));
         assert_eq!(result.constant(), Some(&PgValue::Integer(4)));
         let result = arithmetic(
             &known_date("2020-01-01"),
@@ -994,7 +997,7 @@ mod tests {
         let dates =
             Evaluation::new(ScalarType::Date, false, false, Values::Unlisted(Unlisted::any()));
         let result = arithmetic(&dates, &BinaryOperator::Minus, &dates);
-        assert_eq!(result.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*result.ty(), ScalarType::Integer(IntegerType::Integer));
         assert!(result.may_raise());
         let infinite = Evaluation::known(
             PgValue::Date(sql_values::postgres::PgDate::INFINITY),
@@ -1013,10 +1016,10 @@ mod tests {
             Evaluation::new(ScalarType::Timestamp, false, false, Values::Unlisted(Unlisted::any()));
         let result =
             arithmetic(&timestamp, &BinaryOperator::Plus, &known_int(1, IntegerType::Integer));
-        raised(&result, ScalarType::Timestamp);
+        raised(&result, &ScalarType::Timestamp);
         let result =
             arithmetic(&known_int(1, IntegerType::Integer), &BinaryOperator::Plus, &timestamp);
-        raised(&result, ScalarType::Timestamp);
+        raised(&result, &ScalarType::Timestamp);
 
         // PostgreSQL has no `date + bigint` or `bigint + date`
         let result = arithmetic(
@@ -1024,13 +1027,13 @@ mod tests {
             &BinaryOperator::Plus,
             &known_int(1, IntegerType::Bigint),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
         let result = arithmetic(
             &known_int(1, IntegerType::Bigint),
             &BinaryOperator::Plus,
             &known_date("2020-01-01"),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
 
         // no other operator applies to a date with an integer
         let result = arithmetic(
@@ -1038,19 +1041,19 @@ mod tests {
             &BinaryOperator::Multiply,
             &known_int(2, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
         let result = arithmetic(
             &known_int(2, IntegerType::Integer),
             &BinaryOperator::Minus,
             &known_date("2020-01-01"),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
         let result = arithmetic(
             &known_int(2, IntegerType::Integer),
             &BinaryOperator::Divide,
             &known_date("2020-01-01"),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
 
         // an unlisted day count may shift the date out of range, so it
         // raises
@@ -1061,7 +1064,7 @@ mod tests {
             &BinaryOperator::Plus,
             &unlisted(ScalarType::Integer(IntegerType::Integer), "1", "2"),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
 
         // a shift past the date range raises, leaving no value behind
         let result = arithmetic(
@@ -1072,7 +1075,7 @@ mod tests {
             &BinaryOperator::Plus,
             &known_int(1, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
         let Values::Listed(listed) = result.values() else { panic!("expected listed values") };
         assert!(listed.is_empty());
         let result = arithmetic(
@@ -1083,7 +1086,7 @@ mod tests {
             &BinaryOperator::Minus,
             &known_int(1, IntegerType::Integer),
         );
-        raised(&result, ScalarType::Date);
+        raised(&result, &ScalarType::Date);
 
         // a value the type cannot hold is simply skipped
         let days = Evaluation::new(
@@ -1291,7 +1294,7 @@ mod tests {
     fn a_divisor_that_may_be_zero_adds_an_error() {
         let (values, error) = interval_values(
             &BinaryOperator::Divide,
-            ScalarType::Numeric,
+            &ScalarType::Numeric,
             &Interval { low: Bound::Included(number("1")), high: Bound::Included(number("2")) },
             &Interval { low: Bound::Included(number("-1")), high: Bound::Included(number("1")) },
             false,
@@ -1301,7 +1304,7 @@ mod tests {
 
         let (values, error) = interval_values(
             &BinaryOperator::Modulo,
-            ScalarType::Numeric,
+            &ScalarType::Numeric,
             &Interval { low: Bound::Included(number("1")), high: Bound::Included(number("2")) },
             &Interval {
                 low: Bound::Included(number("-0.5")),
@@ -1314,7 +1317,7 @@ mod tests {
 
         let (values, error) = interval_values(
             &BinaryOperator::Modulo,
-            ScalarType::Numeric,
+            &ScalarType::Numeric,
             &Interval { low: Bound::Included(number("1")), high: Bound::Included(number("2")) },
             &Interval { low: Bound::Included(number("1")), high: Bound::Included(number("1")) },
             false,
@@ -1326,7 +1329,7 @@ mod tests {
         // error
         let (values, error) = interval_values(
             &BinaryOperator::And,
-            ScalarType::Numeric,
+            &ScalarType::Numeric,
             &Interval { low: Bound::Included(number("1")), high: Bound::Included(number("2")) },
             &Interval { low: Bound::Included(number("1")), high: Bound::Included(number("2")) },
             false,
@@ -1367,7 +1370,7 @@ mod tests {
         // a bound at the width, excluded or not, admits no overflow
         let (values, error) = interval_values(
             &BinaryOperator::Minus,
-            ScalarType::Integer(IntegerType::Integer),
+            &ScalarType::Integer(IntegerType::Integer),
             &Interval {
                 low: Bound::Excluded(number("-2147483648")),
                 high: Bound::Included(number("0")),
@@ -1385,7 +1388,7 @@ mod tests {
         );
         let (values, error) = interval_values(
             &BinaryOperator::Minus,
-            ScalarType::Integer(IntegerType::Integer),
+            &ScalarType::Integer(IntegerType::Integer),
             &Interval {
                 low: Bound::Included(number("-2147483648")),
                 high: Bound::Included(number("0")),
@@ -1403,7 +1406,7 @@ mod tests {
         );
         let (_, error) = interval_values(
             &BinaryOperator::Minus,
-            ScalarType::Integer(IntegerType::Integer),
+            &ScalarType::Integer(IntegerType::Integer),
             &Interval {
                 low: Bound::Included(number("-2147483648.5")),
                 high: Bound::Included(number("0")),

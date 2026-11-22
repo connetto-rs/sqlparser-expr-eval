@@ -129,8 +129,8 @@ impl EvalDialect for Engine {
 
     fn comparison_order(
         &self,
-        left: ScalarType,
-        right: ScalarType,
+        left: &ScalarType,
+        right: &ScalarType,
         _options: &(),
     ) -> Option<Order> {
         match self {

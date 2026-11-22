@@ -52,8 +52,8 @@ impl EvalDialect for PostgreSqlDialect {
 
     fn comparison_order(
         &self,
-        left: ScalarType,
-        right: ScalarType,
+        left: &ScalarType,
+        right: &ScalarType,
         options: &PostgreSqlOptions,
     ) -> Option<Order> {
         let _ = options;
@@ -65,7 +65,7 @@ impl EvalDialect for PostgreSqlDialect {
                 ScalarType::Date | ScalarType::Timestamp,
             ) => Some(Order::Time),
             (ScalarType::Text(left), ScalarType::Text(right)) => {
-                TextRules::resolved(left, right)
+                TextRules::resolved(*left, *right)
                     .filter(|rules| rules.identity_equality)
                     .map(|rules| Order::Text(rules.collation))
             }
@@ -333,7 +333,7 @@ mod tests {
     fn concat_folds_the_listed_outputs() {
         // `'a' || 'b'` is the single value `'ab'`
         let evaluation = read("'a' || 'b'", false);
-        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert_eq!(*evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
         assert!(!evaluation.may_be_null());
         assert!(!evaluation.may_raise());
         assert_eq!(

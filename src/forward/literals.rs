@@ -45,7 +45,7 @@ pub(super) fn typed_string<C: Context>(context: &mut C, typed: &TypedString) -> 
     let Value::SingleQuotedString(text) = &typed.value.value else {
         return Evaluation::unknown(ty);
     };
-    match scalar::cast(&PgValue::Text(text.clone()), ScalarType::UnknownLiteral, ty) {
+    match scalar::cast(&PgValue::Text(text.clone()), &ScalarType::UnknownLiteral, &ty) {
         Cast::Folded(datum) => Evaluation::known(datum, ty),
         Cast::Raises => Evaluation::raising(ty),
         Cast::Null | Cast::Unknown => Evaluation::unknown(ty),
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn an_untypeable_number_stays_unknown() {
         let evaluation = super::value(&vspan(Value::Number("0x".to_string(), false)));
-        assert_eq!(evaluation.ty(), ScalarType::Unknown);
+        assert_eq!(*evaluation.ty(), ScalarType::Unknown);
         assert!(evaluation.may_raise());
     }
 
@@ -150,14 +150,14 @@ mod tests {
                 tag: None,
             })));
         assert_eq!(evaluation.constant(), Some(&PgValue::Text("hello".to_string())));
-        assert_eq!(evaluation.ty(), ScalarType::UnknownLiteral);
+        assert_eq!(*evaluation.ty(), ScalarType::UnknownLiteral);
     }
 
     /// A placeholder is unknown to the evaluator.
     #[test]
     fn a_placeholder_is_unknown() {
         let evaluation = super::value(&vspan(Value::Placeholder("?".to_string())));
-        assert_eq!(evaluation.ty(), ScalarType::Unknown);
+        assert_eq!(*evaluation.ty(), ScalarType::Unknown);
         assert!(evaluation.may_raise());
     }
 
@@ -168,7 +168,7 @@ mod tests {
             &mut ctx(),
             &typed(DataType::Date, Value::SingleQuotedString("2024-01-01".to_string())),
         );
-        assert_eq!(good.ty(), ScalarType::Date);
+        assert_eq!(*good.ty(), ScalarType::Date);
         assert!(!good.may_raise());
         assert!(matches!(good.constant(), Some(PgValue::Date(_))));
 
@@ -176,7 +176,7 @@ mod tests {
             &mut ctx(),
             &typed(DataType::Date, Value::SingleQuotedString("2024-13-40".to_string())),
         );
-        assert_eq!(bad.ty(), ScalarType::Date);
+        assert_eq!(*bad.ty(), ScalarType::Date);
         assert!(bad.always_raises());
     }
 
@@ -190,7 +190,7 @@ mod tests {
                 Value::SingleQuotedString("2024-01-01 01:02:03".to_string()),
             ),
         );
-        assert_eq!(good.ty(), ScalarType::Timestamp);
+        assert_eq!(*good.ty(), ScalarType::Timestamp);
         assert!(!good.may_raise());
         assert!(matches!(good.constant(), Some(PgValue::Timestamp(_))));
 
@@ -201,7 +201,7 @@ mod tests {
                 Value::SingleQuotedString("2024-01-01 25:00:00".to_string()),
             ),
         );
-        assert_eq!(bad.ty(), ScalarType::Timestamp);
+        assert_eq!(*bad.ty(), ScalarType::Timestamp);
         assert!(bad.always_raises());
     }
 
@@ -213,13 +213,13 @@ mod tests {
             &mut ctx(),
             &typed(DataType::Int(None), Value::SingleQuotedString(" 5 ".to_string())),
         );
-        assert_eq!(integer.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*integer.ty(), ScalarType::Integer(IntegerType::Integer));
         assert_eq!(integer.constant(), Some(&PgValue::Integer(5)));
         let float = super::typed_string(
             &mut ctx(),
             &typed(DataType::Real, Value::SingleQuotedString("1.5".to_string())),
         );
-        assert_eq!(float.ty(), ScalarType::Float);
+        assert_eq!(*float.ty(), ScalarType::Float);
         assert!(float.may_raise());
     }
 
@@ -230,7 +230,7 @@ mod tests {
             &mut ctx(),
             &typed(DataType::Date, Value::Number("5".to_string(), false)),
         );
-        assert_eq!(evaluation.ty(), ScalarType::Date);
+        assert_eq!(*evaluation.ty(), ScalarType::Date);
         assert!(evaluation.may_raise());
     }
 }

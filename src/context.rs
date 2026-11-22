@@ -231,7 +231,9 @@ pub trait Context {
         Ok(QueryEvaluation::unknown())
     }
 
-    /// The type a cast or a typed literal names.
+    /// The type a cast or a typed literal names. A context that knows the
+    /// schema answers [`ScalarType::Enum`] for an enum type, which the
+    /// parser reads as a custom type.
     fn data_type(&self, data_type: &DataType) -> ScalarType {
         ScalarType::of(data_type)
     }
@@ -314,7 +316,7 @@ mod tests {
         let evaluation =
             evaluate(&parse("f('a')"), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
                 .unwrap();
-        assert_eq!(evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
         // An unknown routine may return `NULL` on non-`NULL` input, and `f`
         // is declared not to raise
         assert!(evaluation.may_be_null());
@@ -334,7 +336,7 @@ mod tests {
             let evaluation =
                 evaluate(&parse(sql), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
                     .unwrap();
-            assert_eq!(evaluation.ty(), ty, "{sql}");
+            assert_eq!(*evaluation.ty(), ty, "{sql}");
         }
     }
 
@@ -366,7 +368,7 @@ mod tests {
         let evaluation =
             evaluate(&parse("1::text"), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
                 .unwrap();
-        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert_eq!(*evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
         assert!(!evaluation.is_always_null());
         // The default cast is conservative and may raise on a type change
         assert!(evaluation.may_raise());
@@ -383,7 +385,7 @@ mod tests {
         // `x` resolves to the column the context spells
         let evaluation =
             evaluate(&parse("x"), &GenericDialect, &(), &mut Minimal, &Guarantees::new()).unwrap();
-        assert_eq!(evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert_eq!(*evaluation.ty(), ScalarType::Text(TextRules::DEFAULT));
         assert!(evaluation.may_be_null());
         // `y` resolves to nothing, so the node reads unknown
         let evaluation =

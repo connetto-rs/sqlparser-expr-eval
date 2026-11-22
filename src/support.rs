@@ -218,7 +218,7 @@ pub(crate) fn prune(evaluation: &Evaluation, outcomes: Outcomes) -> Evaluation {
         Values::Unlisted(_) => evaluation.values().clone(),
     };
     Evaluation::new(
-        evaluation.ty(),
+        evaluation.ty().clone(),
         evaluation.may_be_null() && outcomes.null,
         evaluation.may_raise(),
         values,
@@ -430,7 +430,7 @@ pub(crate) fn values_share(left: &Evaluation, right: &Evaluation) -> bool {
 
 /// Whether the type could stand for a condition.
 #[must_use]
-pub(crate) fn could_be_boolean(ty: ScalarType) -> bool {
+pub(crate) fn could_be_boolean(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Boolean | ScalarType::Unknown | ScalarType::UnknownLiteral)
 }
 
@@ -443,7 +443,7 @@ pub(crate) fn as_condition(evaluation: Evaluation) -> Evaluation {
         ScalarType::Boolean | ScalarType::Unknown => evaluation,
         _ if evaluation.is_impossible() => Evaluation::impossible(ScalarType::Boolean),
         ScalarType::UnknownLiteral => {
-            crate::forward::fold::reinterpret_unknown(evaluation, ScalarType::Boolean)
+            crate::forward::fold::reinterpret_unknown(evaluation, &ScalarType::Boolean)
         }
         // No engine reads an array as a condition.
         ScalarType::Array(_) => Evaluation::raising(ScalarType::Boolean),
@@ -560,15 +560,15 @@ mod tests {
     #[test]
     fn a_stable_expression_is_a_subject_and_a_column_is_not() {
         let text = ScalarType::Text(TextRules::DEFAULT);
-        let mut context = ColumnContext::new().with_callee("upper", strict_callee(text));
+        let mut context = ColumnContext::new().with_callee("upper", strict_callee(text.clone()));
         // a call of a stable function over constants reads no column
         assert!(matches!(
             subject(&mut context, &parse("upper('a') + 1")).expect("resolves"),
             Some(Subject::Expression(_))
         ));
         // the same shape that reads a column is no subject at all
-        let mut context =
-            context.with_column("x", Evaluation::known(PgValue::Text("a".to_string()), text));
+        let mut context = context
+            .with_column("x", Evaluation::known(PgValue::Text("a".to_string()), text.clone()));
         assert!(subject(&mut context, &parse("upper(x)")).expect("resolves").is_none());
         // a volatile callee changes between two evaluations of one statement
         let mut context = ColumnContext::new().with_callee("random", volatile_callee());
@@ -594,7 +594,7 @@ mod tests {
     fn every_constant_form_is_a_subject_and_others_are_not() {
         let text = ScalarType::Text(TextRules::DEFAULT);
         let mut context = ColumnContext::new()
-            .with_callee("upper", strict_callee(text))
+            .with_callee("upper", strict_callee(text.clone()))
             .with_callee("now", strict_callee(text));
         for sql in [
             "DATE '2026-01-01'",
@@ -758,13 +758,16 @@ mod tests {
     #[test]
     fn values_share_matches_the_common_value() {
         let int4 = ScalarType::Integer(IntegerType::Integer);
-        assert!(values_share(&listed(int4, &integers(&[1, 2])), &listed(int4, &integers(&[2, 3]))));
-        assert!(!values_share(
-            &listed(int4, &integers(&[1, 2])),
-            &listed(int4, &integers(&[3, 4]))
+        assert!(values_share(
+            &listed(int4.clone(), &integers(&[1, 2])),
+            &listed(int4.clone(), &integers(&[2, 3]))
         ));
-        let empty = listed(int4, &[]);
-        assert!(!values_share(&empty, &listed(int4, &integers(&[1]))));
+        assert!(!values_share(
+            &listed(int4.clone(), &integers(&[1, 2])),
+            &listed(int4.clone(), &integers(&[3, 4]))
+        ));
+        let empty = listed(int4.clone(), &[]);
+        assert!(!values_share(&empty, &listed(int4.clone(), &integers(&[1]))));
         // a listed value is admitted by an unlisted set only inside its
         // interval, not at an excluded bound
         let interval = |low: i64, high: i64| {
@@ -779,7 +782,7 @@ mod tests {
             false,
             Values::Unlisted(Unlisted { numbers: interval(2, 3), ..Unlisted::any() }),
         );
-        assert!(values_share(&listed(int4, &integers(&[1, 2])), &unlisted));
+        assert!(values_share(&listed(int4.clone(), &integers(&[1, 2])), &unlisted));
         let excluded = Evaluation::new(
             ScalarType::Numeric,
             false,
@@ -806,7 +809,8 @@ mod tests {
         assert!(!values_share(&number(1, 2), &number(3, 5)));
         // two unlisted text sets share a value when both may hold some text
         let text = ScalarType::Text(TextRules::DEFAULT);
-        let text_set = Evaluation::new(text, false, false, Values::Unlisted(Unlisted::any()));
+        let text_set =
+            Evaluation::new(text.clone(), false, false, Values::Unlisted(Unlisted::any()));
         let empty_text = Evaluation::new(
             text,
             false,

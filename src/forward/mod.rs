@@ -286,7 +286,7 @@ mod tests {
         // A numeric shift stands for the same day count but cannot be folded
         // against a listed date, so the shift stays open
         let evaluation = read(context, "d + n");
-        assert_eq!(evaluation.ty(), ScalarType::Date);
+        assert_eq!(*evaluation.ty(), ScalarType::Date);
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     }
 
@@ -306,7 +306,7 @@ mod tests {
             "ARRAY[x]",
         );
         assert_eq!(
-            evaluation.ty(),
+            *evaluation.ty(),
             ScalarType::Array(crate::scalar::ArrayElement::Text(TextRules::DEFAULT))
         );
         assert!(!matches!(evaluation.values(), Values::Listed(_)));
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn a_date_plus_days_folds_to_a_date() {
         let evaluation = read(ColumnContext::new(), "DATE '2026-01-01' + 5");
-        assert_eq!(evaluation.ty(), ScalarType::Date);
+        assert_eq!(*evaluation.ty(), ScalarType::Date);
         assert!(evaluation.constant().is_some());
         assert!(!evaluation.may_be_null());
     }
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn a_numeric_typmod_rounds_to_the_scale() {
         let evaluation = read(ColumnContext::new(), "1.9999::numeric(10, 4)");
-        assert_eq!(evaluation.ty(), ScalarType::Numeric);
+        assert_eq!(*evaluation.ty(), ScalarType::Numeric);
         assert!(evaluation.constant().is_some());
     }
 

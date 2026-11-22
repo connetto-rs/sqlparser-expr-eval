@@ -42,7 +42,7 @@ pub(super) fn constructor<D: EvalDialect, C: Context>(
     let mut ty = ScalarType::Unknown;
     let mut error = false;
     for element in &elements {
-        let (joined, refused) = joined_type(ty, element.ty());
+        let (joined, refused) = joined_type(&ty, element.ty());
         ty = joined;
         error |= refused;
     }
@@ -50,9 +50,9 @@ pub(super) fn constructor<D: EvalDialect, C: Context>(
     if elements.iter().all(Evaluation::is_untyped) {
         ty = ScalarType::Text(TextRules::DEFAULT);
     }
-    let array_type = ScalarType::Array(ArrayElement::of(ty));
+    let array_type = ScalarType::Array(ArrayElement::of(&ty));
     let elements: Vec<Evaluation> =
-        elements.into_iter().map(|element| coerce_to(element, ty)).collect();
+        elements.into_iter().map(|element| coerce_to(element, &ty)).collect();
     Ok(finish(&elements, array_type, error))
 }
 
@@ -78,7 +78,7 @@ pub(super) fn cast_constructor<D: EvalDialect, C: Context>(
             }
         });
     }
-    let array_type = ScalarType::Array(ArrayElement::of(state.context.data_type(element)));
+    let array_type = ScalarType::Array(ArrayElement::of(&state.context.data_type(element)));
     Ok(finish(&elements, array_type, false))
 }
 
@@ -136,13 +136,13 @@ pub(super) fn multidimensional(elements: &[Evaluation]) -> Evaluation {
     let mut ty = ScalarType::Unknown;
     let mut error = false;
     for element in elements {
-        let (joined, refused) = joined_type(ty, element.ty());
+        let (joined, refused) = joined_type(&ty, element.ty());
         ty = joined;
         // PostgreSQL matches no sub-array with a scalar element.
-        error |= refused || !(element.ty().is_array() || element.ty() == ScalarType::Unknown);
+        error |= refused || !(element.ty().is_array() || *element.ty() == ScalarType::Unknown);
     }
     if error || !ty.is_array() {
-        return Evaluation::raising(ScalarType::Array(ArrayElement::of(ty)));
+        return Evaluation::raising(ScalarType::Array(ArrayElement::of(&ty)));
     }
     let error = elements.iter().any(Evaluation::may_raise);
     let constants: Option<Vec<&PgArray>> = elements
@@ -208,16 +208,16 @@ pub(super) fn concat(left: &Evaluation, right: &Evaluation) -> Option<Evaluation
         ScalarType::UnknownLiteral => {
             (Concat::Cat, super::fold::reinterpret_unknown(other.clone(), array.ty()))
         }
-        _ if untyped_null => (Concat::Cat, Evaluation::null(array.ty())),
+        _ if untyped_null => (Concat::Cat, Evaluation::null(array.ty().clone())),
         _ if left_array => (Concat::Append, other.clone()),
         _ => (Concat::Prepend, other.clone()),
     };
     let other_element = match form {
         Concat::Cat => other.ty().element().unwrap_or(ScalarType::Unknown),
-        Concat::Append | Concat::Prepend => other.ty(),
+        Concat::Append | Concat::Prepend => other.ty().clone(),
     };
-    let (joined, refused) = joined_type(element, other_element);
-    let ty = ScalarType::Array(ArrayElement::of(joined));
+    let (joined, refused) = joined_type(&element, &other_element);
+    let ty = ScalarType::Array(ArrayElement::of(&joined));
     let open_types = element.is_unmodelled() || other_element.is_unmodelled();
     if refused && !open_types {
         // PostgreSQL has no `||` between the two types.
@@ -530,7 +530,7 @@ mod tests {
         let context = || {
             ColumnContext::new().with_column(
                 "x",
-                Evaluation::new(int4, false, false, Values::Listed(values.clone())),
+                Evaluation::new(int4.clone(), false, false, Values::Listed(values.clone())),
             )
         };
         assert!(matches!(read(context(), "ARRAY[x, x]").values(), Values::Unlisted(_)));
