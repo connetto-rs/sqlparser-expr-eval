@@ -35,9 +35,8 @@ impl TextRules {
     /// The rules a comparison between implicit collations `left` and `right`
     /// resolves to, the way PostgreSQL derives it. One collation resolves to
     /// itself and a collation other than the default wins over the default.
-    /// Two different collations other than the default make PostgreSQL raise,
-    /// and an unknown collation resolves to nothing known, so both give
-    /// `None`.
+    /// Two [`conflicting`](Self::conflicting) collations and an unknown
+    /// collation resolve to nothing known, so both give `None`.
     #[must_use]
     pub(crate) fn resolved(left: Self, right: Self) -> Option<Self> {
         match (left.collation, right.collation) {
@@ -47,6 +46,17 @@ impl TextRules {
             (_, Collation::Default) => Some(left),
             _ => None,
         }
+    }
+
+    /// Whether `left` and `right` are two different implicit collations
+    /// other than the default, which leave a comparison between them without
+    /// a collation, so PostgreSQL raises on every pair of values it compares.
+    #[must_use]
+    pub(crate) fn conflicting(left: Self, right: Self) -> bool {
+        matches!(
+            (left.collation, right.collation),
+            (Collation::Named(one), Collation::Named(other)) if one != other
+        )
     }
 }
 
