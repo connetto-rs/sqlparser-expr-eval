@@ -33,15 +33,16 @@ pub(super) fn cast(
         let Some(element) = scalar::array_element(definition) else {
             return Evaluation::unknown(ScalarType::Other).with_error(source.may_raise());
         };
-        return cast_array(element, element_type(element), source);
+        return cast_array(element, &element_type(element), source);
     }
     // A typed `NULL` still needs a cast between the two types.
-    let mut fold_error = source.may_raise() || (source.is_always_null() && cast_raises(source, to));
+    let mut fold_error =
+        source.may_raise() || (source.is_always_null() && cast_raises(source, &to));
     let mut null = source.may_be_null();
     let values = match source.values() {
         Values::Listed(listed) => {
-            let fold = scalar::cast_datums(listed, |datum| scalar::cast(datum, source.ty(), to));
-            fold_error |= fold.raises || (fold.undecided && cast_raises(source, to));
+            let fold = scalar::cast_datums(listed, |datum| scalar::cast(datum, source.ty(), &to));
+            fold_error |= fold.raises || (fold.undecided && cast_raises(source, &to));
             null |= fold.null;
             if fold.undecided {
                 Values::Unlisted(Unlisted::any())
@@ -50,20 +51,20 @@ pub(super) fn cast(
             }
         }
         Values::Unlisted(_) => {
-            fold_error |= cast_raises(source, to);
+            fold_error |= cast_raises(source, &to);
             Values::Unlisted(Unlisted::any())
         }
     };
     let mut evaluation = Evaluation::new(to, null, fold_error, values);
     match modifier(data_type) {
         Modifier::Varchar(limit) => {
-            if to.is_text() {
+            if evaluation.ty().is_text() {
                 evaluation = truncate_text(&evaluation, limit);
             }
         }
         Modifier::Refused => {
             // PostgreSQL refuses the type itself.
-            evaluation = Evaluation::raising(to);
+            evaluation = Evaluation::raising(evaluation.ty().clone());
         }
         Modifier::Numeric(typmod) => {
             let raise = numeric_typmod_raises(source, typmod) || evaluation.may_raise();
@@ -77,7 +78,7 @@ pub(super) fn cast(
 /// The cast of `source` to an array of `element`: text read by `array_in`
 /// and an array cast element by element, both under the element's
 /// modifiers, while PostgreSQL has no cast from another type to an array.
-fn cast_array(element: &DataType, ty: ScalarType, source: &Evaluation) -> Evaluation {
+fn cast_array(element: &DataType, ty: &ScalarType, source: &Evaluation) -> Evaluation {
     let array = ScalarType::Array(ArrayElement::of(ty));
     let readable = matches!(
         source.ty(),
@@ -130,7 +131,7 @@ enum ElementTarget {
 
 /// The cast target of an array's element type `ty`, spelled `element`, with
 /// the `varchar`, `numeric` and `timestamp` modifiers it states.
-fn element_target(element: &DataType, ty: ScalarType) -> ElementTarget {
+fn element_target(element: &DataType, ty: &ScalarType) -> ElementTarget {
     match modifier(element) {
         // `modifier` checks the limit against PostgreSQL's range.
         Modifier::Varchar(limit) => {
@@ -244,9 +245,9 @@ fn numeric_typmod_raises(source: &Evaluation, typmod: NumericTypmod) -> bool {
 }
 
 /// Whether casting a non-constant of the source's type to `to` can raise.
-fn cast_raises(source: &Evaluation, to: ScalarType) -> bool {
+fn cast_raises(source: &Evaluation, to: &ScalarType) -> bool {
     let from = source.ty();
-    if source.is_always_null() && matches!(from, ScalarType::Unknown | ScalarType::UnknownLiteral) {
+    if source.is_always_null() && from.is_untyped() {
         return false;
     }
     match to {
@@ -275,7 +276,7 @@ fn cast_raises(source: &Evaluation, to: ScalarType) -> bool {
             }
         }
         ScalarType::Numeric => {
-            if from.is_text() || from == ScalarType::UnknownLiteral {
+            if from.is_text() || *from == ScalarType::UnknownLiteral {
                 true
             } else {
                 !from.is_number()
@@ -284,10 +285,12 @@ fn cast_raises(source: &Evaluation, to: ScalarType) -> bool {
         ScalarType::Date | ScalarType::Timestamp => {
             // An identity cast and `timestamp::date` never raise, while
             // `date::timestamp` refuses a date from 294277-01-01.
-            !(from == to || (from == ScalarType::Timestamp && to == ScalarType::Date))
+            !(from == to || (*from == ScalarType::Timestamp && *to == ScalarType::Date))
         }
         // An integer always fits a `float`, a `numeric` or `float` may not.
         ScalarType::Float => !matches!(from, ScalarType::Integer(_)),
+        // A label reads only as its own enum, and text may hold no label.
+        ScalarType::Enum(_) => from != to,
         ScalarType::Other | ScalarType::Array(_) => true,
     }
 }
@@ -300,7 +303,7 @@ fn truncate_text(evaluation: &Evaluation, limit: usize) -> Evaluation {
     match evaluation.values() {
         Values::Listed(listed) => {
             let kept: BTreeSet<PgValue> = listed.iter().map(|value| clip(value, limit)).collect();
-            Evaluation::new(ty, null, error, Values::Listed(kept))
+            Evaluation::new(ty.clone(), null, error, Values::Listed(kept))
         }
         Values::Unlisted(unlisted) => {
             let cap = u64::try_from(limit).unwrap_or(u64::MAX);
@@ -315,7 +318,7 @@ fn truncate_text(evaluation: &Evaluation, limit: usize) -> Evaluation {
             };
             let mut narrowed = unlisted.clone();
             narrowed.length.high = high;
-            Evaluation::new(ty, null, error, Values::Unlisted(narrowed))
+            Evaluation::new(ty.clone(), null, error, Values::Unlisted(narrowed))
         }
     }
 }
@@ -358,7 +361,7 @@ fn round_numeric(evaluation: Evaluation, typmod: NumericTypmod) -> Evaluation {
             None => error = true,
         }
     }
-    Evaluation::new(evaluation.ty(), evaluation.may_be_null(), error, Values::Listed(kept))
+    evaluation.with_values(Values::Listed(kept)).with_error(error)
 }
 
 #[cfg(test)]
@@ -485,7 +488,7 @@ mod tests {
             Evaluation::new(ScalarType::Other, false, false, Values::Listed(listed.collect()))
         };
         let int4 = ScalarType::Integer(IntegerType::Integer);
-        let evaluation = cast(&jsonb(&["null"]), &DataType::Integer(None), int4);
+        let evaluation = cast(&jsonb(&["null"]), &DataType::Integer(None), int4.clone());
         assert!(evaluation.is_always_null());
         assert!(!evaluation.may_raise());
         let evaluation = cast(&jsonb(&["null", "7"]), &DataType::Integer(None), int4);
@@ -508,8 +511,8 @@ mod tests {
     #[test]
     fn a_varchar_zero_cast_raises() {
         let text_type = ScalarType::Text(TextRules::DEFAULT);
-        assert!(cast(&text("abc"), &varchar(0), text_type).always_raises());
-        assert!(cast(&column(text_type), &varchar(0), text_type).always_raises());
+        assert!(cast(&text("abc"), &varchar(0), text_type.clone()).always_raises());
+        assert!(cast(&column(text_type.clone()), &varchar(0), text_type).always_raises());
         let array = DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(varchar(0)), None));
         assert!(cast(&text("ab"), &array, ScalarType::Other).always_raises());
     }
@@ -655,10 +658,10 @@ mod tests {
     #[test]
     fn cast_raises_is_false_for_an_always_null_source() {
         let source = Evaluation::null(ScalarType::Unknown);
-        assert!(!super::cast_raises(&source, ScalarType::Boolean));
+        assert!(!super::cast_raises(&source, &ScalarType::Boolean));
         // A typed `NULL` still needs a cast between the two types.
         let bigint = Evaluation::null(ScalarType::Integer(IntegerType::Bigint));
-        assert!(super::cast_raises(&bigint, ScalarType::Boolean));
+        assert!(super::cast_raises(&bigint, &ScalarType::Boolean));
     }
 
     /// Only an `integer` or a `boolean` source never raises casting to boolean.
@@ -666,16 +669,16 @@ mod tests {
     fn cast_raises_from_text_to_boolean() {
         assert!(super::cast_raises(
             &column(ScalarType::Text(TextRules::DEFAULT)),
-            ScalarType::Boolean
+            &ScalarType::Boolean
         ));
-        assert!(super::cast_raises(&column(ScalarType::UnknownLiteral), ScalarType::Boolean));
+        assert!(super::cast_raises(&column(ScalarType::UnknownLiteral), &ScalarType::Boolean));
         for raising in
             [ScalarType::Numeric, ScalarType::Integer(IntegerType::Bigint), ScalarType::Date]
         {
-            assert!(super::cast_raises(&column(raising), ScalarType::Boolean));
+            assert!(super::cast_raises(&column(raising), &ScalarType::Boolean));
         }
         for clear in [ScalarType::Integer(IntegerType::Integer), ScalarType::Boolean] {
-            assert!(!super::cast_raises(&column(clear), ScalarType::Boolean));
+            assert!(!super::cast_raises(&column(clear), &ScalarType::Boolean));
         }
     }
 
@@ -683,7 +686,7 @@ mod tests {
     #[test]
     fn cast_raises_from_unbounded_numeric_to_integer() {
         let source = numeric_in(Bound::Unbounded, Bound::Unbounded);
-        assert!(super::cast_raises(&source, ScalarType::Integer(IntegerType::Integer)));
+        assert!(super::cast_raises(&source, &ScalarType::Integer(IntegerType::Integer)));
     }
 
     /// A bounded numeric source's included and excluded bounds are checked.
@@ -694,8 +697,8 @@ mod tests {
         let included = numeric_in(Bound::Included(low.clone()), Bound::Included(high.clone()));
         let excluded = numeric_in(Bound::Excluded(low), Bound::Excluded(high));
         let target = ScalarType::Integer(IntegerType::Bigint);
-        assert!(!super::cast_raises(&included, target));
-        assert!(!super::cast_raises(&excluded, target));
+        assert!(!super::cast_raises(&included, &target));
+        assert!(!super::cast_raises(&excluded, &target));
     }
 
     /// A non-number source may raise casting to an integer.
@@ -703,7 +706,7 @@ mod tests {
     fn cast_raises_from_non_number_to_integer() {
         assert!(super::cast_raises(
             &column(ScalarType::Date),
-            ScalarType::Integer(IntegerType::Integer)
+            &ScalarType::Integer(IntegerType::Integer)
         ));
     }
 
@@ -712,9 +715,9 @@ mod tests {
     fn cast_raises_from_text_to_numeric() {
         assert!(super::cast_raises(
             &column(ScalarType::Text(TextRules::DEFAULT)),
-            ScalarType::Numeric
+            &ScalarType::Numeric
         ));
-        assert!(!super::cast_raises(&column(ScalarType::Numeric), ScalarType::Numeric));
+        assert!(!super::cast_raises(&column(ScalarType::Numeric), &ScalarType::Numeric));
     }
 
     /// Identity casts and `timestamp::date` do not raise, while a date
@@ -722,10 +725,10 @@ mod tests {
     /// refuses.
     #[test]
     fn cast_raises_between_temporal_types() {
-        assert!(super::cast_raises(&column(ScalarType::Date), ScalarType::Timestamp));
-        assert!(!super::cast_raises(&column(ScalarType::Date), ScalarType::Date));
-        assert!(!super::cast_raises(&column(ScalarType::Timestamp), ScalarType::Date));
-        assert!(!super::cast_raises(&column(ScalarType::Timestamp), ScalarType::Timestamp));
+        assert!(super::cast_raises(&column(ScalarType::Date), &ScalarType::Timestamp));
+        assert!(!super::cast_raises(&column(ScalarType::Date), &ScalarType::Date));
+        assert!(!super::cast_raises(&column(ScalarType::Timestamp), &ScalarType::Date));
+        assert!(!super::cast_raises(&column(ScalarType::Timestamp), &ScalarType::Timestamp));
     }
 
     /// Only an integer source never raises casting to float.
@@ -733,13 +736,13 @@ mod tests {
     fn cast_raises_to_float() {
         assert!(super::cast_raises(
             &column(ScalarType::Text(TextRules::DEFAULT)),
-            ScalarType::Float
+            &ScalarType::Float
         ));
-        assert!(super::cast_raises(&column(ScalarType::Numeric), ScalarType::Float));
-        assert!(super::cast_raises(&column(ScalarType::Float), ScalarType::Float));
+        assert!(super::cast_raises(&column(ScalarType::Numeric), &ScalarType::Float));
+        assert!(super::cast_raises(&column(ScalarType::Float), &ScalarType::Float));
         assert!(!super::cast_raises(
             &column(ScalarType::Integer(IntegerType::Bigint)),
-            ScalarType::Float
+            &ScalarType::Float
         ));
     }
 
@@ -759,7 +762,7 @@ mod tests {
         let source = column(ScalarType::Unknown);
         let elem = DataType::Int(None);
         let evaluation =
-            super::cast_array(&elem, ScalarType::Integer(IntegerType::Integer), &source);
+            super::cast_array(&elem, &ScalarType::Integer(IntegerType::Integer), &source);
         assert!(evaluation.may_be_null());
     }
 
@@ -769,7 +772,7 @@ mod tests {
         let source = array(&["not an integer"]);
         let elem = DataType::Int(None);
         let evaluation =
-            super::cast_array(&elem, ScalarType::Integer(IntegerType::Integer), &source);
+            super::cast_array(&elem, &ScalarType::Integer(IntegerType::Integer), &source);
         assert!(evaluation.may_raise());
     }
 
@@ -778,12 +781,12 @@ mod tests {
     #[test]
     fn an_array_cast_reads_text_through_array_in() {
         let int = ScalarType::Integer(IntegerType::Integer);
-        let evaluation = super::cast_array(&DataType::Int(None), int, &text("{1,2}"));
+        let evaluation = super::cast_array(&DataType::Int(None), &int, &text("{1,2}"));
         assert_eq!(evaluation.constant().map(ToString::to_string).as_deref(), Some("{1,2}"));
-        assert!(super::cast_array(&DataType::Int(None), int, &text("{a}")).always_raises());
-        assert!(super::cast_array(&DataType::Int(None), int, &text("{1")).always_raises());
+        assert!(super::cast_array(&DataType::Int(None), &int, &text("{a}")).always_raises());
+        assert!(super::cast_array(&DataType::Int(None), &int, &text("{1")).always_raises());
         let null = Evaluation::null(ScalarType::Text(TextRules::DEFAULT));
-        let evaluation = super::cast_array(&DataType::Int(None), int, &null);
+        let evaluation = super::cast_array(&DataType::Int(None), &int, &null);
         assert!(!evaluation.may_raise());
     }
 
@@ -795,7 +798,7 @@ mod tests {
         let evaluation = cast(&text("01/02/2026"), &DataType::Date, ScalarType::Date);
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
         let evaluation =
-            super::cast_array(&DataType::Date, ScalarType::Date, &array(&["01/02/2026"]));
+            super::cast_array(&DataType::Date, &ScalarType::Date, &array(&["01/02/2026"]));
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     }
 
@@ -803,8 +806,11 @@ mod tests {
     #[test]
     fn an_array_cast_casts_its_elements() {
         let elem = varchar(1);
-        let evaluation =
-            super::cast_array(&elem, ScalarType::Text(TextRules::DEFAULT), &array(&["abcd", "xy"]));
+        let evaluation = super::cast_array(
+            &elem,
+            &ScalarType::Text(TextRules::DEFAULT),
+            &array(&["abcd", "xy"]),
+        );
         assert_eq!(evaluation.constant().map(ToString::to_string).as_deref(), Some("{a,x}"));
     }
 }

@@ -285,7 +285,7 @@ fn single_node<D: EvalDialect, C: Context>(
     }
     // An untyped literal reads through the `boolean` input and has no
     // subject to narrow.
-    if evaluation.ty() == ScalarType::UnknownLiteral {
+    if *evaluation.ty() == ScalarType::UnknownLiteral {
         if support::as_condition(evaluation).outcomes().intersection(outcomes).is_empty() {
             impossible(state);
         }
@@ -773,13 +773,12 @@ fn typed_members(values: Values, null: bool) -> Evaluation {
         }
     };
     let ty = listed.iter().map(kind).reduce(|ty, next| {
-        match (ty, next) {
-            _ if ty == next => ty,
-            (
-                ScalarType::Integer(_) | ScalarType::Numeric,
-                ScalarType::Integer(_) | ScalarType::Numeric,
-            ) => ScalarType::Numeric,
-            _ => ScalarType::Unknown,
+        if ty == next {
+            ty
+        } else if ty.is_number() && next.is_number() {
+            ScalarType::Numeric
+        } else {
+            ScalarType::Unknown
         }
     });
     let ty = ty.unwrap_or(ScalarType::Unknown);
@@ -883,7 +882,7 @@ fn cast_input<D: EvalDialect, C: Context>(
 ) -> Result<(), C::Error> {
     let to = state.context.data_type(data_type);
     let operand_evaluation = forward_of(state, operand)?;
-    if operand_evaluation.ty() == to || (to.is_text() && cast_text_limit(data_type).is_none()) {
+    if *operand_evaluation.ty() == to || (to.is_text() && cast_text_limit(data_type).is_none()) {
         return node(state, operand, outcomes);
     }
     if outcomes.truth || outcomes.falsity {
@@ -934,7 +933,7 @@ fn boolean_value<D: EvalDialect, C: Context>(
     };
     let evaluation = forward_of(state, inner)?;
     // Only a `boolean` inner narrows to a `boolean` value.
-    let narrowed = if evaluation.ty() == ScalarType::Boolean {
+    let narrowed = if *evaluation.ty() == ScalarType::Boolean {
         evaluation.with_values(Values::Listed(BTreeSet::from([PgValue::Boolean(value)])))
     } else {
         evaluation
@@ -1037,7 +1036,7 @@ fn comparison<D: EvalDialect, C: Context>(
 fn relate<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     (left, right): (&Expr, &Expr),
-    (left_type, right_type): (ScalarType, ScalarType),
+    (left_type, right_type): (&ScalarType, &ScalarType),
     op: CmpOp,
     is_true: bool,
 ) -> Result<(), C::Error> {
@@ -1248,14 +1247,13 @@ fn restriction(
     if !compatible(left.ty(), right.ty()) {
         return Restriction::Skip;
     }
-    let untyped = |ty: ScalarType| matches!(ty, ScalarType::Unknown | ScalarType::UnknownLiteral);
     // A typed value side must not meet an untyped literal's raw datum.
-    if left.ty() == ScalarType::UnknownLiteral && !untyped(right.ty()) {
+    if *left.ty() == ScalarType::UnknownLiteral && !right.ty().is_untyped() {
         return Restriction::Skip;
     }
     // An untyped value side reads its values as the other side's type.
     let reinterpreted;
-    let right = if untyped(right.ty()) && !untyped(left.ty()) && !left.ty().is_text() {
+    let right = if right.ty().is_untyped() && !left.ty().is_untyped() && !left.ty().is_text() {
         let Some(read) = reinterpreted_as(right, left.ty()) else {
             return Restriction::Skip;
         };
@@ -1268,7 +1266,7 @@ fn restriction(
         CmpOp::Eq | CmpOp::NotEq => {
             // A non-identity collation can equate distinct strings, so a
             // membership guarantee needs identity equality on both sides.
-            let identity = |ty: ScalarType| {
+            let identity = |ty: &ScalarType| {
                 match ty {
                     ScalarType::Text(rules) => rules.identity_equality,
                     _ => true,
@@ -1301,7 +1299,7 @@ fn restriction(
 
 /// The listed `source` re-read as `target`, `NULL` where a value casts to
 /// `NULL`, and `None` when one cast stays undecided.
-fn reinterpreted_as(source: &Evaluation, target: ScalarType) -> Option<Evaluation> {
+fn reinterpreted_as(source: &Evaluation, target: &ScalarType) -> Option<Evaluation> {
     let Values::Listed(listed) = source.values() else {
         return None;
     };
@@ -1311,22 +1309,22 @@ fn reinterpreted_as(source: &Evaluation, target: ScalarType) -> Option<Evaluatio
         return None;
     }
     let null = source.may_be_null() || fold.null;
-    Some(Evaluation::new(target, null, source.may_raise(), Values::Listed(fold.values)))
+    Some(Evaluation::new(target.clone(), null, source.may_raise(), Values::Listed(fold.values)))
 }
 
 /// Whether the categories can compare as values.
-fn compatible(left: ScalarType, right: ScalarType) -> bool {
+fn compatible(left: &ScalarType, right: &ScalarType) -> bool {
     if left == right {
         return true;
     }
-    matches!(left, ScalarType::Unknown | ScalarType::UnknownLiteral)
-        || matches!(right, ScalarType::Unknown | ScalarType::UnknownLiteral)
+    left.is_untyped()
+        || right.is_untyped()
         || (left.is_number() && right.is_number())
         || (left.is_text() && right.is_text())
 }
 
 /// Whether the categories compare by value order.
-fn orderable(left: ScalarType, right: ScalarType) -> bool {
+fn orderable(left: &ScalarType, right: &ScalarType) -> bool {
     match (left, right) {
         (ScalarType::Text(left), ScalarType::Text(right)) => left.byte_order && right.byte_order,
         (ScalarType::Date, ScalarType::Date) | (ScalarType::Timestamp, ScalarType::Timestamp) => {
@@ -1646,7 +1644,7 @@ fn apply_length<D: EvalDialect, C: Context>(
         // text of any length.
         return Ok(());
     }
-    if !evaluation.ty().is_text() && evaluation.ty() != ScalarType::UnknownLiteral {
+    if !evaluation.ty().is_text() && *evaluation.ty() != ScalarType::UnknownLiteral {
         // A length only bounds text; anything else cannot satisfy the
         // outcome.
         impossible(state);
@@ -2546,7 +2544,7 @@ mod tests {
             false,
             Values::Unlisted(Unlisted::any()),
         );
-        assert!(super::reinterpreted_as(&any, ScalarType::Numeric).is_none());
+        assert!(super::reinterpreted_as(&any, &ScalarType::Numeric).is_none());
         // A literal the type's input refuses drops out of the membership.
         let literals = Evaluation::new(
             ScalarType::UnknownLiteral,
@@ -2557,7 +2555,7 @@ mod tests {
                 PgValue::Text("abc".to_string()),
             ])),
         );
-        let read = super::reinterpreted_as(&literals, ScalarType::Numeric);
+        let read = super::reinterpreted_as(&literals, &ScalarType::Numeric);
         assert_eq!(
             read.as_ref().and_then(Evaluation::constant),
             Some(&PgValue::Numeric(PgNumeric::from(1)))
@@ -2572,7 +2570,7 @@ mod tests {
                 PgValue::Jsonb(sql_values::postgres::PgJsonb::parse("null").unwrap()),
             ])),
         );
-        let read = super::reinterpreted_as(&mixed, ScalarType::Integer(IntegerType::Integer))
+        let read = super::reinterpreted_as(&mixed, &ScalarType::Integer(IntegerType::Integer))
             .expect("every member casts");
         assert!(read.may_be_null());
         assert_eq!(read.constant_value(), Some(&PgValue::Integer(1)));
@@ -2800,7 +2798,7 @@ mod tests {
     fn a_subquery_condition_reads_any_row_backward() {
         let int4 = ScalarType::Integer(sql_values::postgres::IntegerType::Integer);
         let listed = Evaluation::new(
-            int4,
+            int4.clone(),
             false,
             false,
             Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Integer(2)])),

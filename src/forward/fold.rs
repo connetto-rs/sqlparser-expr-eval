@@ -13,41 +13,48 @@ use super::{
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
         guarantees::Guarantees,
-        scalar::{self, ArrayElement, ScalarType, TextRules},
+        scalar::{self, ArrayElement, EnumType, ScalarType, TextRules},
         support,
     },
     State, forward,
 };
 
 /// The category two operands compare in, with the text rules when both are
-/// text, and the element type when both are arrays.
-pub(crate) enum Category {
+/// text, the enum type when both are the one enum, and the element type
+/// when both are arrays.
+pub(crate) enum Category<'a> {
     Number,
     Boolean,
     Text(TextRules, TextRules),
     Timestamp,
+    Enum(&'a EnumType),
     Array(ScalarType),
 }
 
 /// The comparison category of two resolved operand types.
-pub(crate) fn comparison_category(left: ScalarType, right: ScalarType) -> Option<Category> {
+pub(crate) fn comparison_category<'a>(
+    left: &'a ScalarType,
+    right: &ScalarType,
+) -> Option<Category<'a>> {
     Some(match (left, right) {
         // A float compares against a number: PostgreSQL casts the number to
         // the float.
         (a, b)
-            if (a.is_number() || a == ScalarType::Float)
-                && (b.is_number() || b == ScalarType::Float) =>
+            if (a.is_number() || *a == ScalarType::Float)
+                && (b.is_number() || *b == ScalarType::Float) =>
         {
             Category::Number
         }
         (ScalarType::Boolean, ScalarType::Boolean) => Category::Boolean,
-        (ScalarType::Text(a), ScalarType::Text(b)) => Category::Text(a, b),
+        (ScalarType::Text(a), ScalarType::Text(b)) => Category::Text(*a, *b),
         (ScalarType::Date | ScalarType::Timestamp, ScalarType::Date | ScalarType::Timestamp) => {
             Category::Timestamp
         }
+        // PostgreSQL compares an enum with the same enum alone.
+        (ScalarType::Enum(a), ScalarType::Enum(b)) if a == b => Category::Enum(a),
         // PostgreSQL compares arrays of one element type only, without the
         // implicit casts between the elements.
-        (ScalarType::Array(a), ScalarType::Array(b)) if same_element(a, b) => {
+        (ScalarType::Array(a), ScalarType::Array(b)) if same_element(*a, *b) => {
             Category::Array(a.scalar())
         }
         _ => return None,
@@ -189,7 +196,7 @@ pub(crate) fn standard_comparison(
     }
     let category = if left.ty().is_number() && right.ty().is_number() {
         Some(Category::Number)
-    } else if left.ty() == ScalarType::Boolean && right.ty() == ScalarType::Boolean {
+    } else if *left.ty() == ScalarType::Boolean && *right.ty() == ScalarType::Boolean {
         (matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq)).then_some(Category::Boolean)
     } else {
         None
@@ -208,7 +215,7 @@ pub(crate) fn standard_comparison(
 pub(crate) fn pair_analysis(
     left: &Evaluation,
     right: &Evaluation,
-    category: &Category,
+    category: &Category<'_>,
     op: &BinaryOperator,
 ) -> RowKinds {
     // With no value on a side, no pair of values meets.
@@ -240,18 +247,19 @@ pub(crate) fn pair_analysis(
         Category::Timestamp | Category::Array(_) => {
             value_order_pairs(left.values(), right.values(), op)
         }
+        Category::Enum(enumeration) => enum_pairs(left.values(), right.values(), enumeration, op),
     }
 }
 
 /// An untyped literal re-read as the type that resolved it, the way
 /// PostgreSQL types an untyped literal against its use.
-pub(crate) fn reinterpret_unknown(evaluation: Evaluation, target: ScalarType) -> Evaluation {
-    if evaluation.ty() != ScalarType::UnknownLiteral || target.is_text() {
-        return evaluation.with_type(target);
+pub(crate) fn reinterpret_unknown(evaluation: Evaluation, target: &ScalarType) -> Evaluation {
+    if *evaluation.ty() != ScalarType::UnknownLiteral || target.is_text() {
+        return evaluation.with_type(target.clone());
     }
     if let Values::Listed(listed) = evaluation.values() {
         let fold = scalar::cast_datums(listed, |datum| {
-            scalar::cast(datum, ScalarType::UnknownLiteral, target)
+            scalar::cast(datum, &ScalarType::UnknownLiteral, target)
         });
         let error = evaluation.may_raise() || fold.raises || fold.undecided;
         let values = if fold.undecided {
@@ -259,10 +267,20 @@ pub(crate) fn reinterpret_unknown(evaluation: Evaluation, target: ScalarType) ->
         } else {
             Values::Listed(fold.values)
         };
-        return Evaluation::new(target, evaluation.may_be_null() || fold.null, error, values);
+        return Evaluation::new(
+            target.clone(),
+            evaluation.may_be_null() || fold.null,
+            error,
+            values,
+        );
     }
     // An unlisted literal may hold text the target's input refuses.
-    Evaluation::new(target, evaluation.may_be_null(), true, Values::Unlisted(Unlisted::any()))
+    Evaluation::new(
+        target.clone(),
+        evaluation.may_be_null(),
+        true,
+        Values::Unlisted(Unlisted::any()),
+    )
 }
 
 /// Whether every engine has a comparison between the two sides, an untyped
@@ -275,8 +293,8 @@ fn comparable(left: &Evaluation, right: &Evaluation) -> bool {
             ty => !reinterpret_unknown(literal.clone(), ty).may_raise(),
         }
     };
-    let number = |ty: ScalarType| ty.is_number() || ty == ScalarType::Float;
-    let temporal = |ty: ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
+    let number = |ty: &ScalarType| ty.is_number() || *ty == ScalarType::Float;
+    let temporal = |ty: &ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
     let (l, r) = (left.ty(), right.ty());
     match (l, r) {
         (ScalarType::UnknownLiteral, _) => reads_as(left, right),
@@ -290,10 +308,11 @@ fn comparable(left: &Evaluation, right: &Evaluation) -> bool {
                     (ScalarType::Text(_), ScalarType::Text(_))
                         | (ScalarType::Boolean, ScalarType::Boolean)
                 )
+                || matches!((l, r), (ScalarType::Enum(a), ScalarType::Enum(b)) if a == b)
                 || matches!(
                     (l, r),
                     (ScalarType::Array(a), ScalarType::Array(b))
-                        if same_element(a, b) && !a.is_text()
+                        if same_element(*a, *b) && !a.is_text()
                 )
         }
     }
@@ -591,21 +610,43 @@ fn value_order_pairs(left: &Values, right: &Values, op: &BinaryOperator) -> RowK
     let (Values::Listed(l), Values::Listed(r)) = (left, right) else {
         return RowKinds::ANY;
     };
-    let satisfies: Option<fn(&PgValue, &PgValue) -> bool> = match op {
-        BinaryOperator::Eq => Some(|a, b| a == b),
-        BinaryOperator::NotEq => Some(|a, b| a != b),
-        BinaryOperator::Lt => Some(|a, b| a < b),
-        BinaryOperator::LtEq => Some(|a, b| a <= b),
-        BinaryOperator::Gt => Some(|a, b| a > b),
-        BinaryOperator::GtEq => Some(|a, b| a >= b),
-        _ => None,
-    };
-    let Some(satisfies) = satisfies else {
-        return RowKinds::ANY;
-    };
     // A date compares with a timestamp as `date_cmp_timestamp` does, which
     // the value order follows.
-    pair_certainties(l.iter(), &r.iter(), |a, b| {
+    ordered_pairs(l.iter(), &r.iter(), op)
+}
+
+/// The kinds of answer a left label of `enumeration` may give against the
+/// right ones under `op`, whose operators follow the declaration order.
+fn enum_pairs(
+    left: &Values,
+    right: &Values,
+    enumeration: &EnumType,
+    op: &BinaryOperator,
+) -> RowKinds {
+    let (Values::Listed(l), Values::Listed(r)) = (left, right) else {
+        return RowKinds::ANY;
+    };
+    let position = |value: &PgValue| value.as_text().and_then(|label| enumeration.position(label));
+    ordered_pairs(l.iter().filter_map(position), &r.iter().filter_map(position), op)
+}
+
+/// The kinds of answer a left key may give against the right keys under
+/// `op`, compared in the keys' order.
+fn ordered_pairs<T: Ord>(
+    lefts: impl Iterator<Item = T>,
+    rights: &(impl Iterator<Item = T> + Clone),
+    op: &BinaryOperator,
+) -> RowKinds {
+    let satisfies: fn(&T, &T) -> bool = match op {
+        BinaryOperator::Eq => |a, b| a == b,
+        BinaryOperator::NotEq => |a, b| a != b,
+        BinaryOperator::Lt => |a, b| a < b,
+        BinaryOperator::LtEq => |a, b| a <= b,
+        BinaryOperator::Gt => |a, b| a > b,
+        BinaryOperator::GtEq => |a, b| a >= b,
+        _ => return RowKinds::ANY,
+    };
+    pair_certainties(lefts, rights, |a, b| {
         let satisfies = satisfies(a, b);
         (satisfies, !satisfies)
     })
@@ -948,7 +989,7 @@ pub(super) fn unary<D: EvalDialect, C: Context>(
                 return Ok(inner);
             }
             Ok(Evaluation::new(
-                inner.ty(),
+                inner.ty().clone(),
                 inner.may_be_null(),
                 inner.may_raise() || support::sign_may_raise(&inner),
                 Values::Unlisted(Unlisted::any()),
@@ -1042,7 +1083,7 @@ fn concat_combine<D: EvalDialect, C: Context>(
     // An untyped `NULL` takes the text side `||` needs.
     let is_text = |evaluation: &Evaluation| {
         evaluation.ty().is_text()
-            || evaluation.ty() == ScalarType::UnknownLiteral
+            || *evaluation.ty() == ScalarType::UnknownLiteral
             || evaluation.is_untyped_null()
     };
     if !is_text(left) && !is_text(right) {
@@ -1088,17 +1129,13 @@ fn arithmetic_combine<D: EvalDialect, C: Context>(
 }
 
 /// The type a numeric binary operator resolves to.
-pub(crate) fn arithmetic_type(left: ScalarType, right: ScalarType) -> ScalarType {
+pub(crate) fn arithmetic_type(left: &ScalarType, right: &ScalarType) -> ScalarType {
     match (left, right) {
-        (a, b) if a.is_number() && b.is_number() => {
-            match (a, b) {
-                (ScalarType::Integer(a), ScalarType::Integer(b)) => ScalarType::Integer(a.wider(b)),
-                _ => ScalarType::Numeric,
-            }
-        }
-        (a, ScalarType::UnknownLiteral) if a.is_number() => a,
-        (ScalarType::UnknownLiteral, b) if b.is_number() => b,
-        (a, b) if a == ScalarType::Float || b == ScalarType::Float => ScalarType::Float,
+        (ScalarType::Integer(a), ScalarType::Integer(b)) => ScalarType::Integer(a.wider(*b)),
+        (a, b) if a.is_number() && b.is_number() => ScalarType::Numeric,
+        (a, ScalarType::UnknownLiteral) if a.is_number() => a.clone(),
+        (ScalarType::UnknownLiteral, b) if b.is_number() => b.clone(),
+        (a, b) if *a == ScalarType::Float || *b == ScalarType::Float => ScalarType::Float,
         _ => ScalarType::Unknown,
     }
 }
@@ -1107,21 +1144,20 @@ pub(crate) fn arithmetic_type(left: ScalarType, right: ScalarType) -> ScalarType
 /// other operand, or to the default `int4` when both are untyped, the way
 /// PostgreSQL types them.
 fn arithmetic_sides(left: Evaluation, right: Evaluation) -> (Evaluation, Evaluation) {
-    let left_ty = left.ty();
-    let right_ty = right.ty();
-    match (left_ty, right_ty) {
+    match (left.ty(), right.ty()) {
         (ScalarType::UnknownLiteral, right_ty) if right_ty.is_number() => {
             (reinterpret_unknown(left, right_ty), right)
         }
         (left_ty, ScalarType::UnknownLiteral) if left_ty.is_number() => {
-            (left, reinterpret_unknown(right, left_ty))
+            let right = reinterpret_unknown(right, left_ty);
+            (left, right)
         }
         // An engine may find no unique operator for two untyped literals.
         (ScalarType::UnknownLiteral, ScalarType::UnknownLiteral) => {
             let integer = ScalarType::Integer(sql_values::postgres::IntegerType::Integer);
             (
-                reinterpret_unknown(left, integer).with_error(true),
-                reinterpret_unknown(right, integer),
+                reinterpret_unknown(left, &integer).with_error(true),
+                reinterpret_unknown(right, &integer),
             )
         }
         _ => (left, right),
@@ -1173,7 +1209,7 @@ fn negate<D: EvalDialect, C: Context>(
         return Ok(Evaluation::known(value, ty));
     }
     let inner = forward(state, expr)?;
-    let ty = inner.ty();
+    let ty = inner.ty().clone();
     if !ty.is_number() {
         // A `float` negates to a `float` the reading does not fold.
         let negated = if ty == ScalarType::Float { ty } else { ScalarType::Unknown };
@@ -1624,7 +1660,7 @@ mod tests {
             &Guarantees::new(),
         )
         .expect("resolves");
-        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert_eq!(*result.ty(), ScalarType::Unknown);
         assert!(matches!(result.values(), Values::Unlisted(_)));
         assert!(result.may_be_null() && result.may_raise());
     }
@@ -1669,7 +1705,7 @@ mod tests {
             Values::Unlisted(Unlisted::any()),
         );
         let result = read(ColumnContext::new().with_column("s", s), "+s");
-        assert_eq!(result.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert_eq!(*result.ty(), ScalarType::Text(TextRules::DEFAULT));
         assert!(matches!(result.values(), Values::Unlisted(_)));
     }
 
@@ -1690,7 +1726,7 @@ mod tests {
             &Guarantees::new(),
         )
         .expect("resolves");
-        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert_eq!(*result.ty(), ScalarType::Unknown);
         assert!(result.may_be_null() && result.may_raise());
     }
 
@@ -1770,7 +1806,7 @@ mod tests {
         assert_eq!(unlisted.numbers.high, Bound::Included(PgNumeric::from(-1)));
         // a non-number negates to an unknown type
         let result = read(ColumnContext::new().with_column("s", text_unlisted()), "-s");
-        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert_eq!(*result.ty(), ScalarType::Unknown);
         assert!(matches!(result.values(), Values::Unlisted(_)));
     }
 
@@ -1904,23 +1940,23 @@ mod tests {
         let int2 = ScalarType::Integer(IntegerType::Smallint);
         let int4 = ScalarType::Integer(IntegerType::Integer);
         let int8 = ScalarType::Integer(IntegerType::Bigint);
-        assert_eq!(arithmetic_type(int2, int4), int4);
-        assert_eq!(arithmetic_type(int4, int8), int8);
-        assert_eq!(arithmetic_type(int4, ScalarType::Numeric), ScalarType::Numeric);
-        assert_eq!(arithmetic_type(ScalarType::Float, int4), ScalarType::Float);
-        assert_eq!(arithmetic_type(int4, ScalarType::UnknownLiteral), int4);
+        assert_eq!(arithmetic_type(&int2, &int4), int4.clone());
+        assert_eq!(arithmetic_type(&int4, &int8), int8);
+        assert_eq!(arithmetic_type(&int4, &ScalarType::Numeric), ScalarType::Numeric);
+        assert_eq!(arithmetic_type(&ScalarType::Float, &int4), ScalarType::Float);
+        assert_eq!(arithmetic_type(&int4, &ScalarType::UnknownLiteral), int4.clone());
         assert_eq!(
-            arithmetic_type(ScalarType::UnknownLiteral, ScalarType::Numeric),
+            arithmetic_type(&ScalarType::UnknownLiteral, &ScalarType::Numeric),
             ScalarType::Numeric,
         );
         assert_eq!(
-            arithmetic_type(ScalarType::Text(TextRules::DEFAULT), int4),
+            arithmetic_type(&ScalarType::Text(TextRules::DEFAULT), &int4),
             ScalarType::Unknown,
         );
         let result = read(ColumnContext::new().with_column("s", text_unlisted()), "s + 1");
         // PostgreSQL has no `+` for a text and an integer, so the pair
         // raises.
-        assert_eq!(result.ty(), ScalarType::Unknown);
+        assert_eq!(*result.ty(), ScalarType::Unknown);
         assert!(result.may_raise());
         let result = read(
             ColumnContext::new().with_column(
@@ -1929,7 +1965,7 @@ mod tests {
             ),
             "f + 1",
         );
-        assert_eq!(result.ty(), ScalarType::Float);
+        assert_eq!(*result.ty(), ScalarType::Float);
         assert!(matches!(result.values(), Values::Unlisted(_)));
     }
 
@@ -2139,7 +2175,7 @@ mod tests {
     fn an_unknown_literal_a_setting_decides_stays_open() {
         let literal =
             Evaluation::known(PgValue::Text("13/01/2026".to_string()), ScalarType::UnknownLiteral);
-        let resolved = super::reinterpret_unknown(literal, ScalarType::Date);
+        let resolved = super::reinterpret_unknown(literal, &ScalarType::Date);
         assert!(matches!(resolved.values(), Values::Unlisted(_)));
         assert!(resolved.may_raise());
     }
@@ -2151,14 +2187,14 @@ mod tests {
         let int4 = ScalarType::Integer(IntegerType::Integer);
         let int8 = ScalarType::Integer(IntegerType::Bigint);
         let minimum = read(ColumnContext::new(), "-2147483648");
-        assert_eq!(minimum.ty(), int4);
+        assert_eq!(*minimum.ty(), int4);
         assert_eq!(minimum.constant(), Some(&PgValue::Integer(-2_147_483_648)));
-        assert_eq!(read(ColumnContext::new(), "-2147483648 + 1").ty(), int4);
+        assert_eq!(*read(ColumnContext::new(), "-2147483648 + 1").ty(), int4);
         // A double minus lifts the constant back past `integer`.
         let lifted = read(ColumnContext::new(), "- -2147483648");
-        assert_eq!(lifted.ty(), int8);
+        assert_eq!(*lifted.ty(), int8);
         assert!(!lifted.may_raise());
-        assert_eq!(read(ColumnContext::new(), "-(1.5)").ty(), ScalarType::Numeric);
+        assert_eq!(*read(ColumnContext::new(), "-(1.5)").ty(), ScalarType::Numeric);
     }
 
     /// One untyped literal the target cannot read raises on its own rows,
@@ -2175,7 +2211,7 @@ mod tests {
             ])),
         );
         let resolved =
-            super::reinterpret_unknown(literals, ScalarType::Integer(IntegerType::Integer));
+            super::reinterpret_unknown(literals, &ScalarType::Integer(IntegerType::Integer));
         assert!(resolved.may_raise());
         assert_eq!(resolved.values(), &Values::Listed(BTreeSet::from([PgValue::Integer(5)])));
     }
@@ -2223,7 +2259,7 @@ mod tests {
             &Guarantees::new(),
         )
         .expect("the context resolves");
-        assert_eq!(negated.ty(), ScalarType::Float);
+        assert_eq!(*negated.ty(), ScalarType::Float);
         assert!(read("1 || NULL::int").may_raise());
         assert!(!read("NULL || 'a'").may_raise());
     }

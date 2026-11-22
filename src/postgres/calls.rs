@@ -23,11 +23,11 @@ pub(super) fn name_recognised(
     }
     let first = argument_evaluations.first()?;
     let Some((resolved, unsure)) = resolved_type(argument_evaluations) else {
-        return Some(Evaluation::raising(first.ty()));
+        return Some(Evaluation::raising(first.ty().clone()));
     };
     // `NULLIF` compares through `=`, which PostgreSQL has between a `date`
     // and a `timestamp`, so a `date` left argument keeps its type.
-    let ty = if name == "nullif" && first.ty() == ScalarType::Date {
+    let ty = if name == "nullif" && *first.ty() == ScalarType::Date {
         ScalarType::Date
     } else {
         resolved
@@ -35,10 +35,10 @@ pub(super) fn name_recognised(
     // Every argument is read as the resolved type, and an untyped literal
     // its input function cannot read raises the whole call.
     let coerced: Vec<Evaluation>;
-    let arguments = if argument_evaluations.iter().any(|argument| converts(argument, ty)) {
-        coerced = argument_evaluations.iter().map(|argument| coerce(argument, ty)).collect();
+    let arguments = if argument_evaluations.iter().any(|argument| converts(argument, &ty)) {
+        coerced = argument_evaluations.iter().map(|argument| coerce(argument, &ty)).collect();
         let unreadable = argument_evaluations.iter().zip(&coerced).any(|(argument, coerced)| {
-            argument.ty() == ScalarType::UnknownLiteral && coerced.always_raises()
+            *argument.ty() == ScalarType::UnknownLiteral && coerced.always_raises()
         });
         if unreadable {
             return Some(Evaluation::raising(ty));
@@ -83,26 +83,26 @@ pub(super) fn value_function(name: &str, arguments: &[Evaluation]) -> Option<Eva
 }
 
 /// Whether reading the argument as `ty` changes it.
-fn converts(argument: &Evaluation, ty: ScalarType) -> bool {
+fn converts(argument: &Evaluation, ty: &ScalarType) -> bool {
     match argument.ty() {
-        ScalarType::UnknownLiteral => ty != ScalarType::UnknownLiteral,
-        ScalarType::Date => ty == ScalarType::Timestamp,
-        ScalarType::Integer(_) | ScalarType::Numeric => ty == ScalarType::Float,
+        ScalarType::UnknownLiteral => *ty != ScalarType::UnknownLiteral,
+        ScalarType::Date => *ty == ScalarType::Timestamp,
+        ScalarType::Integer(_) | ScalarType::Numeric => *ty == ScalarType::Float,
         _ => false,
     }
 }
 
 /// The argument read as `ty`.
-fn coerce(argument: &Evaluation, ty: ScalarType) -> Evaluation {
+fn coerce(argument: &Evaluation, ty: &ScalarType) -> Evaluation {
     match argument.ty() {
         ScalarType::UnknownLiteral => reinterpret_unknown(argument.clone(), ty),
-        ScalarType::Date if ty == ScalarType::Timestamp => date_as_timestamp(argument),
+        ScalarType::Date if *ty == ScalarType::Timestamp => date_as_timestamp(argument),
         // An integer always fits a `float`, a `numeric` may lie past its range.
-        from @ (ScalarType::Integer(_) | ScalarType::Numeric) if ty == ScalarType::Float => {
+        from @ (ScalarType::Integer(_) | ScalarType::Numeric) if *ty == ScalarType::Float => {
             Evaluation::new(
-                ty,
+                ty.clone(),
                 argument.may_be_null(),
-                argument.may_raise() || from == ScalarType::Numeric,
+                argument.may_raise() || *from == ScalarType::Numeric,
                 Values::Unlisted(Unlisted::any()),
             )
         }
@@ -135,44 +135,44 @@ fn resolved_type(argument_evaluations: &[Evaluation]) -> Option<(ScalarType, boo
     let mut resolved: Option<ScalarType> = None;
     let mut unsure = false;
     for evaluation in argument_evaluations {
-        let ty = evaluation.ty();
         // An untyped literal and an untyped `NULL` take the resolved type.
         if evaluation.is_untyped() {
             continue;
         }
-        let Some(current) = resolved else {
-            resolved = Some(ty);
-            continue;
-        };
-        let (joined, may_raise) = common_type(current, ty)?;
-        resolved = Some(joined);
-        unsure |= may_raise;
+        resolved = Some(match resolved {
+            None => evaluation.ty().clone(),
+            Some(current) => {
+                let (joined, may_raise) = common_type(&current, evaluation.ty())?;
+                unsure |= may_raise;
+                joined
+            }
+        });
     }
     Some((resolved.unwrap_or(ScalarType::Text(TextRules::DEFAULT)), unsure))
 }
 
 /// The type two argument types meet at and whether reading both as it may
 /// raise, `None` for two type categories PostgreSQL never matches.
-fn common_type(current: ScalarType, ty: ScalarType) -> Option<(ScalarType, bool)> {
-    let number = |t: ScalarType| t.is_number() || t == ScalarType::Float;
-    let temporal = |t: ScalarType| matches!(t, ScalarType::Date | ScalarType::Timestamp);
+fn common_type(current: &ScalarType, ty: &ScalarType) -> Option<(ScalarType, bool)> {
+    let number = |t: &ScalarType| t.is_number() || *t == ScalarType::Float;
+    let temporal = |t: &ScalarType| matches!(t, ScalarType::Date | ScalarType::Timestamp);
     Some(match (current, ty) {
         _ if current.is_unmodelled() || ty.is_unmodelled() => (ScalarType::Other, true),
-        _ if current == ty => (current, false),
+        _ if current == ty => (current.clone(), false),
         // Two implicit collations leave the comparison's collation undecided.
         (ScalarType::Text(_), ScalarType::Text(_)) => (ScalarType::Text(TextRules::UNKNOWN), true),
         (ScalarType::Integer(a), ScalarType::Integer(b)) => {
-            (ScalarType::Integer(a.wider(b)), false)
+            (ScalarType::Integer(a.wider(*b)), false)
         }
         _ if number(current) && number(ty) => {
-            let float = current == ScalarType::Float || ty == ScalarType::Float;
+            let float = *current == ScalarType::Float || *ty == ScalarType::Float;
             (if float { ScalarType::Float } else { ScalarType::Numeric }, false)
         }
         _ if temporal(current) && temporal(ty) => (ScalarType::Timestamp, false),
         // Arrays meet at the array of their elements' common type.
         (ScalarType::Array(a), ScalarType::Array(b)) => {
-            let (joined, may_raise) = common_type(a.scalar(), b.scalar())?;
-            (ScalarType::Array(ArrayElement::of(joined)), may_raise)
+            let (joined, may_raise) = common_type(&a.scalar(), &b.scalar())?;
+            (ScalarType::Array(ArrayElement::of(&joined)), may_raise)
         }
         _ => return None,
     })
@@ -265,7 +265,8 @@ fn extremum(
 fn values_hull<'a>(evaluations: impl Iterator<Item = &'a Evaluation>) -> Values {
     let mut hull: Option<Evaluation> = None;
     for evaluation in evaluations {
-        let candidate = Evaluation::new(evaluation.ty(), false, false, evaluation.values().clone());
+        let candidate =
+            Evaluation::new(evaluation.ty().clone(), false, false, evaluation.values().clone());
         hull = Some(match hull {
             Some(hull) => hull.join(&candidate),
             None => candidate,
@@ -352,8 +353,9 @@ mod tests {
     #[test]
     fn coalesce_over_only_nullable_arguments_may_be_null() {
         let ty = ScalarType::Integer(IntegerType::Integer);
-        let evaluation = super::name_recognised("coalesce", &[column(ty), column(ty)], false)
-            .expect("the call resolves");
+        let evaluation =
+            super::name_recognised("coalesce", &[column(ty.clone()), column(ty)], false)
+                .expect("the call resolves");
         assert!(evaluation.may_be_null());
     }
 
@@ -362,7 +364,7 @@ mod tests {
     fn coalesce_of_date_and_timestamp_resolves_to_timestamp() {
         let evaluation = super::name_recognised("coalesce", &[date(), timestamp()], false)
             .expect("the call resolves");
-        assert_eq!(evaluation.ty(), ScalarType::Timestamp);
+        assert_eq!(*evaluation.ty(), ScalarType::Timestamp);
     }
 
     /// Untyped literals alone resolve to `text`.
@@ -373,7 +375,7 @@ mod tests {
         };
         let call = super::name_recognised("coalesce", &[literal("t"), literal("f")], false)
             .expect("resolves");
-        assert_eq!(call.ty(), ScalarType::Text(TextRules::DEFAULT));
+        assert_eq!(*call.ty(), ScalarType::Text(TextRules::DEFAULT));
     }
 
     /// A call outside the four constructs is left to its callees, whatever its
@@ -417,11 +419,11 @@ mod tests {
         let call =
             super::name_recognised("coalesce", &[null_int, column(ScalarType::Float)], false)
                 .expect("resolves");
-        assert_eq!(call.ty(), ScalarType::Float);
+        assert_eq!(*call.ty(), ScalarType::Float);
         assert!(call.may_be(&PgValue::Numeric(PgNumeric::parse("2.5").expect("a number"))));
         let call = super::name_recognised("greatest", &[int(5), column(ScalarType::Float)], false)
             .expect("resolves");
-        assert_eq!(call.ty(), ScalarType::Float);
+        assert_eq!(*call.ty(), ScalarType::Float);
         assert!(!call.may_raise());
         // A `numeric` past the `float` range raises reading as `float`.
         let call = super::name_recognised("least", &[num("1.5"), column(ScalarType::Float)], false)
@@ -436,7 +438,7 @@ mod tests {
             Evaluation::known(PgValue::Integer(1), ScalarType::Integer(IntegerType::Smallint));
         let big = Evaluation::known(PgValue::Integer(2), ScalarType::Integer(IntegerType::Bigint));
         let call = super::name_recognised("greatest", &[small, big], false).expect("resolves");
-        assert_eq!(call.ty(), ScalarType::Integer(IntegerType::Bigint));
+        assert_eq!(*call.ty(), ScalarType::Integer(IntegerType::Bigint));
         assert_eq!(call.constant(), Some(&PgValue::Integer(2)));
     }
 
@@ -447,7 +449,7 @@ mod tests {
         let bytewise = column(ScalarType::Text(TextRules::C));
         let call =
             super::name_recognised("greatest", &[default, bytewise], false).expect("resolves");
-        assert_eq!(call.ty(), ScalarType::Text(TextRules::UNKNOWN));
+        assert_eq!(*call.ty(), ScalarType::Text(TextRules::UNKNOWN));
         assert!(call.may_raise());
     }
 
@@ -456,7 +458,7 @@ mod tests {
     fn coalesce_of_numeric_and_integer_resolves_to_numeric() {
         let evaluation = super::name_recognised("coalesce", &[num("1.5"), int(5)], false)
             .expect("the call resolves");
-        assert_eq!(evaluation.ty(), ScalarType::Numeric);
+        assert_eq!(*evaluation.ty(), ScalarType::Numeric);
     }
 
     /// `COALESCE`, `GREATEST` and `LEAST` read a `date` argument as the
@@ -484,7 +486,7 @@ mod tests {
     fn nullif_of_a_date_and_a_timestamp_keeps_the_date() {
         let evaluation = super::name_recognised("nullif", &[date(), timestamp()], false)
             .expect("the call resolves");
-        assert_eq!(evaluation.ty(), ScalarType::Date);
+        assert_eq!(*evaluation.ty(), ScalarType::Date);
     }
 
     /// `NULLIF` with two unequal constants is the left value.
@@ -511,7 +513,7 @@ mod tests {
         )
         .expect("the call resolves");
         assert!(evaluation.may_be_null());
-        assert_eq!(evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*evaluation.ty(), ScalarType::Integer(IntegerType::Integer));
     }
 
     /// `GREATEST` and `LEAST` of constants give the extremum.
@@ -597,7 +599,7 @@ mod tests {
         assert_eq!(unequal.constant(), Some(&PgValue::Integer(5)));
         let first = super::name_recognised("coalesce", &[literal("5"), num("6.5")], false)
             .expect("the call resolves");
-        assert_eq!(first.ty(), ScalarType::Numeric);
+        assert_eq!(*first.ty(), ScalarType::Numeric);
         assert_eq!(first.constant(), Some(&PgValue::Integer(5)));
         let greatest = super::name_recognised("greatest", &[literal("3"), int(5)], false)
             .expect("the call resolves");
@@ -610,7 +612,7 @@ mod tests {
     fn coalesce_stops_at_an_argument_that_cannot_be_null() {
         let int4 = ScalarType::Integer(IntegerType::Integer);
         let never_null = Evaluation::new(
-            int4,
+            int4.clone(),
             false,
             false,
             Values::Listed([PgValue::Integer(1), PgValue::Integer(2)].into()),

@@ -425,8 +425,8 @@ impl Evaluation {
 
     /// The type of the values.
     #[must_use]
-    pub fn ty(&self) -> ScalarType {
-        self.ty
+    pub fn ty(&self) -> &ScalarType {
+        &self.ty
     }
 
     /// The non-`NULL` values it may take.
@@ -578,13 +578,9 @@ impl Evaluation {
     /// The outcomes both evaluations allow.
     #[must_use]
     pub fn meet(&self, other: &Self) -> Self {
-        let ty = if matches!(self.ty, ScalarType::Unknown | ScalarType::UnknownLiteral) {
-            other.ty
-        } else {
-            self.ty
-        };
+        let ty = if self.ty.is_untyped() { &other.ty } else { &self.ty };
         Self::new(
-            ty,
+            ty.clone(),
             self.null && other.null,
             self.error && other.error,
             self.values.meet(&other.values),
@@ -594,11 +590,10 @@ impl Evaluation {
     /// The outcomes either evaluation allows.
     #[must_use]
     pub fn join(&self, other: &Self) -> Self {
-        let unknown = |ty| matches!(ty, ScalarType::Unknown | ScalarType::UnknownLiteral);
-        let ty = if self.ty == other.ty || unknown(other.ty) {
-            self.ty
-        } else if unknown(self.ty) {
-            other.ty
+        let ty = if self.ty == other.ty || other.ty.is_untyped() {
+            self.ty.clone()
+        } else if self.ty.is_untyped() {
+            other.ty.clone()
         } else {
             ScalarType::Other
         };
@@ -624,12 +619,21 @@ impl Evaluation {
         if unlisted.length.low == Bound::Unbounded {
             unlisted.length.low = Bound::Included(0);
         }
-        match self.ty {
+        match &self.ty {
             ScalarType::Boolean => {
                 let listed = [false, true]
                     .into_iter()
                     .map(PgValue::Boolean)
                     .filter(|value| !unlisted.excluded.contains(value))
+                    .collect();
+                self.values = Values::Listed(listed);
+            }
+            ScalarType::Enum(enumeration) if enumeration.labels().len() <= LISTED_LIMIT => {
+                let listed = enumeration
+                    .labels()
+                    .iter()
+                    .map(|label| PgValue::Text(label.clone()))
+                    .filter(|value| unlisted.admits(value))
                     .collect();
                 self.values = Values::Listed(listed);
             }
@@ -690,7 +694,7 @@ impl Evaluation {
     /// Drops the listed values the type cannot hold, as a type resolution
     /// such as a `meet` against a subject's type may leave them behind.
     fn drop_values_outside_type(&mut self) {
-        let ty = self.ty;
+        let ty = &self.ty;
         let Values::Listed(listed) = &self.values else {
             return;
         };
@@ -700,6 +704,9 @@ impl Evaluation {
                 | ScalarType::UnknownLiteral
                 | ScalarType::Float
                 | ScalarType::Other => true,
+                ScalarType::Enum(enumeration) => {
+                    matches!(value, PgValue::Text(label) if enumeration.position(label).is_some())
+                }
                 ScalarType::Boolean => matches!(value, PgValue::Boolean(_)),
                 ScalarType::Integer(target) => {
                     match value {
@@ -844,7 +851,7 @@ mod tests {
             }),
         );
         let joined = listed.join(&narrow);
-        assert_eq!(joined.ty(), ScalarType::Numeric);
+        assert_eq!(*joined.ty(), ScalarType::Numeric);
         assert_eq!(
             joined.values(),
             &Values::Unlisted(Unlisted {
@@ -861,14 +868,14 @@ mod tests {
             PgValue::Integer(1),
             ScalarType::Integer(IntegerType::Integer),
         ));
-        assert_eq!(typed.ty(), ScalarType::Integer(IntegerType::Integer));
+        assert_eq!(*typed.ty(), ScalarType::Integer(IntegerType::Integer));
         // Two unrelated types join to `Other`
         let mixed = Evaluation::known(
             PgValue::Text(alloc::string::String::from("a")),
             ScalarType::Text(TextRules::DEFAULT),
         )
         .join(&Evaluation::known(PgValue::Integer(1), ScalarType::Integer(IntegerType::Integer)));
-        assert_eq!(mixed.ty(), ScalarType::Other);
+        assert_eq!(*mixed.ty(), ScalarType::Other);
     }
 
     #[test]
@@ -924,7 +931,7 @@ mod tests {
         let int4 = ScalarType::Integer(IntegerType::Integer);
         // A small interval enumerates its members, honouring exclusions
         let evaluation = Evaluation::new(
-            int4,
+            int4.clone(),
             false,
             false,
             Values::Unlisted(Unlisted {
@@ -1008,7 +1015,7 @@ mod tests {
         };
         // Only the empty string fits
         let evaluation = Evaluation::new(
-            text,
+            text.clone(),
             false,
             false,
             Values::Unlisted(length(Bound::Included(0), Bound::Included(0))),
@@ -1020,7 +1027,7 @@ mod tests {
         // An excluded empty string leaves no value
         let mut excluded = length(Bound::Included(0), Bound::Included(0));
         excluded.excluded.insert(PgValue::Text(alloc::string::String::new()));
-        let evaluation = Evaluation::new(text, false, false, Values::Unlisted(excluded));
+        let evaluation = Evaluation::new(text.clone(), false, false, Values::Unlisted(excluded));
         assert!(evaluation.values().is_empty());
         // An interval still admitting one character stays unlisted
         let evaluation = Evaluation::new(

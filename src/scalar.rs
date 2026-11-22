@@ -1,7 +1,12 @@
 //! The scalar types the evaluator reads an expression as, and the casts and
 //! literal typing it folds [`PgValue`]s with.
 
-use alloc::{collections::BTreeSet, string::ToString};
+use alloc::{
+    collections::BTreeSet,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 use sql_values::postgres::{
     CastError, CastTarget, CastValue, IntegerType, PgArray, PgNumeric, PgValue, cast_value,
@@ -114,8 +119,48 @@ pub enum Collation {
     Unknown,
 }
 
+/// A PostgreSQL enum type, its name and its labels in declaration order.
+///
+/// Two enum types are the same type only when both name and labels agree,
+/// so two enums declaring the same labels stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EnumType {
+    name: String,
+    labels: Vec<String>,
+}
+
+impl EnumType {
+    /// The enum type `name` with `labels` in declaration order.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        labels: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self { name: name.into(), labels: labels.into_iter().map(Into::into).collect() }
+    }
+
+    /// The name the context identifies the type by.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The labels in declaration order.
+    #[must_use]
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// The declaration position of `label`, which orders the type's values,
+    /// `None` when the type has no such label.
+    #[must_use]
+    pub fn position(&self, label: &str) -> Option<usize> {
+        self.labels.iter().position(|declared| declared == label)
+    }
+}
+
 /// The scalar type a value or an expression's result carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     /// The type is not known, as for an untyped `NULL`.
     Unknown,
@@ -136,6 +181,9 @@ pub enum ScalarType {
     Date,
     /// `timestamp` without time zone.
     Timestamp,
+    /// A PostgreSQL enum type, whose values are its labels held as
+    /// [`PgValue::Text`] and ordered by declaration.
+    Enum(Arc<EnumType>),
     /// Any other known type whose values are not modelled.
     Other,
     /// An array of the element type, of any number of dimensions.
@@ -168,21 +216,22 @@ pub enum ArrayElement {
 
 impl ArrayElement {
     /// The element type of an array of `ty`, the element of an array being
-    /// its own element and an untyped literal being `text`.
+    /// its own element, an untyped literal being `text`, and an enum, whose
+    /// arrays the evaluator does not model, being `Other`.
     #[must_use]
-    pub fn of(ty: ScalarType) -> Self {
+    pub fn of(ty: &ScalarType) -> Self {
         match ty {
             ScalarType::Unknown => ArrayElement::Unknown,
             ScalarType::UnknownLiteral => ArrayElement::Text(TextRules::DEFAULT),
             ScalarType::Boolean => ArrayElement::Boolean,
-            ScalarType::Integer(integer) => ArrayElement::Integer(integer),
+            ScalarType::Integer(integer) => ArrayElement::Integer(*integer),
             ScalarType::Numeric => ArrayElement::Numeric,
             ScalarType::Float => ArrayElement::Float,
-            ScalarType::Text(rules) => ArrayElement::Text(rules),
+            ScalarType::Text(rules) => ArrayElement::Text(*rules),
             ScalarType::Date => ArrayElement::Date,
             ScalarType::Timestamp => ArrayElement::Timestamp,
-            ScalarType::Other => ArrayElement::Other,
-            ScalarType::Array(element) => element,
+            ScalarType::Enum(_) | ScalarType::Other => ArrayElement::Other,
+            ScalarType::Array(element) => *element,
         }
     }
 
@@ -239,7 +288,7 @@ impl ScalarType {
             }
             DataType::Array(definition) => {
                 match array_element(definition) {
-                    Some(element) => ScalarType::Array(ArrayElement::of(ScalarType::of(element))),
+                    Some(element) => ScalarType::Array(ArrayElement::of(&ScalarType::of(element))),
                     None => ScalarType::Other,
                 }
             }
@@ -249,7 +298,7 @@ impl ScalarType {
 
     /// The element type of an array type.
     #[must_use]
-    pub fn element(self) -> Option<ScalarType> {
+    pub fn element(&self) -> Option<ScalarType> {
         match self {
             ScalarType::Array(element) => Some(element.scalar()),
             _ => None,
@@ -258,39 +307,46 @@ impl ScalarType {
 
     /// Whether the type is an array type.
     #[must_use]
-    pub fn is_array(self) -> bool {
+    pub fn is_array(&self) -> bool {
         matches!(self, ScalarType::Array(_))
     }
 
     /// Whether the type is an array of text, which PostgreSQL may have typed
     /// as a `varchar` array it compares with no `text` array.
     #[must_use]
-    pub fn is_text_array(self) -> bool {
+    pub fn is_text_array(&self) -> bool {
         matches!(self, ScalarType::Array(ArrayElement::Text(_)))
     }
 
     /// Whether the type carries no modelled values: the untyped `Unknown` or
     /// a known type the evaluator does not model.
     #[must_use]
-    pub fn is_unmodelled(self) -> bool {
+    pub fn is_unmodelled(&self) -> bool {
         matches!(self, ScalarType::Unknown | ScalarType::Other)
     }
 
     /// Whether the type is a number, an integer or `numeric`.
     #[must_use]
-    pub fn is_number(self) -> bool {
+    pub fn is_number(&self) -> bool {
         matches!(self, ScalarType::Integer(_) | ScalarType::Numeric)
     }
 
     /// Whether the type is a text type.
     #[must_use]
-    pub fn is_text(self) -> bool {
+    pub fn is_text(&self) -> bool {
         matches!(self, ScalarType::Text(_))
+    }
+
+    /// Whether the type is `Unknown` or `UnknownLiteral`, either of which
+    /// reads as the type of its context.
+    #[must_use]
+    pub fn is_untyped(&self) -> bool {
+        matches!(self, ScalarType::Unknown | ScalarType::UnknownLiteral)
     }
 
     /// The inclusive `i64` bounds the type admits, when it is an integer type.
     #[must_use]
-    pub fn integer_bounds(self) -> Option<(i64, i64)> {
+    pub fn integer_bounds(&self) -> Option<(i64, i64)> {
         match self {
             ScalarType::Integer(integer) => Some(integer.range().into_inner()),
             _ => None,
@@ -380,12 +436,15 @@ pub(crate) fn cast_datums(datums: &BTreeSet<PgValue>, cast: impl Fn(&PgValue) ->
 /// Casts `datum` of type `from` to type `to`, following PostgreSQL's casts.
 /// A date or a timestamp prints through `DateStyle`, so its cast to text is
 /// left undecided, as is a cast to a type the evaluator does not model.
-pub(crate) fn cast(datum: &PgValue, from: ScalarType, to: ScalarType) -> Cast {
+pub(crate) fn cast(datum: &PgValue, from: &ScalarType, to: &ScalarType) -> Cast {
     if from == to {
         return Cast::Folded(datum.clone());
     }
+    if let Some(cast) = enum_cast(datum, from, to) {
+        return cast;
+    }
     if let ScalarType::Array(element) = to {
-        return match cast_target(element.scalar()) {
+        return match cast_target(&element.scalar()) {
             Some(target) => array_cast(datum, target),
             None => Cast::Unknown,
         };
@@ -420,9 +479,38 @@ pub(crate) fn cast(datum: &PgValue, from: ScalarType, to: ScalarType) -> Cast {
     }
 }
 
+/// The cast of `datum` from or to an enum type, `None` when neither side is
+/// one. A label reads from text, an untyped literal or an untyped text
+/// constant and prints to text, while PostgreSQL has no cast between an enum
+/// and any other type, another enum included.
+fn enum_cast(datum: &PgValue, from: &ScalarType, to: &ScalarType) -> Option<Cast> {
+    Some(match (from, to) {
+        (
+            ScalarType::Unknown | ScalarType::UnknownLiteral | ScalarType::Text(_),
+            ScalarType::Enum(enumeration),
+        ) => {
+            match datum {
+                PgValue::Text(label) if enumeration.position(label).is_some() => {
+                    Cast::Folded(datum.clone())
+                }
+                PgValue::Text(_) => Cast::Raises,
+                _ => Cast::Unknown,
+            }
+        }
+        (ScalarType::Enum(_), ScalarType::Text(_)) => Cast::Folded(datum.clone()),
+        (ScalarType::Other, ScalarType::Enum(_))
+        | (
+            ScalarType::Enum(_),
+            ScalarType::Unknown | ScalarType::UnknownLiteral | ScalarType::Other,
+        ) => Cast::Unknown,
+        (_, ScalarType::Enum(_)) | (ScalarType::Enum(_), _) => Cast::Raises,
+        _ => return None,
+    })
+}
+
 /// The cast target of a type without a modifier, `None` for a type the
 /// casts do not model.
-pub(crate) fn cast_target(ty: ScalarType) -> Option<CastTarget> {
+pub(crate) fn cast_target(ty: &ScalarType) -> Option<CastTarget> {
     Some(match ty {
         ScalarType::Boolean => CastTarget::Boolean,
         ScalarType::Integer(IntegerType::Smallint) => CastTarget::Smallint,
@@ -435,6 +523,7 @@ pub(crate) fn cast_target(ty: ScalarType) -> Option<CastTarget> {
         ScalarType::Unknown
         | ScalarType::UnknownLiteral
         | ScalarType::Float
+        | ScalarType::Enum(_)
         | ScalarType::Other
         | ScalarType::Array(_) => return None,
     })
@@ -458,12 +547,12 @@ pub(crate) fn array_cast(datum: &PgValue, element: CastTarget) -> Cast {
 /// The `sql-values` value of `datum` read as its type `from`, an integer at
 /// the width its type names, `bigint` when the type names none, and `None`
 /// for an integer past that width, which no value of the type holds.
-fn cast_source(datum: &PgValue, from: ScalarType) -> Option<CastValue> {
+fn cast_source(datum: &PgValue, from: &ScalarType) -> Option<CastValue> {
     let width = match (datum, from) {
         (PgValue::Integer(value), ScalarType::Numeric) => {
             return Some(CastValue::Numeric(PgNumeric::from(*value)));
         }
-        (_, ScalarType::Integer(width)) => width,
+        (_, ScalarType::Integer(width)) => *width,
         _ => IntegerType::Bigint,
     };
     datum.clone().into_cast_value(width).ok()
@@ -523,7 +612,7 @@ mod tests {
         let int8 = ScalarType::Integer(IntegerType::Bigint);
         assert_eq!(
             number_literal("2147483647", false),
-            Some((PgValue::Integer(2_147_483_647), int4))
+            Some((PgValue::Integer(2_147_483_647), int4.clone()))
         );
         assert_eq!(
             number_literal("2147483648", false),
@@ -532,7 +621,7 @@ mod tests {
         // The negation folds into the constant before it is typed.
         assert_eq!(
             number_literal("2147483648", true),
-            Some((PgValue::Integer(-2_147_483_648), int4))
+            Some((PgValue::Integer(-2_147_483_648), int4.clone()))
         );
         assert_eq!(number_literal("0xff", false), Some((PgValue::Integer(255), int4)));
         let (datum, ty) = number_literal("9223372036854775808", false).unwrap();
@@ -553,47 +642,47 @@ mod tests {
         let int8 = ScalarType::Integer(IntegerType::Bigint);
         let text_type = ScalarType::Text(TextRules::DEFAULT);
         // An identity cast keeps the value, and a narrowing cast checks it.
-        assert_eq!(cast(&PgValue::Integer(5), int4, int4), Cast::Folded(PgValue::Integer(5)));
-        assert_eq!(cast(&PgValue::Integer(5), int4, int2), Cast::Folded(PgValue::Integer(5)));
+        assert_eq!(cast(&PgValue::Integer(5), &int4, &int4), Cast::Folded(PgValue::Integer(5)));
+        assert_eq!(cast(&PgValue::Integer(5), &int4, &int2), Cast::Folded(PgValue::Integer(5)));
         // `int4` alone casts to boolean.
         assert_eq!(
-            cast(&PgValue::Integer(1), int4, ScalarType::Boolean),
+            cast(&PgValue::Integer(1), &int4, &ScalarType::Boolean),
             Cast::Folded(PgValue::Boolean(true))
         );
-        assert_eq!(cast(&PgValue::Integer(1), int2, ScalarType::Boolean), Cast::Raises);
-        assert_eq!(cast(&PgValue::Integer(1), int8, ScalarType::Boolean), Cast::Raises);
+        assert_eq!(cast(&PgValue::Integer(1), &int2, &ScalarType::Boolean), Cast::Raises);
+        assert_eq!(cast(&PgValue::Integer(1), &int8, &ScalarType::Boolean), Cast::Raises);
         assert_eq!(
-            cast(&PgValue::Boolean(true), ScalarType::Boolean, int4),
+            cast(&PgValue::Boolean(true), &ScalarType::Boolean, &int4),
             Cast::Folded(PgValue::Integer(1))
         );
-        assert_eq!(cast(&PgValue::Boolean(true), ScalarType::Boolean, int2), Cast::Raises);
-        assert_eq!(cast(&PgValue::Integer(32768), int4, int2), Cast::Raises);
+        assert_eq!(cast(&PgValue::Boolean(true), &ScalarType::Boolean, &int2), Cast::Raises);
+        assert_eq!(cast(&PgValue::Integer(32768), &int4, &int2), Cast::Raises);
         // An integer under a `numeric` type is a `numeric`, which no boolean
         // cast takes.
         assert_eq!(
-            cast(&PgValue::Integer(1), ScalarType::Numeric, ScalarType::Boolean),
+            cast(&PgValue::Integer(1), &ScalarType::Numeric, &ScalarType::Boolean),
             Cast::Raises
         );
         assert_eq!(
-            cast(&PgValue::Numeric(numeric("2.5")), ScalarType::Numeric, int4),
+            cast(&PgValue::Numeric(numeric("2.5")), &ScalarType::Numeric, &int4),
             Cast::Folded(PgValue::Integer(3))
         );
         assert_eq!(
-            cast(&PgValue::Integer(42), int4, ScalarType::Numeric),
+            cast(&PgValue::Integer(42), &int4, &ScalarType::Numeric),
             Cast::Folded(PgValue::Numeric(numeric("42")))
         );
         assert_eq!(
-            cast(&PgValue::Numeric(PgNumeric::NAN), ScalarType::Numeric, int4),
+            cast(&PgValue::Numeric(PgNumeric::NAN), &ScalarType::Numeric, &int4),
             Cast::Raises
         );
-        assert_eq!(cast(&text(" 42 "), text_type, int4), Cast::Folded(PgValue::Integer(42)));
-        assert_eq!(cast(&text("4.2"), text_type, int4), Cast::Raises);
+        assert_eq!(cast(&text(" 42 "), &text_type, &int4), Cast::Folded(PgValue::Integer(42)));
+        assert_eq!(cast(&text("4.2"), &text_type, &int4), Cast::Raises);
         assert_eq!(
-            cast(&text("of"), text_type, ScalarType::Boolean),
+            cast(&text("of"), &text_type, &ScalarType::Boolean),
             Cast::Folded(PgValue::Boolean(false))
         );
         assert_eq!(
-            cast(&text("-inf"), text_type, ScalarType::Numeric),
+            cast(&text("-inf"), &text_type, &ScalarType::Numeric),
             Cast::Folded(PgValue::Numeric(PgNumeric::NEG_INFINITY))
         );
     }
@@ -602,47 +691,47 @@ mod tests {
     fn temporal_casts_fold_unless_a_setting_decides_them() {
         let text_type = ScalarType::Text(TextRules::DEFAULT);
         assert_eq!(
-            cast(&text("Jan 29 2024"), text_type, ScalarType::Date),
+            cast(&text("Jan 29 2024"), &text_type, &ScalarType::Date),
             Cast::Folded(PgValue::Date(date(2024, 1, 29)))
         );
-        assert_eq!(cast(&text("2023-02-29"), text_type, ScalarType::Date), Cast::Raises);
+        assert_eq!(cast(&text("2023-02-29"), &text_type, &ScalarType::Date), Cast::Raises);
         // The `DateStyle` field order decides `01/02/2024`, and the current
         // time decides `today`.
-        assert_eq!(cast(&text("01/02/2024"), text_type, ScalarType::Date), Cast::Unknown);
-        assert_eq!(cast(&text("today"), text_type, ScalarType::Date), Cast::Unknown);
+        assert_eq!(cast(&text("01/02/2024"), &text_type, &ScalarType::Date), Cast::Unknown);
+        assert_eq!(cast(&text("today"), &text_type, &ScalarType::Date), Cast::Unknown);
         assert_eq!(
-            cast(&PgValue::Date(date(2026, 1, 1)), ScalarType::Date, ScalarType::Timestamp),
+            cast(&PgValue::Date(date(2026, 1, 1)), &ScalarType::Date, &ScalarType::Timestamp),
             Cast::Folded(PgValue::Timestamp(midnight(2026, 1, 1)))
         );
         assert_eq!(
-            cast(&PgValue::Date(date(294_277, 1, 1)), ScalarType::Date, ScalarType::Timestamp),
+            cast(&PgValue::Date(date(294_277, 1, 1)), &ScalarType::Date, &ScalarType::Timestamp),
             Cast::Raises
         );
         assert_eq!(
             cast(
                 &PgValue::Timestamp(midnight(2026, 1, 1)),
-                ScalarType::Timestamp,
-                ScalarType::Date
+                &ScalarType::Timestamp,
+                &ScalarType::Date
             ),
             Cast::Folded(PgValue::Date(date(2026, 1, 1)))
         );
         assert_eq!(
-            cast(&PgValue::Date(date(2026, 1, 1)), ScalarType::Date, text_type),
+            cast(&PgValue::Date(date(2026, 1, 1)), &ScalarType::Date, &text_type),
             Cast::Unknown
         );
         assert_eq!(
             cast(
                 &PgValue::Date(date(2026, 1, 1)),
-                ScalarType::Date,
-                ScalarType::Integer(IntegerType::Integer)
+                &ScalarType::Date,
+                &ScalarType::Integer(IntegerType::Integer)
             ),
             Cast::Raises
         );
         assert_eq!(
             cast(
                 &PgValue::Integer(1),
-                ScalarType::Integer(IntegerType::Integer),
-                ScalarType::Float
+                &ScalarType::Integer(IntegerType::Integer),
+                &ScalarType::Float
             ),
             Cast::Unknown
         );
@@ -653,15 +742,15 @@ mod tests {
         let text_type = ScalarType::Text(TextRules::DEFAULT);
         let int8 = ScalarType::Integer(IntegerType::Bigint);
         assert_eq!(
-            cast(&PgValue::Boolean(true), ScalarType::Boolean, text_type),
+            cast(&PgValue::Boolean(true), &ScalarType::Boolean, &text_type),
             Cast::Folded(text("true"))
         );
-        assert_eq!(cast(&PgValue::Integer(42), int8, text_type), Cast::Folded(text("42")));
+        assert_eq!(cast(&PgValue::Integer(42), &int8, &text_type), Cast::Folded(text("42")));
         assert_eq!(
-            cast(&PgValue::Numeric(numeric("1.50")), ScalarType::Numeric, text_type),
+            cast(&PgValue::Numeric(numeric("1.50")), &ScalarType::Numeric, &text_type),
             Cast::Folded(text("1.50"))
         );
-        assert_eq!(cast(&text("42"), text_type, int8), Cast::Folded(PgValue::Integer(42)));
+        assert_eq!(cast(&text("42"), &text_type, &int8), Cast::Folded(PgValue::Integer(42)));
     }
 
     /// A `jsonb` `null` casts to a scalar type as `NULL`, any other `jsonb`
@@ -670,12 +759,18 @@ mod tests {
     fn jsonb_casts_fold_null_to_null() {
         let jsonb = |text: &str| PgValue::Jsonb(PgJsonb::parse(text).unwrap());
         let int4 = ScalarType::Integer(IntegerType::Integer);
-        assert_eq!(cast(&jsonb("null"), ScalarType::Other, int4), Cast::Null);
-        assert_eq!(cast(&jsonb("null"), ScalarType::Other, ScalarType::Boolean), Cast::Null);
-        assert_eq!(cast(&jsonb("42"), ScalarType::Other, int4), Cast::Folded(PgValue::Integer(42)));
-        assert_eq!(cast(&jsonb("true"), ScalarType::Other, int4), Cast::Raises);
+        assert_eq!(cast(&jsonb("null"), &ScalarType::Other, &int4), Cast::Null);
+        assert_eq!(cast(&jsonb("null"), &ScalarType::Other, &ScalarType::Boolean), Cast::Null);
+        assert_eq!(
+            cast(&jsonb("42"), &ScalarType::Other, &int4),
+            Cast::Folded(PgValue::Integer(42))
+        );
+        assert_eq!(cast(&jsonb("true"), &ScalarType::Other, &int4), Cast::Raises);
         let text_type = ScalarType::Text(TextRules::DEFAULT);
-        assert_eq!(cast(&jsonb("null"), ScalarType::Other, text_type), Cast::Folded(text("null")));
+        assert_eq!(
+            cast(&jsonb("null"), &ScalarType::Other, &text_type),
+            Cast::Folded(text("null"))
+        );
     }
 
     #[test]
@@ -835,13 +930,13 @@ mod tests {
             ScalarType::Timestamp,
             ScalarType::Other,
         ] {
-            let array = ScalarType::Array(ArrayElement::of(ty));
-            assert_eq!(array.element(), Some(ty));
-            assert_eq!(ArrayElement::of(array), ArrayElement::of(ty));
+            let array = ScalarType::Array(ArrayElement::of(&ty));
+            assert_eq!(ArrayElement::of(&array), ArrayElement::of(&ty));
             assert_eq!(ty.element(), None);
+            assert_eq!(array.element(), Some(ty));
         }
         assert_eq!(
-            ArrayElement::of(ScalarType::UnknownLiteral).scalar(),
+            ArrayElement::of(&ScalarType::UnknownLiteral).scalar(),
             ScalarType::Text(TextRules::DEFAULT)
         );
         let int_array =

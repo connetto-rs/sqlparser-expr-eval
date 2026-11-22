@@ -53,7 +53,7 @@ pub(super) fn call<D: EvalDialect, C: Context>(
     if callees.is_empty() {
         return Ok(Evaluation::unknown(ScalarType::Unknown).with_error(true));
     }
-    let returns = callees.first().map_or(ScalarType::Unknown, |callee| callee.returns);
+    let returns = callees.first().map_or(ScalarType::Unknown, |callee| callee.returns.clone());
     if function.over.is_some()
         || callees
             .iter()
@@ -93,7 +93,7 @@ pub(super) fn call<D: EvalDialect, C: Context>(
         && first_builtin
             .is_some_and(|first| callees.iter().all(|callee| callee.builtin == Some(first)))
         && let Some(builtin) = first_builtin
-        && let Some(folded) = fold_builtin(builtin, &argument_evaluations, returns)
+        && let Some(folded) = fold_builtin(builtin, &argument_evaluations, evaluation.ty().clone())
     {
         let raises = folded.may_raise() || error;
         evaluation = folded.with_error(raises);
@@ -173,7 +173,7 @@ fn fold_builtin(
 
 /// Whether a `length` argument holds text or a not-yet-typed literal.
 fn text_argument(evaluation: &Evaluation) -> bool {
-    evaluation.ty().is_text() || evaluation.ty() == ScalarType::UnknownLiteral
+    evaluation.ty().is_text() || *evaluation.ty() == ScalarType::UnknownLiteral
 }
 
 /// The `length` and `octet_length` folds, counting bytes instead of
@@ -248,7 +248,7 @@ fn fold_abs(arguments: &[Evaluation], returns: ScalarType) -> Option<Evaluation>
     let argument = arguments.first()?;
     // An untyped literal is read through a number type's input, which may
     // refuse it.
-    if argument.ty() == ScalarType::UnknownLiteral {
+    if *argument.ty() == ScalarType::UnknownLiteral {
         return Some(Evaluation::new(
             returns,
             argument.may_be_null(),
@@ -336,13 +336,12 @@ fn single_value(evaluation: &Evaluation) -> Option<PgValue> {
 
 /// The type that holds the values of both `ty` and `branch`, and whether an
 /// engine may refuse to join them.
-pub(super) fn joined_type(ty: ScalarType, branch: ScalarType) -> (ScalarType, bool) {
-    let untyped = |t: ScalarType| matches!(t, ScalarType::Unknown | ScalarType::UnknownLiteral);
-    let number = |t: ScalarType| t.is_number() || t == ScalarType::Float;
-    if ty == branch || (untyped(branch) && ty != ScalarType::Unknown) {
-        (ty, false)
-    } else if untyped(ty) {
-        (branch, false)
+pub(super) fn joined_type(ty: &ScalarType, branch: &ScalarType) -> (ScalarType, bool) {
+    let number = |t: &ScalarType| t.is_number() || *t == ScalarType::Float;
+    if ty == branch || (branch.is_untyped() && *ty != ScalarType::Unknown) {
+        (ty.clone(), false)
+    } else if ty.is_untyped() {
+        (branch.clone(), false)
     } else if number(ty) && number(branch) {
         (super::fold::arithmetic_type(ty, branch), false)
     } else {
@@ -351,9 +350,9 @@ pub(super) fn joined_type(ty: ScalarType, branch: ScalarType) -> (ScalarType, bo
 }
 
 /// The evaluation read as the type a join resolved it to.
-pub(super) fn coerce_to(evaluation: Evaluation, ty: ScalarType) -> Evaluation {
+pub(super) fn coerce_to(evaluation: Evaluation, ty: &ScalarType) -> Evaluation {
     let from = evaluation.ty();
-    if from == ty || matches!(ty, ScalarType::Unknown | ScalarType::UnknownLiteral) {
+    if from == ty || ty.is_untyped() {
         return evaluation;
     }
     match (from, ty) {
@@ -361,13 +360,13 @@ pub(super) fn coerce_to(evaluation: Evaluation, ty: ScalarType) -> Evaluation {
         // A `numeric` may overflow a `float`, and unmodelled values stay open.
         (_, ScalarType::Float | ScalarType::Other) => {
             Evaluation::new(
-                ty,
+                ty.clone(),
                 evaluation.may_be_null(),
-                evaluation.may_raise() || from == ScalarType::Numeric,
+                evaluation.may_raise() || *from == ScalarType::Numeric,
                 Values::Unlisted(Unlisted::any()),
             )
         }
-        _ => evaluation.with_type(ty),
+        _ => evaluation.with_type(ty.clone()),
     }
 }
 
@@ -384,7 +383,7 @@ fn argument_type(arguments: &[Evaluation]) -> Option<ScalarType> {
     let [argument] = arguments else {
         return None;
     };
-    Some(argument.ty())
+    Some(argument.ty().clone())
 }
 
 /// The integer value of a character count, `i64::MAX` past the range.
@@ -442,7 +441,7 @@ pub(super) fn case<D: EvalDialect, C: Context>(
         Some(operand) => {
             let evaluation = forward(state, operand)?;
             Some(if evaluation.is_untyped() {
-                coerce_to(evaluation, ScalarType::Text(TextRules::DEFAULT))
+                coerce_to(evaluation, &ScalarType::Text(TextRules::DEFAULT))
             } else {
                 evaluation
             })
@@ -469,7 +468,7 @@ pub(super) fn case<D: EvalDialect, C: Context>(
         };
         // Every branch is typed, even one no row reaches.
         let result = forward(state, &when.result)?;
-        let (joined, refused) = joined_type(ty, result.ty());
+        let (joined, refused) = joined_type(&ty, result.ty());
         ty = joined;
         error |= refused;
         let reachable = end_reachable && condition.truth;
@@ -482,7 +481,7 @@ pub(super) fn case<D: EvalDialect, C: Context>(
     }
     if let Some(else_result) = else_result {
         let result = forward(state, else_result)?;
-        let (joined, refused) = joined_type(ty, result.ty());
+        let (joined, refused) = joined_type(&ty, result.ty());
         ty = joined;
         error |= refused;
         results.push((result, end_reachable));
@@ -499,7 +498,7 @@ pub(super) fn case<D: EvalDialect, C: Context>(
     }
     let mut values = Values::none();
     for (result, reachable) in results {
-        let result = coerce_to(result, ty);
+        let result = coerce_to(result, &ty);
         // A branch no row reaches may still refuse its types when planned.
         error |= result.may_raise();
         if reachable {
@@ -525,22 +524,25 @@ pub(super) fn in_target<D: EvalDialect, C: Context>(
         InTarget::List(list) => {
             let mut o = Outcomes { truth: false, falsity: true, null: false };
             let mut error = value.may_raise();
-            let mut ty = value.ty();
+            let mut ty = value.ty().clone();
             let mut members = Vec::new();
             for member in list {
                 let member = forward(state, member)?;
-                let (joined, refused) = joined_type(ty, member.ty());
+                let (joined, refused) = joined_type(&ty, member.ty());
                 ty = joined;
                 error |= refused;
                 members.push(member);
             }
             // The list's untyped literals are read as the type it joins to.
-            let value =
-                if value.ty() == ScalarType::UnknownLiteral { coerce_to(value, ty) } else { value };
+            let value = if *value.ty() == ScalarType::UnknownLiteral {
+                coerce_to(value, &ty)
+            } else {
+                value
+            };
             error |= value.may_raise();
             for member in members {
-                let member = if member.ty() == ScalarType::UnknownLiteral {
-                    coerce_to(member, ty)
+                let member = if *member.ty() == ScalarType::UnknownLiteral {
+                    coerce_to(member, &ty)
                 } else {
                     member
                 };
@@ -590,7 +592,7 @@ pub(super) fn like<D: EvalDialect, C: Context>(
         Some(escape) => Some(forward(state, escape)?),
         None => None,
     };
-    let text = |ty: ScalarType| {
+    let text = |ty: &ScalarType| {
         matches!(ty, ScalarType::Text(_) | ScalarType::Unknown | ScalarType::UnknownLiteral)
     };
     let mut error =
@@ -717,11 +719,11 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
             let mut values = BTreeSet::new();
             let mut null = false;
             let mut error = value.may_raise() || row;
-            let mut ty = value.ty();
+            let mut ty = value.ty().clone();
             let mut evaluations = Vec::new();
             for element in &elements {
                 let evaluation = forward(state, element)?;
-                let (joined, refused) = joined_type(ty, evaluation.ty());
+                let (joined, refused) = joined_type(&ty, evaluation.ty());
                 ty = joined;
                 error |= refused;
                 evaluations.push(evaluation);
@@ -739,11 +741,14 @@ pub(super) fn any_all<D: EvalDialect, C: Context>(
                 && !untyped(&value)
                 && !evaluations.is_empty()
                 && evaluations.iter().all(untyped);
-            let value =
-                if value.ty() == ScalarType::UnknownLiteral { coerce_to(value, ty) } else { value };
+            let value = if *value.ty() == ScalarType::UnknownLiteral {
+                coerce_to(value, &ty)
+            } else {
+                value
+            };
             error |= value.may_raise();
             let evaluations: Vec<Evaluation> =
-                evaluations.into_iter().map(|evaluation| coerce_to(evaluation, ty)).collect();
+                evaluations.into_iter().map(|evaluation| coerce_to(evaluation, &ty)).collect();
             error |= evaluations.iter().any(Evaluation::may_raise);
             for evaluation in evaluations {
                 match evaluation.constant() {
@@ -789,13 +794,13 @@ fn array_operand<D: EvalDialect, C: Context>(
     operand: Evaluation,
     is_any: bool,
 ) -> Evaluation {
-    let operand = if operand.ty() == ScalarType::UnknownLiteral {
-        let element = if value.ty() == ScalarType::UnknownLiteral {
-            ScalarType::Text(TextRules::DEFAULT)
+    let operand = if *operand.ty() == ScalarType::UnknownLiteral {
+        let element = if *value.ty() == ScalarType::UnknownLiteral {
+            ArrayElement::Text(TextRules::DEFAULT)
         } else {
-            value.ty()
+            ArrayElement::of(value.ty())
         };
-        super::fold::reinterpret_unknown(operand, ScalarType::Array(ArrayElement::of(element)))
+        super::fold::reinterpret_unknown(operand, &ScalarType::Array(element))
     } else {
         operand
     };
@@ -839,7 +844,7 @@ fn array_outcomes<D: EvalDialect, C: Context>(
 ) -> (Outcomes, bool) {
     let (values, null) = support::array_members(array);
     let nonempty = !values.is_empty();
-    let set = Evaluation::new(element, null, false, Values::Listed(values));
+    let set = Evaluation::new(element.clone(), null, false, Values::Listed(values));
     let mut cmp = comparison_evals(state, value.clone(), op, set);
     if !nonempty {
         // With no member to compare, an unlisted one still types the
@@ -989,14 +994,14 @@ pub(super) fn scalar_subquery<D: EvalDialect, C: Context>(
     let error = qe.error || qe.rows.many;
     let evaluation = if qe.rows.many {
         Evaluation::new(
-            column.ty(),
+            column.ty().clone(),
             column.may_be_null() || qe.rows.none,
             error,
             Values::Unlisted(Unlisted::any()),
         )
     } else {
         Evaluation::new(
-            column.ty(),
+            column.ty().clone(),
             column.may_be_null() || qe.rows.none,
             error,
             column.values().clone(),
@@ -1417,7 +1422,7 @@ mod tests {
         );
         let evaluation = read(context, "count(*)");
         assert!(!evaluation.may_be_null());
-        assert_eq!(evaluation.ty(), int8());
+        assert_eq!(*evaluation.ty(), int8());
     }
 
     /// `count` of a column counts from zero.
@@ -1480,10 +1485,10 @@ mod tests {
     fn the_builtin_calls_reach_their_fold_arms() {
         let context = ColumnContext::new()
             .with_callee("lower", builtin_callee(Builtin::Lower, default_text()));
-        assert_eq!(read(context, "lower('abc')").ty(), default_text());
+        assert_eq!(*read(context, "lower('abc')").ty(), default_text());
         let context = ColumnContext::new()
             .with_callee("upper", builtin_callee(Builtin::Upper, default_text()));
-        assert_eq!(read(context, "upper('abc')").ty(), default_text());
+        assert_eq!(*read(context, "upper('abc')").ty(), default_text());
         let context = ColumnContext::new()
             .with_callee("btrim", builtin_callee(Builtin::Btrim, default_text()));
         assert_eq!(
@@ -1556,7 +1561,7 @@ mod tests {
     #[test]
     fn a_case_of_untyped_nulls_resolves_to_text() {
         let evaluation = read(ColumnContext::new(), "CASE WHEN true THEN NULL END");
-        assert_eq!(evaluation.ty(), default_text());
+        assert_eq!(*evaluation.ty(), default_text());
         let tested =
             read(ColumnContext::new(), "(CASE WHEN true THEN NULL ELSE NULL END) IS UNKNOWN");
         assert!(tested.may_raise());
@@ -1857,7 +1862,7 @@ mod tests {
     #[test]
     fn a_scalar_subquery_reads_the_query() {
         let context = ColumnContext::new();
-        assert_eq!(read(context, "(SELECT 1)").ty(), ScalarType::Unknown);
+        assert_eq!(*read(context, "(SELECT 1)").ty(), ScalarType::Unknown);
         let context = ColumnContext::new()
             .with_query(Rows { none: false, one: false, many: true }, int_col());
         assert!(read(context, "(SELECT 1)").may_raise());
@@ -1918,7 +1923,7 @@ mod tests {
     fn abs_over_a_range_holding_the_minimum_may_raise() {
         let int4 = ScalarType::Integer(IntegerType::Integer);
         let small = Evaluation::new(
-            int4,
+            int4.clone(),
             true,
             false,
             Values::Unlisted(Unlisted {
@@ -1933,7 +1938,7 @@ mod tests {
             ColumnContext::new()
                 .with_column("x", int_col())
                 .with_column("y", small.clone())
-                .with_callee("abs", builtin_callee(Builtin::Abs, int4))
+                .with_callee("abs", builtin_callee(Builtin::Abs, int4.clone()))
         };
         assert!(read(context(), "abs(x)").may_raise());
         assert!(!read(context(), "abs(y)").may_raise());
@@ -1949,7 +1954,7 @@ mod tests {
         assert!(literal.may_be(&PgValue::Integer(1)));
         assert!(read("CASE WHEN false THEN '' ELSE 0.0 END").may_raise());
         let float = read("CASE WHEN true THEN 2147483647 ELSE 1.5::real END");
-        assert_eq!(float.ty(), ScalarType::Float);
+        assert_eq!(*float.ty(), ScalarType::Float);
         assert!(float.constant_value().is_none());
         assert!(read("x = ANY (ARRAY['1'])").may_raise());
         assert!(read("'a' = ANY (ARRAY[x])").may_raise());
@@ -1957,7 +1962,7 @@ mod tests {
         assert!(!read("'1' IN ('2', 1)").may_raise());
         // Branches of untyped literals alone join to `text`.
         let text = read("CASE WHEN x = 1 THEN 'a' ELSE 'b' END");
-        assert_eq!(text.ty(), ScalarType::Text(crate::scalar::TextRules::DEFAULT));
+        assert_eq!(*text.ty(), ScalarType::Text(crate::scalar::TextRules::DEFAULT));
         assert!(text.may_be(&PgValue::Text("a".to_string())));
     }
 

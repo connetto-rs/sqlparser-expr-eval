@@ -45,8 +45,8 @@ pub trait EvalDialect {
     /// operands are kept and composed only within one order.
     fn comparison_order(
         &self,
-        left: ScalarType,
-        right: ScalarType,
+        left: &ScalarType,
+        right: &ScalarType,
         options: &Self::Options,
     ) -> Option<Order> {
         let _ = (left, right, options);
@@ -108,7 +108,7 @@ pub trait EvalDialect {
         if source.is_always_null() {
             // A typed `NULL` may name a cast that does not exist.
             let typed = !source.is_untyped();
-            let refused = typed && to != source.ty();
+            let refused = typed && to != *source.ty();
             return Evaluation::null(to).with_error(source.may_raise() || refused);
         }
         // A `numeric(p, s)` typmod, a narrower `float` or a `varchar(0)` may
@@ -128,7 +128,7 @@ pub trait EvalDialect {
                     }))
                     | DataType::CharVarying(Some(CharacterLength::IntegerLength { length: 0, .. }))
             );
-        let error = source.may_raise() || to != source.ty() || bounded;
+        let error = source.may_raise() || to != *source.ty() || bounded;
         source.with_type(to).with_values(Values::Unlisted(Unlisted::any())).with_error(error)
     }
 
