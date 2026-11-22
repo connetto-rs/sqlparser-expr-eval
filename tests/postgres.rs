@@ -696,3 +696,31 @@ fn an_enum_compares_with_no_other_type() {
     assert!(read(kinds(None), "kind = 'note'::text").always_raises());
     assert!(read(kinds(None), "kind = 'note'::resource_kind").outcomes().truth);
 }
+
+#[test]
+fn an_enum_cast_raises_only_on_text_that_may_hold_no_label() {
+    let mut context = kinds(None);
+    context.columns.push(("name".into(), column(ScalarType::Text(TextRules::DEFAULT), false)));
+    let label = read(context, "name::resource_kind");
+    assert!(label.may_raise() && !label.always_raises());
+    // Any type the evaluator does not model may declare a cast with an enum.
+    let unmodelled = read(kinds(None), "kind::unmodelled_type");
+    assert!(!unmodelled.always_raises());
+    assert_eq!(unmodelled.constant(), None);
+}
+
+#[test]
+fn an_enum_too_large_to_list_stays_undecided() {
+    let wide = ScalarType::Enum(Arc::new(EnumType::new(
+        "wide_kind",
+        (0..65).map(|label| format!("label_{label}")),
+    )));
+    let wide_context = || {
+        let mut context = Ctx::with_columns(vec![("kind".into(), column(wide.clone(), false))]);
+        context.types = vec![("wide_kind".into(), wide.clone())];
+        context
+    };
+    let equality = read(wide_context(), "kind = 'label_0'");
+    assert_eq!(equality.outcomes(), Outcomes { null: false, ..Outcomes::ANY });
+    assert!(!read(wide_context(), "kind::wide_kind").may_raise());
+}
