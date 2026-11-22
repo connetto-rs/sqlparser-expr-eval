@@ -123,6 +123,15 @@ pub enum Collation {
 ///
 /// Two enum types are the same type only when both name and labels agree,
 /// so two enums declaring the same labels stay distinct.
+///
+/// ```
+/// use sqlparser_expr_eval::EnumType;
+///
+/// let kinds = EnumType::new("resource_kind", ["project", "note", "folder"]);
+/// assert_eq!(kinds.name(), "resource_kind");
+/// assert_eq!(kinds.position("folder"), Some(2));
+/// assert_eq!(kinds.position("bogus"), None);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EnumType {
     name: String,
@@ -953,5 +962,12 @@ mod tests {
     fn only_text_and_arrays_cast_to_an_array() {
         assert_eq!(array_cast(&PgValue::Integer(1), CastTarget::Integer), Cast::Raises);
         assert!(matches!(array_cast(&text("{1}"), CastTarget::Integer), Cast::Folded(_)));
+    }
+
+    /// A context's untyped non-text value casts to an enum undecided.
+    #[test]
+    fn an_untyped_non_text_value_casts_to_an_enum_undecided() {
+        let kinds = ScalarType::Enum(Arc::new(EnumType::new("kinds", ["note"])));
+        assert_eq!(cast(&PgValue::Integer(1), &ScalarType::Unknown, &kinds), Cast::Unknown);
     }
 }
