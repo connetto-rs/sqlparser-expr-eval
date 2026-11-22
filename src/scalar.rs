@@ -31,6 +31,9 @@ impl TextRules {
     /// A collation the evaluator cannot reason about.
     pub const UNKNOWN: TextRules =
         TextRules { identity_equality: false, byte_order: false, collation: Collation::Unknown };
+    /// PostgreSQL's `"C"` collation, the one the `name` type carries.
+    pub const C: TextRules =
+        TextRules { identity_equality: true, byte_order: true, collation: Collation::C };
 
     /// The rules a comparison between implicit collations `left` and `right`
     /// resolves to, the way PostgreSQL derives it. One collation resolves to
@@ -53,18 +56,12 @@ impl TextRules {
     /// a collation, so PostgreSQL raises on every pair of values it compares.
     #[must_use]
     pub(crate) fn conflicting(left: Self, right: Self) -> bool {
-        matches!(
-            (left.collation, right.collation),
-            (Collation::Named(one), Collation::Named(other)) if one != other
-        )
+        match (left.collation, right.collation) {
+            (Collation::Named(one), Collation::Named(other)) => one != other,
+            (Collation::Named(_), Collation::C) | (Collation::C, Collation::Named(_)) => true,
+            _ => false,
+        }
     }
-}
-
-#[cfg(test)]
-impl TextRules {
-    /// The `"C"` collation, which orders by byte.
-    pub(crate) const BYTEWISE: TextRules =
-        TextRules { identity_equality: true, byte_order: true, collation: Collation::Named(0) };
 }
 
 /// Which collation a text value carries.
@@ -76,6 +73,9 @@ pub enum Collation {
     /// identities name the same collation and two different ones different
     /// collations.
     Named(u32),
+    /// PostgreSQL's built-in `"C"` collation, the collation of the `name`
+    /// type. A context reads a column declared `COLLATE "C"` as carrying it.
+    C,
     /// A collation the context cannot identify, which shares no order with
     /// any other.
     Unknown,
@@ -754,6 +754,9 @@ mod tests {
         assert_eq!(TextRules::resolved(named(1), named(2)), None);
         assert_eq!(TextRules::resolved(TextRules::UNKNOWN, default), None);
         assert_eq!(TextRules::resolved(default, TextRules::UNKNOWN), None);
+        assert_eq!(TextRules::resolved(default, TextRules::C), Some(TextRules::C));
+        assert_eq!(TextRules::resolved(TextRules::C, TextRules::C), Some(TextRules::C));
+        assert_eq!(TextRules::resolved(named(1), TextRules::C), None);
     }
 
     /// An array's element is every scalar type but an array, an untyped
@@ -766,7 +769,7 @@ mod tests {
             ScalarType::Integer(IntegerType::Smallint),
             ScalarType::Numeric,
             ScalarType::Float,
-            ScalarType::Text(TextRules::BYTEWISE),
+            ScalarType::Text(TextRules::C),
             ScalarType::Date,
             ScalarType::Timestamp,
             ScalarType::Other,

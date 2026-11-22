@@ -59,6 +59,29 @@ pub(super) fn name_recognised(
     }
 }
 
+/// The SQL value functions, keywords PostgreSQL reads as a value of a fixed
+/// type without a catalog lookup and that never raise. A time form may take
+/// its precision as the one argument, and the other forms take none.
+pub(super) fn value_function(name: &str, arguments: &[Evaluation]) -> Option<Evaluation> {
+    let (ty, null) = match (name, arguments) {
+        ("current_user" | "current_role" | "session_user" | "user" | "current_catalog", []) => {
+            (ScalarType::Text(TextRules::C), false)
+        }
+        // `NULL` when no schema on the search path exists.
+        ("current_schema", []) => (ScalarType::Text(TextRules::C), true),
+        // `NULL` for a session that authenticated no identity.
+        ("system_user", []) => (ScalarType::Text(TextRules::DEFAULT), true),
+        ("current_date", []) => (ScalarType::Date, false),
+        ("localtimestamp", [] | [_]) => (ScalarType::Timestamp, false),
+        ("current_time" | "current_timestamp" | "localtime", [] | [_]) => {
+            (ScalarType::Other, false)
+        }
+        _ => return None,
+    };
+    let error = arguments.iter().any(Evaluation::may_raise);
+    Some(Evaluation::new(ty, null, error, Values::Unlisted(Unlisted::any())))
+}
+
 /// Whether reading the argument as `ty` changes it.
 fn converts(argument: &Evaluation, ty: ScalarType) -> bool {
     match argument.ty() {
@@ -421,7 +444,7 @@ mod tests {
     #[test]
     fn text_under_different_collations_may_raise() {
         let default = column(ScalarType::Text(TextRules::DEFAULT));
-        let bytewise = column(ScalarType::Text(TextRules::BYTEWISE));
+        let bytewise = column(ScalarType::Text(TextRules::C));
         let call =
             super::name_recognised("greatest", &[default, bytewise], false).expect("resolves");
         assert_eq!(call.ty(), ScalarType::Text(TextRules::UNKNOWN));

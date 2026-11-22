@@ -491,3 +491,49 @@ fn comparing_two_implicit_collations_raises() {
         assert!(!read(conflicting_texts(), sql).may_raise(), "{sql}");
     }
 }
+
+#[test]
+fn sql_value_functions_take_their_type_and_never_raise() {
+    let name = ScalarType::Text(TextRules::C);
+    for (sql, ty, null) in [
+        ("current_user", name, false),
+        ("CURRENT_ROLE", name, false),
+        ("session_user", name, false),
+        ("user", name, false),
+        ("current_catalog", name, false),
+        ("current_schema", name, true),
+        ("system_user", ScalarType::Text(TextRules::DEFAULT), true),
+        ("current_date", ScalarType::Date, false),
+        ("current_time", ScalarType::Other, false),
+        ("current_time(3)", ScalarType::Other, false),
+        ("current_timestamp", ScalarType::Other, false),
+        ("current_timestamp(3)", ScalarType::Other, false),
+        ("localtime", ScalarType::Other, false),
+        ("localtime(3)", ScalarType::Other, false),
+        ("localtimestamp", ScalarType::Timestamp, false),
+        ("localtimestamp(3)", ScalarType::Timestamp, false),
+    ] {
+        let evaluation = read(context(), sql);
+        assert_eq!(evaluation.ty(), ty, "{sql}");
+        assert_eq!(evaluation.may_be_null(), null, "{sql}");
+        assert!(!evaluation.may_raise(), "{sql}");
+    }
+}
+
+#[test]
+fn a_text_column_compares_with_the_current_user_without_raising() {
+    let compared = read(context(), "x = current_user");
+    assert!(!compared.may_raise());
+    let admitted = read(context(), "x = current_user OR true");
+    assert_eq!(admitted.outcomes(), Outcomes::TRUE);
+    assert!(!admitted.may_raise());
+}
+
+#[test]
+fn the_current_user_raises_against_another_named_collation() {
+    // `name` carries the "C" collation, which conflicts with any other
+    // implicit collation but the default.
+    assert!(read(conflicting_texts(), "icu = current_user").may_raise());
+    assert!(read(conflicting_texts(), "current_user < bytes").may_raise());
+    assert!(!read(conflicting_texts(), "plain = current_user").may_raise());
+}
