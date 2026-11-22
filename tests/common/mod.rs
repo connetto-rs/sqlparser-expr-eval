@@ -1,5 +1,5 @@
-//! The context and helpers both integration test files read the public API
-//! through.
+//! The context and helpers the integration tests and the benchmarks read
+//! the public API through.
 
 use sqlparser::{
     ast::{Expr, Function, ObjectNamePart, Query, SelectItem, SetExpr, Statement},
