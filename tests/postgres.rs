@@ -589,3 +589,26 @@ fn a_collation_applies_to_text_alone() {
     assert!(!literal.may_raise());
     assert!(read(conflicting_texts(), r#"1 COLLATE "C""#).may_raise());
 }
+
+#[test]
+fn a_deciding_constant_folds_the_chain_before_it_runs() {
+    // PostgreSQL's planner reduces a chain holding `true` under `OR`, or
+    // `false` under `AND`, to that constant, so the other terms never run.
+    for (sql, decided) in [
+        ("icu < bytes OR true", Outcomes::TRUE),
+        ("true OR icu < bytes", Outcomes::TRUE),
+        ("icu < bytes OR 1 = 1", Outcomes::TRUE),
+        ("icu < bytes OR (plain < icu OR NOT false)", Outcomes::TRUE),
+        ("icu < bytes AND false", Outcomes::FALSE),
+    ] {
+        let evaluation = read(conflicting_texts(), sql);
+        assert_eq!((evaluation.outcomes(), evaluation.may_raise()), (decided, false), "{sql}");
+    }
+    // The planner folds every constant before the deciding one, and a
+    // constant that raises raises there, but never reaches one after it.
+    assert!(read(context(), "1 / 0 = 1 OR true").may_raise());
+    assert!(read(context(), "id > 1 / 0 OR true").may_raise());
+    assert!(!read(context(), "true OR 1 / 0 = 1").may_raise());
+    // A term that reads a column is not folded, whatever it evaluates to.
+    assert!(read(conflicting_texts(), "icu < bytes OR plain = plain").may_raise());
+}

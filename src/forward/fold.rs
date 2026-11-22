@@ -1,6 +1,6 @@
 //! Operators, forward: comparisons, arithmetic and string concatenation.
 
-use alloc::collections::BTreeSet;
+use alloc::{collections::BTreeSet, vec::Vec};
 use core::{cmp::Ordering, ops::Bound};
 
 use sql_values::postgres::{PgNumeric, PgValue};
@@ -9,7 +9,7 @@ use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
 use super::{
     super::{
         backward::CmpOp,
-        context::Context,
+        context::{Context, Volatility},
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
         guarantees::Guarantees,
@@ -726,6 +726,12 @@ fn and_or<D: EvalDialect, C: Context>(
     and: bool,
 ) -> Result<Evaluation, C::Error> {
     let combine = if and { support::and_outcomes_set } else { support::or_outcomes_set };
+    if state.dialect.folds_deciding_constants(state.options)
+        && let Some(error) = folded_chain(state, terms, and)?
+    {
+        let decided = if and { Outcomes::FALSE } else { Outcomes::TRUE };
+        return Ok(Evaluation::condition(decided, error));
+    }
     // The guarantees each outcome of the prefix seen so far implies, and
     // the guarantee of the prefix not being false, or not being true for an
     // `OR`, which the outcome updates draw on.
@@ -831,6 +837,71 @@ fn and_or<D: EvalDialect, C: Context>(
         outcomes = outcomes.union(if and { Outcomes::FALSE } else { Outcomes::TRUE });
     }
     Ok(Evaluation::condition(outcomes, error))
+}
+
+/// Whether the planner may raise as it reduces the `AND`/`OR` chain of
+/// `terms` to a constant term that decides it, `false` under `AND` and
+/// `true` under `OR`, `None` when no term folds to that constant. Nested
+/// chains of the same operator flatten into the chain, and the planner
+/// folds the constants of every term before the deciding one.
+fn folded_chain<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    terms: &[&Expr],
+    and: bool,
+) -> Result<Option<bool>, C::Error> {
+    let decided = if and { Outcomes::FALSE } else { Outcomes::TRUE };
+    let op = if and { BinaryOperator::And } else { BinaryOperator::Or };
+    let mut flat = Vec::with_capacity(terms.len());
+    let mut pending: Vec<&Expr> = terms.iter().rev().copied().collect();
+    while let Some(term) = pending.pop() {
+        match support::unnest(term) {
+            Expr::BinaryOp { left, op: inner, right } if *inner == op => {
+                pending.extend(support::and_or_terms(left, right, and).into_iter().rev());
+            }
+            term => flat.push(term),
+        }
+    }
+    let mut deciding = None;
+    for (position, term) in flat.iter().enumerate() {
+        if support::fixed(state.context, term, Volatility::Immutable)? {
+            let evaluation = support::as_condition(forward(state, term)?);
+            if evaluation.outcomes() == decided && !evaluation.may_raise() {
+                deciding = Some(position);
+                break;
+            }
+        }
+    }
+    let Some(deciding) = deciding else {
+        return Ok(None);
+    };
+    for term in &flat[..deciding] {
+        if folding_may_raise(state, term)? {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
+/// Whether the planner may raise as it folds the immutable constants within
+/// `expression`, which it does before the expression runs. A call over a
+/// column or a node without operands to walk, such as a subquery, may
+/// raise wherever it raises.
+fn folding_may_raise<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    expression: &Expr,
+) -> Result<bool, C::Error> {
+    let mut stack = vec![expression];
+    while let Some(node) = stack.pop() {
+        if support::is_reference(node) {
+            continue;
+        }
+        let walked = !support::fixed(state.context, node, Volatility::Immutable)?
+            && support::push_operands(&mut stack, node);
+        if !walked && forward(state, node)?.may_raise() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// [`backward::implied_within`](super::super::backward::implied_within) on one

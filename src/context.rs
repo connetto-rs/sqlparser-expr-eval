@@ -36,8 +36,9 @@ impl NullInput {
     }
 }
 
-/// How a function's result may change between calls with equal arguments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a function's result may change between calls with equal arguments,
+/// ordered from the least volatile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Volatility {
     /// Fixed by the arguments.
     Immutable,
