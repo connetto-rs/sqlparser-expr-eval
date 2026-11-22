@@ -628,8 +628,8 @@ impl<R: Ord + Clone> Guarantees<R> {
         let stored_only =
             |side: &Self| side.apart.is_empty() && side.null_subjects().next().is_none();
         let (ours_stored, theirs_stored) = (stored_only(self), stored_only(other));
-        joined.relations = self.relations.clone();
         for (order, network) in &self.relations {
+            let mut kept = network.clone();
             let theirs = other.relations.get(order);
             for (left, row) in network {
                 let their_row = theirs.and_then(|network| network.get(left));
@@ -646,11 +646,14 @@ impl<R: Ord + Clone> Guarantees<R> {
                         continue;
                     }
                     if union == Relation::ANY || union.is_empty() {
-                        joined.forget(*order, left, right);
+                        forget(&mut kept, left, right);
                     } else {
-                        joined.store(*order, left, right, union);
+                        store(&mut kept, left, right, union);
                     }
                 }
+            }
+            if !kept.is_empty() {
+                joined.relations.insert_mut(*order, kept);
             }
         }
         // A pair only `other` relates keeps its relation where `self` never
@@ -675,32 +678,9 @@ impl<R: Ord + Clone> Guarantees<R> {
         first: &Self,
         second: &Self,
     ) {
-        let theirs = second.relation(order, left, right);
-        if theirs == Relation::ANY {
-            return;
-        }
-        let union = first.relation(order, left, right).union(theirs);
+        let union = first.relation(order, left, right).union(second.relation(order, left, right));
         if union != Relation::ANY && !union.is_empty() {
             self.store(order, left, right, union);
-        }
-    }
-
-    /// Drops the relation of `left` to `right` under `order`, and its mirror.
-    fn forget(&mut self, order: Order, left: &Subject<R>, right: &Subject<R>) {
-        let Some(network) = self.relations.get_mut(&order) else {
-            return;
-        };
-        for (from, to) in [(left, right), (right, left)] {
-            let emptied = network.get_mut(from).is_some_and(|row| {
-                row.remove_mut(to);
-                row.is_empty()
-            });
-            if emptied {
-                network.remove_mut(from);
-            }
-        }
-        if network.is_empty() {
-            self.relations.remove_mut(&order);
         }
     }
 
@@ -774,6 +754,19 @@ fn store<R: Ord + Clone>(
     }
 }
 
+/// Drops the relation of `left` to `right`, and its mirror.
+fn forget<R: Ord + Clone>(network: &mut Network<R>, left: &Subject<R>, right: &Subject<R>) {
+    for (from, to) in [(left, right), (right, left)] {
+        let emptied = network.get_mut(from).is_some_and(|row| {
+            row.remove_mut(to);
+            row.is_empty()
+        });
+        if emptied {
+            network.remove_mut(from);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sql_values::postgres::{IntegerType, PgValue};
@@ -797,6 +790,26 @@ mod tests {
         assert!(Guarantees::<String>::new().is_empty());
         assert!(Guarantees::<String>::impossible().is_impossible());
         assert!(!Guarantees::<String>::impossible().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_subject_never_equal_to_itself_may_still_be_null() {
+        let mut guarantees = Guarantees::<String>::new();
+        guarantees.relate(Order::Number, &ref_subject("x"), &ref_subject("x"), Relation::LESS);
+        assert!(!guarantees.is_impossible());
+    }
+
+    #[test]
+    fn debug_output_lists_pairs_kept_apart() {
+        let mut guarantees = integers(&["x", "y"], &["x", "y"]);
+        guarantees.relate(Order::Number, &ref_subject("x"), &ref_subject("y"), Relation::NONE);
+        let debug = format!("{guarantees:?}");
+        assert!(
+            debug.contains(
+                r#"apart: {Reference("x"): {Reference("y"): ()}, Reference("y"): {Reference("x"): ()}}"#
+            ),
+            "{debug}"
+        );
     }
 
     /// Any integer, `NULL` too when `null` holds.
