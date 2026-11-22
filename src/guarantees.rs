@@ -12,7 +12,10 @@ use super::{Evaluation, Order, Relation, Values};
 type Map<K, V> = RedBlackTreeMapSync<K, V>;
 
 /// What a guarantee is about.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Literals sort after every other subject, so a walk over the neighbours of
+/// a subject can stop at the first literal when literals do not concern it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[expect(
     clippy::large_enum_variant,
     reason = "box indirection would allocate on every subject clone and lookup"
@@ -23,6 +26,26 @@ pub enum Subject<R> {
     /// Any other expression, matched as written, such as a call reading a
     /// session setting.
     Expression(Expr),
+}
+
+impl<R: Ord> Ord for Subject<R> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        literal(self).cmp(&literal(other)).then_with(|| {
+            match (self, other) {
+                (Self::Reference(left), Self::Reference(right)) => left.cmp(right),
+                (Self::Reference(_), Self::Expression(_)) => Ordering::Less,
+                (Self::Expression(_), Self::Reference(_)) => Ordering::Greater,
+                (Self::Expression(left), Self::Expression(right)) => left.cmp(right),
+            }
+        })
+    }
+}
+
+impl<R: Ord> PartialOrd for Subject<R> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// The evaluations a set of subjects is known to stay within, and the
@@ -243,16 +266,21 @@ impl<R: Ord + Clone> Guarantees<R> {
             return;
         };
         let left_row = self.non_null(left).then_some(left_row);
-        let after: Vec<_> =
-            neighbours(right, self.non_null(right).then_some(right_row), left).collect();
+        // Literals come last, so a literal before skips the literals after.
+        let (mut after, literals): (Vec<_>, Vec<_>) =
+            neighbours(right, self.non_null(right).then_some(right_row), left)
+                .partition(|(after, _)| !literal(after));
+        let plain = after.len();
+        after.extend(literals);
         let mut pending = Vec::new();
         for (before, to_left) in neighbours(left, left_row, right) {
             let through = to_left.mirrored().composed(narrowed);
             if through == Relation::ANY {
                 continue;
             }
-            for &(after, from_right) in &after {
-                if (before == left && after == right) || (literal(before) && literal(after)) {
+            let after = if literal(before) { &after[..plain] } else { &after[..] };
+            for &(after, from_right) in after {
+                if before == left && after == right {
                     continue;
                 }
                 let composed = through.composed(from_right);
@@ -331,10 +359,7 @@ impl<R: Ord + Clone> Guarantees<R> {
                 return;
             };
             if self.non_null(right) {
-                for (beyond, from_right) in network.get(right).into_iter().flat_map(Map::iter) {
-                    if literal(left) && literal(beyond) {
-                        continue;
-                    }
+                for (beyond, from_right) in neighbours_of(network.get(right), literal(left)) {
                     let composed = relation.composed(*from_right);
                     if self.narrow_through(order, left, beyond, composed).is_some() {
                         queue(&mut pending, left, beyond);
@@ -345,10 +370,7 @@ impl<R: Ord + Clone> Guarantees<R> {
                 }
             }
             if self.non_null(left) {
-                for (before, to_left) in network.get(left).into_iter().flat_map(Map::iter) {
-                    if literal(before) && literal(right) {
-                        continue;
-                    }
+                for (before, to_left) in neighbours_of(network.get(left), literal(right)) {
                     let composed = to_left.mirrored().composed(relation);
                     if self.narrow_through(order, before, right, composed).is_some() {
                         queue(&mut pending, before, right);
@@ -600,14 +622,26 @@ impl<R: Ord + Clone> Guarantees<R> {
             }
         }
         // The join starts from `self`'s relations and rewrites only the pairs
-        // `other` widens, so a side that adds nothing costs no copying.
+        // `other` widens, so a side that adds nothing costs no copying. A side
+        // holding no subject `NULL` and no pair apart relates each pair as it
+        // stores it.
+        let stored_only =
+            |side: &Self| side.apart.is_empty() && side.null_subjects().next().is_none();
+        let (ours_stored, theirs_stored) = (stored_only(self), stored_only(other));
         joined.relations = self.relations.clone();
         for (order, network) in &self.relations {
+            let theirs = other.relations.get(order);
             for (left, row) in network {
+                let their_row = theirs.and_then(|network| network.get(left));
                 for (right, stored) in row.range(left..) {
-                    let union = self
-                        .relation(*order, left, right)
-                        .union(other.relation(*order, left, right));
+                    let ours =
+                        if ours_stored { *stored } else { self.relation(*order, left, right) };
+                    let theirs = if theirs_stored {
+                        their_row.and_then(|row| row.get(right)).copied().unwrap_or(Relation::ANY)
+                    } else {
+                        other.relation(*order, left, right)
+                    };
+                    let union = ours.union(theirs);
                     if union == *stored {
                         continue;
                     }
@@ -694,6 +728,15 @@ impl<R: Ord + Clone> Guarantees<R> {
 /// which stand in the order their values decide.
 fn literal<R>(subject: &Subject<R>) -> bool {
     matches!(subject, Subject::Expression(Expr::Value(_)))
+}
+
+/// The subjects `row` relates to, without the literals when `plain`, which
+/// stops at the first literal since literals sort last.
+fn neighbours_of<R: Ord>(
+    row: Option<&Row<R>>,
+    plain: bool,
+) -> impl Iterator<Item = (&Subject<R>, &Relation)> {
+    row.into_iter().flat_map(Map::iter).take_while(move |(subject, _)| !plain || !literal(subject))
 }
 
 /// `subject` standing equal to itself, then each subject but `other` its row
