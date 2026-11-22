@@ -133,7 +133,8 @@ pub trait EvalDialect {
     }
 
     /// The result of a call the dialect recognises by name before the context
-    /// is asked.
+    /// is asked. `arguments` is empty only for a keyword the parser reads as
+    /// a call without an argument list, such as `current_user`.
     fn named_call(
         &self,
         name: &str,

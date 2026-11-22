@@ -2330,13 +2330,13 @@ mod tests {
     fn an_ordering_against_listed_text_keeps_an_unlisted_side_open() {
         let byte = |text: &str| PgValue::Text(text.to_string());
         let v = Evaluation::new(
-            ScalarType::Text(TextRules::BYTEWISE),
+            ScalarType::Text(TextRules::C),
             false,
             false,
             Values::Listed(BTreeSet::from([byte("a"), byte("e")])),
         );
         let guarantees = quantified(
-            plain_column(ScalarType::Text(TextRules::BYTEWISE)),
+            plain_column(ScalarType::Text(TextRules::C)),
             v,
             "x < ANY (SELECT v FROM q)",
             Outcomes::TRUE,
@@ -2647,13 +2647,13 @@ mod tests {
         // `e` around them.
         let byte = |text: &str| PgValue::Text(text.to_string());
         let x = Evaluation::new(
-            ScalarType::Text(TextRules::BYTEWISE),
+            ScalarType::Text(TextRules::C),
             false,
             false,
             Values::Listed(BTreeSet::from([byte("`"), byte("b")])),
         );
         let v = Evaluation::new(
-            ScalarType::Text(TextRules::BYTEWISE),
+            ScalarType::Text(TextRules::C),
             false,
             false,
             Values::Listed(BTreeSet::from([byte("a"), byte("e")])),
@@ -3556,7 +3556,7 @@ mod tests {
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
-                .with_column("y", unknown_column(ScalarType::Text(TextRules::BYTEWISE))),
+                .with_column("y", unknown_column(ScalarType::Text(TextRules::C))),
             &parse("x < y"),
             Outcomes::TRUE,
         );
@@ -5165,8 +5165,7 @@ mod tests {
     #[test]
     fn a_text_ordering_over_an_unlisted_value_keeps_it() {
         let guarantees = implied_with(
-            ColumnContext::new()
-                .with_column("x", unknown_column(ScalarType::Text(TextRules::BYTEWISE))),
+            ColumnContext::new().with_column("x", unknown_column(ScalarType::Text(TextRules::C))),
             &parse("x < 'b'"),
             Outcomes::TRUE,
         );

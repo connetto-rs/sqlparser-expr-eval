@@ -144,8 +144,10 @@ impl EvalDialect for PostgreSqlDialect {
         options: &PostgreSqlOptions,
     ) -> Option<Evaluation> {
         let _ = options;
-        let error = arguments.iter().any(Evaluation::may_raise);
-        calls::name_recognised(name, arguments, error)
+        calls::value_function(name, arguments).or_else(|| {
+            let error = arguments.iter().any(Evaluation::may_raise);
+            calls::name_recognised(name, arguments, error)
+        })
     }
 
     fn null_equals_operand<'a>(

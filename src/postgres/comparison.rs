@@ -414,11 +414,8 @@ mod tests {
         assert!(resolved.rows.may_be_true());
         assert!(resolved.rows.may_be_false());
         assert!(resolved.rows.all_true);
-        let resolved = comparison(
-            text(TextRules::BYTEWISE),
-            &BinaryOperator::Lt,
-            text_of(TextRules::BYTEWISE, "a"),
-        );
+        let resolved =
+            comparison(text(TextRules::C), &BinaryOperator::Lt, text_of(TextRules::C, "a"));
         assert!(resolved.rows.all_true);
         assert!(resolved.rows.all_false);
         let resolved = comparison(
@@ -442,8 +439,8 @@ mod tests {
         assert!(resolved.rows.may_be_false());
 
         // Ordering decides only under a byte collation.
-        let a = text_of(TextRules::BYTEWISE, "a");
-        let b = text_of(TextRules::BYTEWISE, "b");
+        let a = text_of(TextRules::C, "a");
+        let b = text_of(TextRules::C, "b");
         let resolved = comparison(a.clone(), &BinaryOperator::Lt, b.clone());
         assert!(resolved.rows.may_be_true());
         assert!(!resolved.rows.may_be_false());
@@ -473,9 +470,9 @@ mod tests {
 
         // Byte order over two listed values decides every pair.
         let resolved = comparison(
-            text_of(TextRules::BYTEWISE, "a"),
+            text_of(TextRules::C, "a"),
             &BinaryOperator::LtEq,
-            text_of(TextRules::BYTEWISE, "b"),
+            text_of(TextRules::C, "b"),
         );
         assert!(resolved.rows.may_be_true());
         assert!(!resolved.rows.may_be_false());

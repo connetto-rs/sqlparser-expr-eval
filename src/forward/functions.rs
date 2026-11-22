@@ -4,7 +4,9 @@ use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::{fmt::Write, ops::Bound};
 
 use sql_values::postgres::{IntegerType, PgArray, PgNumeric, PgValue};
-use sqlparser::ast::{Array, BinaryOperator, CaseWhen, Expr, Function, InTarget, Query};
+use sqlparser::ast::{
+    Array, BinaryOperator, CaseWhen, Expr, Function, FunctionArguments, InTarget, Query,
+};
 
 use super::{
     super::{
@@ -36,7 +38,9 @@ pub(super) fn call<D: EvalDialect, C: Context>(
         error |= evaluation.may_raise();
         argument_evaluations.push(evaluation);
     }
-    if !arguments.is_empty()
+    // A keyword the parser reads as a call without an argument list, such as
+    // `current_user`, is the dialect's to recognise as well.
+    if (!arguments.is_empty() || matches!(function.args, FunctionArguments::None))
         && function.over.is_none()
         && let Some(name) = support::simple_name(&function.name)
         && let Some(evaluation) =
@@ -1112,7 +1116,7 @@ mod tests {
     }
 
     fn byte_text(value: &str) -> Evaluation {
-        Evaluation::known(PgValue::Text(value.to_string()), ScalarType::Text(TextRules::BYTEWISE))
+        Evaluation::known(PgValue::Text(value.to_string()), ScalarType::Text(TextRules::C))
     }
 
     fn text_len(low: Bound<u64>, high: Bound<u64>) -> Evaluation {
