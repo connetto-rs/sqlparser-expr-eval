@@ -43,10 +43,10 @@ pub(crate) fn resolve_reference<C: Context>(
 ///
 /// An expression other than a reference is a subject only when every
 /// evaluation in one statement gives it one value. It is built from literals,
-/// operators, casts, `CASE`, lists and calls of immutable or stable ordinary
-/// functions alone, so it reads no column and holds no subquery. Two calls of
-/// `random()` differ, and a column named alike in a subquery may be another
-/// column.
+/// operators, casts, collations, `CASE`, lists and calls of immutable or
+/// stable ordinary functions alone, so it reads no column and holds no
+/// subquery. Two calls of `random()` differ, and a column named alike in a
+/// subquery may be another column.
 pub(crate) fn subject<C: Context>(
     context: &mut C,
     expression: &Expr,
@@ -77,6 +77,7 @@ fn push_fixed_children<'a, C: Context>(
         Expr::Value(_) | Expr::TypedString(_) => {}
         Expr::Nested(value)
         | Expr::Cast { expr: value, .. }
+        | Expr::Collate { expr: value, .. }
         | Expr::UnaryOp { expr: value, .. }
         | Expr::IsNull(value)
         | Expr::IsNotNull(value)

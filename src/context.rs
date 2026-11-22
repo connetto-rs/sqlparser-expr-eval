@@ -3,9 +3,9 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
-use sqlparser::ast::{DataType, Expr, Function, Query};
+use sqlparser::ast::{DataType, Expr, Function, ObjectName, Query};
 
-use super::{Evaluation, Guarantees, ScalarType};
+use super::{Evaluation, Guarantees, ScalarType, TextRules};
 
 /// A reference the context resolved, with what it can hold.
 #[derive(Debug, Clone)]
@@ -233,6 +233,19 @@ pub trait Context {
     /// The type a cast or a typed literal names.
     fn data_type(&self, data_type: &DataType) -> ScalarType {
         ScalarType::of(data_type)
+    }
+
+    /// The rules of the collation `name` names, under the identity a column
+    /// declared with it carries, [`TextRules::UNKNOWN`] when the context
+    /// cannot identify it. The evaluator marks them
+    /// [`explicit`](TextRules::explicit) itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's error when resolution fails.
+    fn collation(&mut self, name: &ObjectName) -> Result<TextRules, Self::Error> {
+        let _ = name;
+        Ok(TextRules::UNKNOWN)
     }
 }
 

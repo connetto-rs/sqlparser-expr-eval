@@ -116,6 +116,7 @@ fn evaluate_node<D: EvalDialect, C: Context>(
         Expr::UnaryOp { op, expr } => fold::unary(state, *op, expr)?,
         Expr::BinaryOp { left, op, right } => fold::binary(state, left, op, right)?,
         Expr::Cast { kind, expr, data_type, .. } => literals::cast(state, kind, expr, data_type)?,
+        Expr::Collate { expr, collation } => literals::collate(state, expr, collation)?,
         Expr::Function(call) => functions::call(state, call)?,
         Expr::Case { operand, conditions, else_result, .. } => {
             functions::case(state, operand.as_deref(), conditions, else_result.as_deref())?

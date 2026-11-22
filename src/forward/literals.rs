@@ -1,14 +1,15 @@
-//! Literals and typed string literals, forward.
+//! Literals, typed string literals, and the casts and collations applied
+//! to an expression, forward.
 
 use sql_values::postgres::PgValue;
-use sqlparser::ast::{CastKind, DataType, Expr, TypedString, Value, ValueWithSpan};
+use sqlparser::ast::{CastKind, DataType, Expr, ObjectName, TypedString, Value, ValueWithSpan};
 
 use super::{
     super::{
         context::Context,
         dialect::EvalDialect,
         domain::Evaluation,
-        scalar::{self, Cast, ScalarType},
+        scalar::{self, ArrayElement, Cast, ScalarType, TextRules},
     },
     State, forward,
 };
@@ -88,6 +89,26 @@ pub(super) fn cast_evaluation<D: EvalDialect, C: Context>(
         |element| state.context.data_type(element),
         state.options,
     )
+}
+
+/// The forward evaluation of `expr COLLATE collation`, the operand's values
+/// under the collation the context names, marked explicit. An untyped
+/// literal or `NULL` reads as text, and an operand of another type than
+/// text may raise, as an engine may refuse to collate it.
+pub(super) fn collate<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    expr: &Expr,
+    collation: &ObjectName,
+) -> Result<Evaluation, C::Error> {
+    let operand = forward(state, expr)?;
+    let rules = TextRules { explicit: true, ..state.context.collation(collation)? };
+    Ok(match operand.ty() {
+        ty if ty.is_text() || operand.is_untyped() => operand.with_type(ScalarType::Text(rules)),
+        ScalarType::Array(ArrayElement::Text(_)) => {
+            operand.with_type(ScalarType::Array(ArrayElement::Text(rules)))
+        }
+        _ => operand.with_error(true),
+    })
 }
 
 #[cfg(test)]

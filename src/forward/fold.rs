@@ -534,7 +534,7 @@ fn pair_certainties<A, B>(
 }
 
 /// The kinds of answer a left text may give against the right texts under
-/// `op`, under the collations both sides carry.
+/// `op`, under the collation the two sides' collations resolve to.
 fn text_pairs(
     left: &Values,
     right: &Values,
@@ -542,8 +542,8 @@ fn text_pairs(
     rules_right: TextRules,
     op: &BinaryOperator,
 ) -> RowKinds {
-    let identity = rules_left.identity_equality && rules_right.identity_equality;
-    let byte_order = rules_left.byte_order && rules_right.byte_order;
+    let rules = TextRules::resolved(rules_left, rules_right).unwrap_or(TextRules::UNKNOWN);
+    let (identity, byte_order) = (rules.identity_equality, rules.byte_order);
     let (Values::Listed(l), Values::Listed(r)) = (left, right) else {
         // An unlisted left side admits values the listed right side cannot
         // exclude, so its rows take the kinds the listed values alone
