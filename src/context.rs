@@ -321,6 +321,22 @@ mod tests {
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     }
 
+    /// A context that names no collation leaves an explicit one unknown,
+    /// over text and over a text array alike.
+    #[test]
+    fn an_unnamed_collation_is_unknown() {
+        let explicit = TextRules { explicit: true, ..TextRules::UNKNOWN };
+        for (sql, ty) in [
+            (r#"x COLLATE "C""#, ScalarType::Text(explicit)),
+            (r#"ARRAY[x] COLLATE "C""#, ScalarType::Array(crate::ArrayElement::Text(explicit))),
+        ] {
+            let evaluation =
+                evaluate(&parse(sql), &GenericDialect, &(), &mut Minimal, &Guarantees::new())
+                    .unwrap();
+            assert_eq!(evaluation.ty(), ty, "{sql}");
+        }
+    }
+
     #[test]
     fn a_nested_query_reads_unknown() {
         let evaluation = evaluate(
