@@ -39,7 +39,13 @@ pub struct Guarantees<R> {
     /// Each network is closed under composition through every subject that
     /// cannot be `NULL`, which `relate` relies on to look one step out only.
     relations: Map<Order, Network<R>>,
+    /// Pairs of subjects that never both hold a value, under every order,
+    /// kept in both directions.
+    apart: Map<Subject<R>, Partners<R>>,
 }
+
+/// The subjects one subject never holds a value together with.
+type Partners<R> = Map<Subject<R>, ()>;
 
 /// The relation of one subject to each subject it is related to.
 type Row<R> = Map<Subject<R>, Relation>;
@@ -57,6 +63,7 @@ impl<R: Ord> Clone for Guarantees<R> {
             references: self.references.clone(),
             expressions: self.expressions.clone(),
             relations: self.relations.clone(),
+            apart: self.apart.clone(),
         }
     }
 }
@@ -67,6 +74,7 @@ impl<R: Ord> PartialEq for Guarantees<R> {
             && self.references == other.references
             && self.expressions == other.expressions
             && self.relations == other.relations
+            && self.apart == other.apart
     }
 }
 
@@ -80,6 +88,7 @@ impl<R: Ord + fmt::Debug> fmt::Debug for Guarantees<R> {
             .field("references", &Entries(&self.references))
             .field("expressions", &Entries(&self.expressions))
             .field("relations", &Entries(&self.relations))
+            .field("apart", &Entries(&self.apart))
             .finish()
     }
 }
@@ -100,6 +109,12 @@ where
 }
 
 impl fmt::Debug for Entries<'_, Evaluation> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Debug for Entries<'_, ()> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
@@ -126,6 +141,7 @@ impl<R: Ord + Clone> Guarantees<R> {
             references: Map::new_sync(),
             expressions: Map::new_sync(),
             relations: Map::new_sync(),
+            apart: Map::new_sync(),
         }
     }
 
@@ -148,11 +164,12 @@ impl<R: Ord + Clone> Guarantees<R> {
             && self.references.is_empty()
             && self.expressions.is_empty()
             && self.relations.is_empty()
+            && self.apart.is_empty()
     }
 
     /// Whether some pair of subjects stands in a known relation.
     pub(crate) fn has_relations(&self) -> bool {
-        !self.relations.is_empty()
+        !self.relations.is_empty() || !self.apart.is_empty()
     }
 
     /// The orders `left` may stand in to `right` under `order` on the rows
@@ -163,10 +180,17 @@ impl<R: Ord + Clone> Guarantees<R> {
         if left == right {
             return Relation::EQUAL;
         }
-        if self.null(left) || self.null(right) {
+        if self.never_both(left, right) {
             return Relation::NONE;
         }
         self.stored(order, left, right)
+    }
+
+    /// Whether `left` and `right`, two subjects, never both hold a value.
+    fn never_both(&self, left: &Subject<R>, right: &Subject<R>) -> bool {
+        self.null(left)
+            || self.null(right)
+            || self.apart.get(left).is_some_and(|partners| partners.contains_key(right))
     }
 
     /// The relation the network of `order` keeps from `left` to `right`.
@@ -203,6 +227,9 @@ impl<R: Ord + Clone> Guarantees<R> {
             }
             return;
         }
+        if self.never_both(left, right) {
+            return;
+        }
         let narrowed = match self.narrow(order, left, right, relation) {
             Some(narrowed) if !narrowed.is_empty() => narrowed,
             _ => return,
@@ -225,7 +252,7 @@ impl<R: Ord + Clone> Guarantees<R> {
                 continue;
             }
             for &(after, from_right) in &after {
-                if before == left && after == right {
+                if (before == left && after == right) || (literal(before) && literal(after)) {
                     continue;
                 }
                 let composed = through.composed(from_right);
@@ -276,13 +303,7 @@ impl<R: Ord + Clone> Guarantees<R> {
         if narrowed == known {
             return None;
         }
-        if let Some(network) = self.relations.get_mut(&order) {
-            store(network, left, right, narrowed);
-        } else {
-            let mut network = Map::new_sync();
-            store(&mut network, left, right, narrowed);
-            self.relations.insert_mut(order, network);
-        }
+        self.store(order, left, right, narrowed);
         if narrowed.is_empty() {
             self.separate(left, right);
         }
@@ -311,6 +332,9 @@ impl<R: Ord + Clone> Guarantees<R> {
             };
             if self.non_null(right) {
                 for (beyond, from_right) in network.get(right).into_iter().flat_map(Map::iter) {
+                    if literal(left) && literal(beyond) {
+                        continue;
+                    }
                     let composed = relation.composed(*from_right);
                     if self.narrow_through(order, left, beyond, composed).is_some() {
                         queue(&mut pending, left, beyond);
@@ -322,6 +346,9 @@ impl<R: Ord + Clone> Guarantees<R> {
             }
             if self.non_null(left) {
                 for (before, to_left) in network.get(left).into_iter().flat_map(Map::iter) {
+                    if literal(before) && literal(right) {
+                        continue;
+                    }
                     let composed = to_left.mirrored().composed(relation);
                     if self.narrow_through(order, before, right, composed).is_some() {
                         queue(&mut pending, before, right);
@@ -342,17 +369,11 @@ impl<R: Ord + Clone> Guarantees<R> {
             let Some((subject, row)) = network.get_key_value(subject) else {
                 continue;
             };
-            let mut pending = Vec::new();
-            for (other, relation) in row {
-                if relation.is_empty() {
-                    self.separate(subject, other);
-                    if self.impossible {
-                        return;
-                    }
-                } else {
-                    pending.push((subject, other));
-                }
-            }
+            let pending = row
+                .iter()
+                .filter(|(_, relation)| !relation.is_empty())
+                .map(|(other, _)| (subject, other))
+                .collect();
             self.propagate(*order, network, pending);
             if self.impossible {
                 return;
@@ -372,6 +393,9 @@ impl<R: Ord + Clone> Guarantees<R> {
 
     /// Applies that `left` and `right` never both hold a value.
     fn separate(&mut self, left: &Subject<R>, right: &Subject<R>) {
+        if self.impossible {
+            return;
+        }
         let to_null = match (self.non_null(left), self.non_null(right)) {
             (true, true) => {
                 *self = Self::impossible();
@@ -380,12 +404,47 @@ impl<R: Ord + Clone> Guarantees<R> {
             (true, false) => right,
             (false, true) => left,
             (false, false) if left == right => left,
-            (false, false) => return,
+            (false, false) => {
+                self.keep_apart(left, right);
+                return;
+            }
         };
-        if let Some(evaluation) = self.get(to_null) {
-            let null = evaluation.clone().with_values(Values::none());
-            self.restrict(to_null.clone(), null);
+        match self.get(to_null) {
+            Some(evaluation) => {
+                let null = evaluation.clone().with_values(Values::none());
+                self.restrict(to_null.clone(), null);
+            }
+            // A subject nothing is known about cannot be held `NULL` yet.
+            None if left != right => self.keep_apart(left, right),
+            None => {}
         }
+    }
+
+    /// Records that `left` and `right`, two subjects, never both hold a value.
+    fn keep_apart(&mut self, left: &Subject<R>, right: &Subject<R>) {
+        for (subject, partner) in [(left, right), (right, left)] {
+            if let Some(partners) = self.apart.get_mut(subject) {
+                partners.insert_mut(partner.clone(), ());
+            } else {
+                let partners = Map::new_sync().insert(partner.clone(), ());
+                self.apart.insert_mut(subject.clone(), partners);
+            }
+        }
+    }
+
+    /// Every subject held `NULL`.
+    fn null_subjects(&self) -> impl Iterator<Item = Subject<R>> + '_ {
+        let references = self
+            .references
+            .iter()
+            .filter(|(_, evaluation)| evaluation.values().is_empty())
+            .map(|(reference, _)| Subject::Reference(reference.clone()));
+        let expressions = self
+            .expressions
+            .iter()
+            .filter(|(_, evaluation)| evaluation.values().is_empty())
+            .map(|(expression, _)| Subject::Expression(expression.clone()));
+        references.chain(expressions)
     }
 
     /// The guarantee about `subject`, `None` when it is unconstrained.
@@ -432,12 +491,14 @@ impl<R: Ord + Clone> Guarantees<R> {
             Some(known) => known.meet(&evaluation),
             None => evaluation,
         };
-        if narrowed.values().is_empty() && !narrowed.may_be_null() {
+        let narrowed_null = narrowed.values().is_empty();
+        if narrowed_null && !narrowed.may_be_null() {
             *self = Self::impossible();
             return;
         }
-        let composes =
-            (!narrowed.may_be_null() && !self.non_null(&subject)).then(|| subject.clone());
+        let composes = !narrowed.may_be_null() && !self.non_null(&subject);
+        let partners = self.apart.get(&subject).cloned();
+        let follow = (composes || partners.is_some()).then(|| subject.clone());
         match subject {
             Subject::Reference(reference) => {
                 self.references.insert_mut(reference, narrowed);
@@ -446,7 +507,19 @@ impl<R: Ord + Clone> Guarantees<R> {
                 self.expressions.insert_mut(expression, narrowed);
             }
         }
-        if let Some(subject) = composes {
+        let Some(subject) = follow else {
+            return;
+        };
+        // A subject just held `NULL` has nothing left to separate, which
+        // also ends the recursion through `separate`.
+        if !narrowed_null {
+            for partner in partners.iter().flat_map(Map::keys) {
+                if self.non_null(&subject) || self.non_null(partner) {
+                    self.separate(&subject, partner);
+                }
+            }
+        }
+        if composes && !self.impossible {
             self.compose_through(&subject);
         }
     }
@@ -471,12 +544,17 @@ impl<R: Ord + Clone> Guarantees<R> {
                 }
             }
         }
+        for (left, partners) in &other.apart {
+            for (right, ()) in partners.range(left..) {
+                met.separate(left, right);
+            }
+        }
         met
     }
 
     /// The guarantees holding when either holds: a subject only one side
-    /// constrains is left unconstrained, and so is a pair only one side
-    /// relates.
+    /// constrains is left unconstrained, and a pair stands in the orders
+    /// either side allows it.
     #[must_use]
     pub fn join(&self, other: &Self) -> Self {
         if self.impossible {
@@ -485,8 +563,7 @@ impl<R: Ord + Clone> Guarantees<R> {
         if other.impossible {
             return self.clone();
         }
-        Self {
-            impossible: false,
+        let mut joined = Self {
             references: self
                 .references
                 .iter()
@@ -507,30 +584,116 @@ impl<R: Ord + Clone> Guarantees<R> {
                         .map(|theirs| (expression.clone(), evaluation.join(theirs)))
                 })
                 .collect(),
-            relations: self
-                .relations
-                .iter()
-                .filter_map(|(order, network)| {
-                    let theirs = other.relations.get(order)?;
-                    let joined: Network<R> = network
-                        .iter()
-                        .filter_map(|(left, related)| {
-                            let their_related = theirs.get(left)?;
-                            let joined: Row<R> = related
-                                .iter()
-                                .filter_map(|(right, relation)| {
-                                    let union = relation.union(*their_related.get(right)?);
-                                    (union != Relation::ANY).then(|| (right.clone(), union))
-                                })
-                                .collect();
-                            (!joined.is_empty()).then(|| (left.clone(), joined))
-                        })
-                        .collect();
-                    (!joined.is_empty()).then_some((*order, joined))
-                })
-                .collect(),
+            ..Self::new()
+        };
+        for (first, second) in [(self, other), (other, self)] {
+            for (left, partners) in &first.apart {
+                for right in partners.keys() {
+                    joined.keep_apart_in_both(left, right, second);
+                }
+            }
+            for left in first.null_subjects() {
+                let partners = second.apart.get(&left).into_iter().flat_map(Map::keys);
+                for right in partners.cloned().chain(second.null_subjects()) {
+                    joined.keep_apart_in_both(&left, &right, second);
+                }
+            }
+        }
+        // The join starts from `self`'s relations and rewrites only the pairs
+        // `other` widens, so a side that adds nothing costs no copying.
+        joined.relations = self.relations.clone();
+        for (order, network) in &self.relations {
+            for (left, row) in network {
+                for (right, stored) in row.range(left..) {
+                    let union = self
+                        .relation(*order, left, right)
+                        .union(other.relation(*order, left, right));
+                    if union == *stored {
+                        continue;
+                    }
+                    if union == Relation::ANY || union.is_empty() {
+                        joined.forget(*order, left, right);
+                    } else {
+                        joined.store(*order, left, right, union);
+                    }
+                }
+            }
+        }
+        // A pair only `other` relates keeps its relation where `self` never
+        // has both hold a value.
+        for left in self.null_subjects().chain(self.apart.keys().cloned()) {
+            for (order, network) in &other.relations {
+                for right in network.get(&left).into_iter().flat_map(Map::keys) {
+                    joined.keep_union(*order, &left, right, self, other);
+                }
+            }
+        }
+        joined
+    }
+
+    /// Stores the orders either `first` or `second` allows `left` to stand
+    /// in to `right`, when that is neither every order nor none.
+    fn keep_union(
+        &mut self,
+        order: Order,
+        left: &Subject<R>,
+        right: &Subject<R>,
+        first: &Self,
+        second: &Self,
+    ) {
+        let theirs = second.relation(order, left, right);
+        if theirs == Relation::ANY {
+            return;
+        }
+        let union = first.relation(order, left, right).union(theirs);
+        if union != Relation::ANY && !union.is_empty() {
+            self.store(order, left, right, union);
         }
     }
+
+    /// Drops the relation of `left` to `right` under `order`, and its mirror.
+    fn forget(&mut self, order: Order, left: &Subject<R>, right: &Subject<R>) {
+        let Some(network) = self.relations.get_mut(&order) else {
+            return;
+        };
+        for (from, to) in [(left, right), (right, left)] {
+            let emptied = network.get_mut(from).is_some_and(|row| {
+                row.remove_mut(to);
+                row.is_empty()
+            });
+            if emptied {
+                network.remove_mut(from);
+            }
+        }
+        if network.is_empty() {
+            self.relations.remove_mut(&order);
+        }
+    }
+
+    /// Stores the relation of `left` to `right` under `order`.
+    fn store(&mut self, order: Order, left: &Subject<R>, right: &Subject<R>, relation: Relation) {
+        if let Some(network) = self.relations.get_mut(&order) {
+            store(network, left, right, relation);
+        } else {
+            let mut network = Map::new_sync();
+            store(&mut network, left, right, relation);
+            self.relations.insert_mut(order, network);
+        }
+    }
+
+    /// Keeps `left` and `right` apart in a join when `other`, the side that
+    /// did not list the pair, never has both hold a value either.
+    fn keep_apart_in_both(&mut self, left: &Subject<R>, right: &Subject<R>, other: &Self) {
+        if left != right && other.never_both(left, right) && !self.null(left) && !self.null(right) {
+            self.keep_apart(left, right);
+        }
+    }
+}
+
+/// Whether `subject` is a literal. Composition never relates two literals,
+/// which stand in the order their values decide.
+fn literal<R>(subject: &Subject<R>) -> bool {
+    matches!(subject, Subject::Expression(Expr::Value(_)))
 }
 
 /// `subject` standing equal to itself, then each subject but `other` its row
@@ -658,116 +821,243 @@ mod tests {
         }
     }
 
-    /// The relations among `count` subjects that `constraints` leave once
-    /// closed through those in `non_null` from scratch, with the subjects
-    /// held `NULL`, `None` when no row satisfies them.
-    fn closure(
-        non_null: &[bool],
-        constraints: &[(usize, usize, Relation)],
-    ) -> Option<(Vec<Vec<Relation>>, Vec<bool>)> {
-        let count = non_null.len();
-        let mut relations = alloc::vec![alloc::vec![Relation::ANY; count]; count];
-        for (index, row) in relations.iter_mut().enumerate() {
-            row[index] = Relation::EQUAL;
+    /// A random run of guarantees over a few integers, as the closure
+    /// oracle replays it.
+    #[derive(Debug, Clone)]
+    struct Script {
+        non_null: Vec<bool>,
+        null: Vec<bool>,
+        constraints: Vec<(usize, usize, Relation)>,
+    }
+
+    impl Script {
+        /// Draws a run over `names` and applies it to guarantees holding
+        /// each name to any integer or `NULL`.
+        fn draw(draws: &mut Draws, names: &[&str]) -> (Self, Guarantees<String>) {
+            let count = names.len();
+            let mut guarantees = integers(names, names);
+            let mut script = Self {
+                non_null: alloc::vec![false; count],
+                null: alloc::vec![false; count],
+                constraints: Vec::new(),
+            };
+            for _ in 0..=draws.below(24) {
+                let left = draws.below(count);
+                match draws.below(8) {
+                    0 | 1 => {
+                        script.non_null[left] = true;
+                        guarantees.restrict(ref_subject(names[left]), integer(false));
+                    }
+                    2 => {
+                        script.null[left] = true;
+                        let null = integer(true).with_values(Values::none());
+                        guarantees.restrict(ref_subject(names[left]), null);
+                    }
+                    _ => {
+                        let right = draws.below(count);
+                        let bits = draws.below(8);
+                        let relation = Relation {
+                            less: bits & 1 != 0,
+                            equal: bits & 2 != 0,
+                            greater: bits & 4 != 0,
+                        };
+                        script.constraints.push((left, right, relation));
+                        let (left, right) = (ref_subject(names[left]), ref_subject(names[right]));
+                        guarantees.relate(Order::Number, &left, &right, relation);
+                    }
+                }
+            }
+            (script, guarantees)
         }
-        for &(left, right, relation) in constraints {
-            relations[left][right] = relations[left][right].intersection(relation);
-            relations[right][left] = relations[right][left].intersection(relation.mirrored());
+
+        /// Both runs, one after the other.
+        fn and(&self, other: &Self) -> Self {
+            let either = |left: &[bool], right: &[bool]| {
+                left.iter().zip(right).map(|(left, right)| *left || *right).collect()
+            };
+            Self {
+                non_null: either(&self.non_null, &other.non_null),
+                null: either(&self.null, &other.null),
+                constraints: [&self.constraints[..], &other.constraints[..]].concat(),
+            }
         }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for middle in (0..count).filter(|&middle| non_null[middle]) {
-                for left in 0..count {
-                    for right in 0..count {
-                        let first = relations[left][middle];
-                        let second = relations[middle][right];
-                        if left == right || first.is_empty() || second.is_empty() {
-                            continue;
-                        }
-                        let narrowed = relations[left][right].intersection(first.composed(second));
-                        if narrowed != relations[left][right] {
-                            relations[left][right] = narrowed;
-                            relations[right][left] = narrowed.mirrored();
-                            changed = true;
+
+        /// The relation of each subject to each other one under
+        /// `Order::Number`, closed from scratch through every subject held
+        /// to a value, `None` when no row satisfies the run.
+        fn closure(&self) -> Option<Vec<Vec<Relation>>> {
+            let count = self.non_null.len();
+            if (0..count).any(|index| self.non_null[index] && self.null[index]) {
+                return None;
+            }
+            let mut relations = alloc::vec![alloc::vec![Relation::ANY; count]; count];
+            for (index, row) in relations.iter_mut().enumerate() {
+                row[index] = Relation::EQUAL;
+            }
+            for &(left, right, relation) in &self.constraints {
+                relations[left][right] = relations[left][right].intersection(relation);
+                relations[right][left] = relations[right][left].intersection(relation.mirrored());
+            }
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for middle in (0..count).filter(|&middle| self.non_null[middle]) {
+                    for left in 0..count {
+                        for right in 0..count {
+                            let first = relations[left][middle];
+                            let second = relations[middle][right];
+                            if left == right || first.is_empty() || second.is_empty() {
+                                continue;
+                            }
+                            let composed = first.composed(second);
+                            let narrowed = relations[left][right].intersection(composed);
+                            if narrowed != relations[left][right] {
+                                relations[left][right] = narrowed;
+                                relations[right][left] = narrowed.mirrored();
+                                changed = true;
+                            }
                         }
                     }
                 }
             }
-        }
-        let mut null = alloc::vec![false; count];
-        for left in 0..count {
-            for right in 0..count {
-                if !relations[left][right].is_empty() {
-                    continue;
-                }
-                match (non_null[left], non_null[right]) {
-                    (true, true) => return None,
-                    (true, false) => null[right] = true,
-                    (false, true) => null[left] = true,
-                    (false, false) => null[left] |= left == right,
+            let mut null = self.null.clone();
+            for left in 0..count {
+                for right in 0..count {
+                    if !relations[left][right].is_empty() {
+                        continue;
+                    }
+                    match (self.non_null[left], self.non_null[right]) {
+                        (true, true) => return None,
+                        (true, false) => null[right] = true,
+                        (false, true) => null[left] = true,
+                        (false, false) => null[left] |= left == right,
+                    }
                 }
             }
+            for (left, row) in relations.iter_mut().enumerate() {
+                for (right, relation) in row.iter_mut().enumerate() {
+                    if left != right && (null[left] || null[right]) {
+                        *relation = Relation::NONE;
+                    }
+                }
+            }
+            Some(relations)
         }
-        Some((relations, null))
+    }
+
+    /// Names for `count` subjects.
+    fn names(count: usize) -> Vec<String> {
+        (0..count).map(|index| alloc::format!("s{index}")).collect()
+    }
+
+    /// Asserts `guarantees` hold the relations `closure` of `script`
+    /// computes, under every order since only `Order::Number` was related.
+    fn assert_closure(guarantees: &Guarantees<String>, script: &Script, names: &[&str]) {
+        let Some(relations) = script.closure() else {
+            assert!(guarantees.is_impossible(), "{script:?}");
+            return;
+        };
+        assert!(!guarantees.is_impossible(), "{script:?}");
+        for (left, row) in relations.iter().enumerate() {
+            for (right, expected) in row.iter().enumerate().filter(|(right, _)| *right != left) {
+                let (left, right) = (&ref_subject(names[left]), &ref_subject(names[right]));
+                let number = guarantees.relation(Order::Number, left, right);
+                assert_eq!(number, *expected, "{left:?} to {right:?} in {script:?}");
+                let other = if expected.is_empty() { Relation::NONE } else { Relation::ANY };
+                let time = guarantees.relation(Order::Time, left, right);
+                assert_eq!(time, other, "{left:?} to {right:?} in {script:?}");
+            }
+        }
     }
 
     #[test]
     fn relations_match_their_closure_whatever_the_order() {
         for seed in 0..4000_u64 {
             let mut draws = Draws(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-            let count = 2 + draws.below(7);
-            let names: Vec<_> = (0..count).map(|index| alloc::format!("s{index}")).collect();
+            let names = names(2 + draws.below(7));
             let names: Vec<_> = names.iter().map(String::as_str).collect();
-            let mut guarantees = integers(&names, &names);
-            let mut non_null = alloc::vec![false; count];
-            let mut constraints = Vec::new();
-            for _ in 0..=draws.below(24) {
-                let left = draws.below(count);
-                if draws.below(4) == 0 {
-                    non_null[left] = true;
-                    guarantees.restrict(ref_subject(names[left]), integer(false));
-                    continue;
-                }
-                let right = draws.below(count);
-                let bits = draws.below(8);
-                let relation =
-                    Relation { less: bits & 1 != 0, equal: bits & 2 != 0, greater: bits & 4 != 0 };
-                constraints.push((left, right, relation));
-                let (left, right) = (ref_subject(names[left]), ref_subject(names[right]));
-                guarantees.relate(Order::Number, &left, &right, relation);
-            }
-            let Some((relations, null)) = closure(&non_null, &constraints) else {
-                assert!(guarantees.is_impossible(), "seed {seed}: {constraints:?} {non_null:?}");
-                continue;
-            };
-            assert!(!guarantees.is_impossible(), "seed {seed}: {constraints:?} {non_null:?}");
-            for left in 0..count {
-                let held_null = guarantees
-                    .reference(&names[left].to_string())
-                    .is_some_and(|evaluation| evaluation.values().is_empty());
-                assert_eq!(
-                    held_null, null[left],
-                    "seed {seed}: {left} {constraints:?} {non_null:?}"
-                );
-                for right in (0..count).filter(|&right| right != left) {
-                    let expected = if null[left] || null[right] {
-                        Relation::NONE
-                    } else {
-                        relations[left][right]
+            let (script, guarantees) = Script::draw(&mut draws, &names);
+            assert_closure(&guarantees, &script, &names);
+        }
+    }
+
+    #[test]
+    fn meet_matches_the_closure_of_both_runs() {
+        for seed in 0..4000_u64 {
+            let mut draws = Draws(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let names = names(2 + draws.below(7));
+            let names: Vec<_> = names.iter().map(String::as_str).collect();
+            let (left_script, left) = Script::draw(&mut draws, &names);
+            let (right_script, right) = Script::draw(&mut draws, &names);
+            assert_closure(&left.meet(&right), &left_script.and(&right_script), &names);
+        }
+    }
+
+    #[test]
+    fn join_unites_the_relations_of_both_sides() {
+        for seed in 0..4000_u64 {
+            let mut draws = Draws(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let names = names(2 + draws.below(7));
+            let names: Vec<_> = names.iter().map(String::as_str).collect();
+            let (_, left) = Script::draw(&mut draws, &names);
+            let (_, right) = Script::draw(&mut draws, &names);
+            let joined = left.join(&right);
+            for (left_name, right_name) in
+                names.iter().flat_map(|left| names.iter().map(move |right| (left, right)))
+            {
+                let (left_subject, right_subject) =
+                    (&ref_subject(left_name), &ref_subject(right_name));
+                for order in [Order::Number, Order::Time] {
+                    let relation = |guarantees: &Guarantees<String>| {
+                        guarantees.relation(order, left_subject, right_subject)
                     };
-                    let actual = guarantees.relation(
-                        Order::Number,
-                        &ref_subject(names[left]),
-                        &ref_subject(names[right]),
-                    );
+                    let expected = match (left.is_impossible(), right.is_impossible()) {
+                        (true, _) => relation(&right),
+                        (false, true) => relation(&left),
+                        (false, false) => relation(&left).union(relation(&right)),
+                    };
                     assert_eq!(
-                        actual, expected,
-                        "seed {seed}: {left} to {right} {constraints:?} {non_null:?}"
+                        relation(&joined),
+                        expected,
+                        "seed {seed}: {left_name} to {right_name}"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn join_keeps_a_relation_the_other_side_holds_null() {
+        // `a < b OR b IS NULL`
+        let mut left = integers(&["a", "b"], &["a", "b"]);
+        left.relate(Order::Number, &ref_subject("a"), &ref_subject("b"), Relation::LESS);
+        let mut right = integers(&["a", "b"], &["a", "b"]);
+        right.restrict(ref_subject("b"), integer(true).with_values(Values::none()));
+        let joined = left.join(&right);
+        assert_eq!(
+            joined.relation(Order::Number, &ref_subject("a"), &ref_subject("b")),
+            Relation::LESS
+        );
+    }
+
+    #[test]
+    fn join_keeps_two_subjects_apart_each_side_holds_null() {
+        // `x IS NULL OR y IS NULL`
+        let null = integer(true).with_values(Values::none());
+        let mut left = integers(&["x", "y"], &["x", "y"]);
+        left.restrict(ref_subject("x"), null.clone());
+        let mut right = integers(&["x", "y"], &["x", "y"]);
+        right.restrict(ref_subject("y"), null);
+        let mut joined = left.join(&right);
+        let text = Order::Text(crate::scalar::Collation::C);
+        for order in [Order::Number, Order::Time, text] {
+            assert_eq!(
+                joined.relation(order, &ref_subject("x"), &ref_subject("y")),
+                Relation::NONE
+            );
+        }
+        joined.restrict(ref_subject("x"), integer(false));
+        assert!(joined.reference(&"y".to_string()).is_some_and(|y| y.values().is_empty()));
     }
 
     #[test]

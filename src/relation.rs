@@ -87,31 +87,14 @@ impl Relation {
     /// stands in `other` to `c`, by the point algebra's composition table.
     #[must_use]
     pub fn composed(self, other: Self) -> Self {
-        let mut composed = Self::NONE;
-        for first in self.singles() {
-            for second in other.singles() {
-                composed = composed.union(basic_composition(first, second));
-            }
+        let (first, second) = (!self.is_empty(), !other.is_empty());
+        Self {
+            less: (self.less && second) || (other.less && first),
+            equal: (self.equal && other.equal)
+                || (self.less && other.greater)
+                || (self.greater && other.less),
+            greater: (self.greater && second) || (other.greater && first),
         }
-        composed
-    }
-
-    /// The single orders the relation holds.
-    fn singles(self) -> impl Iterator<Item = Self> {
-        [(self.less, Self::LESS), (self.equal, Self::EQUAL), (self.greater, Self::GREATER)]
-            .into_iter()
-            .filter_map(|(held, single)| held.then_some(single))
-    }
-}
-
-/// The composition of two single orders.
-fn basic_composition(first: Relation, second: Relation) -> Relation {
-    if first == Relation::EQUAL {
-        second
-    } else if second == Relation::EQUAL || first == second {
-        first
-    } else {
-        Relation::ANY
     }
 }
 
