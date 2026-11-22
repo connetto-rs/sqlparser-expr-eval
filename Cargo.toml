@@ -15,6 +15,13 @@ categories = ["database", "no-std"]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", default-features = false, features = ["visitor"] }
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
 
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "evaluation"
+harness = false
+
 [features]
 default = ["std"]
 std = ["sqlparser/std", "sqlparser/recursive-protection"]
