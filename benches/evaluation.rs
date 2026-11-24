@@ -30,10 +30,10 @@ const LINEAR: &[usize] = &[8, 64, 512];
 const STEEP: &[usize] = &[8, 16, 32, 64];
 
 /// A context with a nullable integer `x`, a nullable text `s`, the integers
-/// `c0` to `c{count - 1}` that are never `NULL`, and the text built-ins.
-fn context(count: usize) -> Ctx {
+/// `c0` to `c{count - 1}`, nullable when `nullable`, and the text built-ins.
+fn context(count: usize, nullable: bool) -> Ctx {
     let mut columns = vec![("x".into(), column(INTEGER, true)), ("s".into(), column(TEXT, true))];
-    columns.extend((0..count).map(|index| (format!("c{index}"), column(INTEGER, false))));
+    columns.extend((0..count).map(|index| (format!("c{index}"), column(INTEGER, nullable))));
     Ctx::with_columns(columns)
         .with_callee("length", builtin_callee(Builtin::Length, INTEGER))
         .with_callee("lower", builtin_callee(Builtin::Lower, TEXT))
@@ -55,7 +55,7 @@ fn forward_group(
     let mut group = criterion.benchmark_group(group);
     for &size in sizes {
         let expression = parse(&sql(size));
-        let mut context = context(0);
+        let mut context = context(0, false);
         let guarantees = Guarantees::new();
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -112,18 +112,20 @@ fn text_calls(criterion: &mut Criterion) {
     });
 }
 
-/// Measures `implied` taking `TRUE` for each expression of `group`, built
-/// from each of `sizes` over a context holding that many integer columns.
+/// Measures `implied` taking `outcomes` for each expression of `group`,
+/// built from each of `sizes` over a context holding that many integer
+/// columns, nullable when `nullable`.
 fn backward_group(
     criterion: &mut Criterion,
     group: &str,
     sizes: &[usize],
+    (outcomes, nullable): (Outcomes, bool),
     sql: impl Fn(usize) -> String,
 ) {
     let mut group = criterion.benchmark_group(group);
     for &size in sizes {
         let expression = parse(&sql(size));
-        let mut context = context(size + 1);
+        let mut context = context(size + 1, nullable);
         let guarantees = Guarantees::new();
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -132,7 +134,7 @@ fn backward_group(
                 bencher.iter(|| {
                     implied(
                         black_box(expression),
-                        Outcomes::TRUE,
+                        outcomes,
                         &PostgreSqlDialect {},
                         &PostgreSqlOptions::default(),
                         &mut context,
@@ -147,20 +149,54 @@ fn backward_group(
 }
 
 fn relation_chain(criterion: &mut Criterion) {
-    backward_group(criterion, "backward/relation_chain", STEEP, |size| {
+    backward_group(criterion, "backward/relation_chain", STEEP, (Outcomes::TRUE, false), |size| {
         joined(size, " AND ", |index| format!("c{index} < c{}", index + 1))
     });
 }
 
 fn bounds(criterion: &mut Criterion) {
-    backward_group(criterion, "backward/bounds", STEEP, |size| {
+    backward_group(criterion, "backward/bounds", STEEP, (Outcomes::TRUE, false), |size| {
         joined(size, " AND ", |index| format!("c{index} BETWEEN {index} AND {}", index + 10))
     });
 }
 
 fn disjoint_values(criterion: &mut Criterion) {
-    backward_group(criterion, "backward/or_of_equalities", LINEAR, |size| {
-        joined(size, " OR ", |index| format!("(x = {index} AND c{index} IS NOT NULL)"))
+    backward_group(
+        criterion,
+        "backward/or_of_equalities",
+        LINEAR,
+        (Outcomes::TRUE, false),
+        |size| joined(size, " OR ", |index| format!("(x = {index} AND c{index} IS NOT NULL)")),
+    );
+}
+
+/// Measures `implied` taking `NOT_FALSE`, as a check holds, on the
+/// disjunction of two conjunctions of `size` terms over nullable columns,
+/// each term built by `term` from its column and whether it stands in the
+/// first conjunction.
+fn disjoint_conjunctions(
+    criterion: &mut Criterion,
+    group: &str,
+    term: impl Fn(usize, bool) -> String,
+) {
+    backward_group(criterion, group, &[2, 4, 8], (Outcomes::NOT_FALSE, true), |size| {
+        format!(
+            "({}) OR ({})",
+            joined(size, " AND ", |index| term(index, true)),
+            joined(size, " AND ", |index| term(index, false))
+        )
+    });
+}
+
+fn null_pairs(criterion: &mut Criterion) {
+    disjoint_conjunctions(criterion, "backward/null_pairs", |index, first| {
+        format!("c{index} IS {}NULL", if first { "" } else { "NOT " })
+    });
+}
+
+fn sign_pairs(criterion: &mut Criterion) {
+    disjoint_conjunctions(criterion, "backward/sign_pairs", |index, first| {
+        format!("c{index} {} 0", if first { ">" } else { "<" })
     });
 }
 
@@ -173,6 +209,8 @@ criterion_group!(
     text_calls,
     relation_chain,
     bounds,
-    disjoint_values
+    disjoint_values,
+    null_pairs,
+    sign_pairs
 );
 criterion_main!(benches);

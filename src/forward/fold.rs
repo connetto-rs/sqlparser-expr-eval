@@ -773,21 +773,15 @@ fn and_or<D: EvalDialect, C: Context>(
         let decided = if and { Outcomes::FALSE } else { Outcomes::TRUE };
         return Ok(Evaluation::condition(decided, error));
     }
-    // The guarantees each outcome of the prefix seen so far implies, and
-    // the guarantee of the prefix not being false, or not being true for an
-    // `OR`, which the outcome updates draw on.
     let base = state.guarantees.clone();
-    let mut true_guarantee = if and { base.clone() } else { Guarantees::impossible() };
-    let mut false_guarantee = if and { Guarantees::impossible() } else { base.clone() };
-    let mut null_guarantee = Guarantees::impossible();
-    let mut helper_guarantee = base.clone();
+    let mut prefix = Prefix::start(&base, and);
     let mut outcomes = if and { Outcomes::TRUE } else { Outcomes::FALSE };
     let mut error = false;
     // A term that decides the chain may be read first, and the engine then
     // skips a term that would raise.
     let mut deciding = false;
     let mut first = true;
-    for term in terms {
+    for (position, term) in terms.iter().enumerate() {
         // The first term has no prefix to read under, nor has a term after a
         // prefix that always raises, and each later term reads correlated
         // only while the budget holds.
@@ -797,9 +791,9 @@ fn and_or<D: EvalDialect, C: Context>(
             // The term is read once per outcome the prefix may take, under
             // what that outcome implies, so the sides correlate.
             for (single, guarantee) in [
-                (Outcomes::TRUE, &true_guarantee),
-                (Outcomes::FALSE, &false_guarantee),
-                (Outcomes::NULL, &null_guarantee),
+                (Outcomes::TRUE, &prefix.truth),
+                (Outcomes::FALSE, &prefix.falsity),
+                (Outcomes::NULL, &prefix.null),
             ] {
                 if single.intersection(outcomes).is_empty() {
                     continue;
@@ -839,45 +833,87 @@ fn and_or<D: EvalDialect, C: Context>(
             error |= evaluation.may_raise();
         }
         first = false;
-        // The running guarantees feed the next term's correlated reads.
-        if state.budget.get() > 0 {
-            if and {
-                let next_true = narrow_within(state, term, &true_guarantee, Outcomes::TRUE)?;
-                let next_null = Guarantees::join(
-                    &narrow_within(state, term, &null_guarantee, Outcomes::NOT_FALSE)?,
-                    &narrow_within(state, term, &true_guarantee, Outcomes::NULL)?,
-                );
-                let next_false = Guarantees::join(
-                    &false_guarantee,
-                    &narrow_within(state, term, &helper_guarantee, Outcomes::FALSE)?,
-                );
-                let next_helper =
-                    narrow_within(state, term, &helper_guarantee, Outcomes::NOT_FALSE)?;
-                (true_guarantee, false_guarantee, null_guarantee, helper_guarantee) =
-                    (next_true, next_false, next_null, next_helper);
-            } else {
-                let next_false = narrow_within(state, term, &false_guarantee, Outcomes::FALSE)?;
-                // The term alone may be the true one, so it is read under
-                // the base, not the prefix.
-                let next_true = Guarantees::join(
-                    &true_guarantee,
-                    &narrow_within(state, term, &base, Outcomes::TRUE)?,
-                );
-                let next_null = Guarantees::join(
-                    &narrow_within(state, term, &null_guarantee, Outcomes::NOT_TRUE)?,
-                    &narrow_within(state, term, &helper_guarantee, Outcomes::NULL)?,
-                );
-                let next_helper =
-                    narrow_within(state, term, &helper_guarantee, Outcomes::NOT_TRUE)?;
-                (true_guarantee, false_guarantee, null_guarantee, helper_guarantee) =
-                    (next_true, next_false, next_null, next_helper);
-            }
+        // The running guarantees feed the next term's correlated reads, so
+        // the last term updates none.
+        if position + 1 < terms.len() && state.budget.get() > 0 {
+            prefix = prefix.advanced(state, term, &base, and)?;
         }
     }
     if deciding {
         outcomes = outcomes.union(if and { Outcomes::FALSE } else { Outcomes::TRUE });
     }
     Ok(Evaluation::condition(outcomes, error))
+}
+
+/// The guarantees each outcome of the prefix of an `AND`/`OR` chain seen so
+/// far implies, and the guarantee of the prefix not being false, or not
+/// being true for an `OR`, which the outcome updates draw on.
+struct Prefix<R> {
+    truth: Guarantees<R>,
+    falsity: Guarantees<R>,
+    null: Guarantees<R>,
+    helper: Guarantees<R>,
+}
+
+impl<R: Ord + Clone> Prefix<R> {
+    /// The empty prefix of a chain read under `base`, which takes the
+    /// chain's identity outcome.
+    fn start(base: &Guarantees<R>, and: bool) -> Self {
+        Self {
+            truth: if and { base.clone() } else { Guarantees::impossible() },
+            falsity: if and { Guarantees::impossible() } else { base.clone() },
+            null: Guarantees::impossible(),
+            helper: base.clone(),
+        }
+    }
+
+    /// The prefix extended by `term`, the chain being read under `base`.
+    fn advanced<D: EvalDialect, C: Context<Reference = R>>(
+        self,
+        state: &mut State<'_, D, C>,
+        term: &Expr,
+        base: &Guarantees<R>,
+        and: bool,
+    ) -> Result<Self, C::Error> {
+        if and {
+            let [truth, null_from_null, null_from_true, false_from_helper, helper] = narrow_each(
+                state,
+                term,
+                [
+                    (&self.truth, Outcomes::TRUE),
+                    (&self.null, Outcomes::NOT_FALSE),
+                    (&self.truth, Outcomes::NULL),
+                    (&self.helper, Outcomes::FALSE),
+                    (&self.helper, Outcomes::NOT_FALSE),
+                ],
+            )?;
+            return Ok(Self {
+                truth,
+                falsity: self.falsity.join(&false_from_helper),
+                null: null_from_null.join(&null_from_true),
+                helper,
+            });
+        }
+        // The term alone may be the true one, so it is read under the base,
+        // not the prefix.
+        let [falsity, true_from_base, null_from_null, null_from_helper, helper] = narrow_each(
+            state,
+            term,
+            [
+                (&self.falsity, Outcomes::FALSE),
+                (base, Outcomes::TRUE),
+                (&self.null, Outcomes::NOT_TRUE),
+                (&self.helper, Outcomes::NULL),
+                (&self.helper, Outcomes::NOT_TRUE),
+            ],
+        )?;
+        Ok(Self {
+            truth: self.truth.join(&true_from_base),
+            falsity,
+            null: null_from_null.join(&null_from_helper),
+            helper,
+        })
+    }
 }
 
 /// Whether the planner may raise as it reduces the `AND`/`OR` chain of
@@ -945,23 +981,44 @@ fn folding_may_raise<D: EvalDialect, C: Context>(
     Ok(false)
 }
 
-/// [`backward::implied_within`](super::super::backward::implied_within) on one
-/// term, drawing on the pass's budget.
-fn narrow_within<D: EvalDialect, C: Context>(
+/// [`backward::implied_each_within`](super::super::backward::implied_each_within)
+/// on one term for each `(base, outcomes)` request, drawing on the pass's
+/// budget. Requests on equal bases share one backward pass, and an
+/// impossible base implies impossible guarantees without one.
+fn narrow_each<D: EvalDialect, C: Context, const N: usize>(
     state: &mut State<'_, D, C>,
     term: &Expr,
-    base: &Guarantees<C::Reference>,
-    single: Outcomes,
-) -> Result<Guarantees<C::Reference>, C::Error> {
-    super::super::backward::implied_within(
-        term,
-        single,
-        state.dialect,
-        state.options,
-        state.context,
-        base,
-        state.budget,
-    )
+    requests: [(&Guarantees<C::Reference>, Outcomes); N],
+) -> Result<[Guarantees<C::Reference>; N], C::Error> {
+    let mut narrowed: [Guarantees<C::Reference>; N] =
+        core::array::from_fn(|_| Guarantees::impossible());
+    let mut answered = [false; N];
+    for (position, &(base, _)) in requests.iter().enumerate() {
+        if answered[position] || base.is_impossible() {
+            continue;
+        }
+        let sharing: Vec<usize> = (position..N)
+            .filter(|&other| {
+                let other_base = requests[other].0;
+                !answered[other] && (core::ptr::eq(other_base, base) || *other_base == *base)
+            })
+            .collect();
+        let outcomes: Vec<Outcomes> = sharing.iter().map(|&other| requests[other].1).collect();
+        let answers = super::super::backward::implied_each_within(
+            term,
+            &outcomes,
+            state.dialect,
+            state.options,
+            state.context,
+            base,
+            state.budget,
+        )?;
+        for (other, answer) in sharing.into_iter().zip(answers) {
+            narrowed[other] = answer;
+            answered[other] = true;
+        }
+    }
+    Ok(narrowed)
 }
 
 /// The unary operator of an expression, forward.

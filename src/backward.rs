@@ -80,31 +80,54 @@ pub(super) fn implied_within<D: EvalDialect, C: Context>(
     Ok(narrowed)
 }
 
+/// [`implied_within`] for each outcome set of `requests`, all of them drawn
+/// from one forward reading of `expression` and one narrowing per single
+/// outcome.
+pub(super) fn implied_each_within<D: EvalDialect, C: Context>(
+    expression: &Expr,
+    requests: &[Outcomes],
+    dialect: &D,
+    options: &D::Options,
+    context: &mut C,
+    guarantees: &Guarantees<C::Reference>,
+    budget: &Cell<u32>,
+) -> Result<Vec<Guarantees<C::Reference>>, C::Error> {
+    let mut base = guarantees.clone();
+    let mut state = State { dialect, options, context, guarantees: &mut base, budget, depth: 0 };
+    node_each(&mut state, expression, requests)
+}
+
+/// `expression` without its parentheses and its run of `NOT`, and whether
+/// that run negates the outcomes. `NOT` negates the outcome set exactly, so
+/// the run is folded here; splitting per level would double the branches at
+/// each.
+fn unwrapped(expression: &Expr) -> (&Expr, bool) {
+    let mut expression = expression;
+    let mut negated = false;
+    loop {
+        expression = match expression {
+            Expr::Nested(inner) => inner,
+            Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => {
+                negated = !negated;
+                inner
+            }
+            _ => return (expression, negated),
+        };
+    }
+}
+
 /// Narrows the guarantees so that `expression` takes one of `outcomes`.
 fn node<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     expression: &Expr,
     outcomes: Outcomes,
 ) -> Result<(), C::Error> {
-    let mut expression = expression;
-    let mut outcomes = outcomes;
-    // `NOT` negates the outcome set exactly, so a run of it is folded here,
-    // interleaved with the parentheses; splitting per level would double the
-    // branches at each.
-    loop {
-        expression = match expression {
-            Expr::Nested(inner) => inner,
-            Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => {
-                outcomes = outcomes.negated();
-                inner
-            }
-            _ => break,
-        };
-    }
-    if outcomes.is_empty() {
-        impossible(state);
+    if !single_outcome(outcomes) {
+        *state.guarantees = merged(node_each(state, expression, &[outcomes])?);
         return Ok(());
     }
+    let (expression, negated) = unwrapped(expression);
+    let outcomes = if negated { outcomes.negated() } else { outcomes };
     if state.depth >= forward::DEPTH_LIMIT {
         // Past the depth limit the pass narrows nothing more, which is a
         // safe over-approximation.
@@ -113,18 +136,66 @@ fn node<D: EvalDialect, C: Context>(
     // An error abandons the pass, so only the success paths restore the
     // depth.
     state.depth += 1;
-    if !single_outcome(outcomes) {
-        let mut branches = Vec::with_capacity(3);
-        for single in singles(outcomes).into_iter().flatten() {
-            branches.push(branch(state, |s| node(s, expression, single))?);
-        }
-        merge(state, branches);
-        state.depth -= 1;
-        return Ok(());
-    }
-    let result = single_node(state, expression, outcomes);
+    let evaluation = forward_of(state, expression)?;
+    single_node(state, expression, &evaluation, outcomes)?;
     state.depth -= 1;
-    result
+    Ok(())
+}
+
+/// The guarantees, narrowed from a copy of the current ones, under which
+/// `expression` takes one of each outcome set of `requests`. The forward
+/// reading of `expression` and the narrowing for each single outcome are
+/// shared between the requests.
+fn node_each<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    expression: &Expr,
+    requests: &[Outcomes],
+) -> Result<Vec<Guarantees<C::Reference>>, C::Error> {
+    let (expression, negated) = unwrapped(expression);
+    let requests: Vec<Outcomes> = requests
+        .iter()
+        .map(|&outcomes| if negated { outcomes.negated() } else { outcomes })
+        .collect();
+    if state.depth >= forward::DEPTH_LIMIT {
+        // Past the depth limit the pass narrows nothing more, which is a
+        // safe over-approximation.
+        return Ok(requests
+            .iter()
+            .map(|outcomes| {
+                if outcomes.is_empty() {
+                    Guarantees::impossible()
+                } else {
+                    state.guarantees.clone()
+                }
+            })
+            .collect());
+    }
+    let wanted = requests.iter().fold(Outcomes::NONE, |wanted, &outcomes| wanted.union(outcomes));
+    // An error abandons the pass, so only the success paths restore the
+    // depth.
+    state.depth += 1;
+    let mut narrowed: [Option<Guarantees<C::Reference>>; 3] = [None, None, None];
+    if !wanted.is_empty() {
+        let evaluation = forward_of(state, expression)?;
+        for (slot, single) in narrowed.iter_mut().zip(singles(wanted)) {
+            if let Some(single) = single {
+                *slot = Some(branch(state, |s| single_node(s, expression, &evaluation, single))?);
+            }
+        }
+    }
+    state.depth -= 1;
+    Ok(requests
+        .iter()
+        .map(|&outcomes| {
+            merged(
+                narrowed
+                    .iter()
+                    .zip(singles(outcomes))
+                    .filter(|(_, single)| single.is_some())
+                    .filter_map(|(guarantees, _)| guarantees.clone()),
+            )
+        })
+        .collect())
 }
 
 /// Whether `outcomes` holds a single outcome.
@@ -164,7 +235,12 @@ fn merge<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     branches: Vec<Guarantees<C::Reference>>,
 ) {
-    let mut joined: Option<Guarantees<C::Reference>> = None;
+    *state.guarantees = merged(branches);
+}
+
+/// The disjunction of `branches`, impossible when every branch is.
+fn merged<R: Ord + Clone>(branches: impl IntoIterator<Item = Guarantees<R>>) -> Guarantees<R> {
+    let mut joined: Option<Guarantees<R>> = None;
     for branch in branches {
         if branch.is_impossible() {
             continue;
@@ -174,7 +250,7 @@ fn merge<D: EvalDialect, C: Context>(
             None => branch,
         });
     }
-    *state.guarantees = joined.unwrap_or_else(Guarantees::impossible);
+    joined.unwrap_or_else(Guarantees::impossible)
 }
 
 /// Marks the guarantees impossible.
@@ -267,13 +343,14 @@ fn restrict_none<D: EvalDialect, C: Context>(
     restrict_subject(state, expression, evaluation.with_values(Values::none()))
 }
 
-/// Narrows the guarantees for one outcome of `expression`.
+/// Narrows the guarantees for one outcome of `expression`, whose forward
+/// reading under them is `evaluation`.
 fn single_node<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     expression: &Expr,
+    evaluation: &Evaluation,
     outcomes: Outcomes,
 ) -> Result<(), C::Error> {
-    let evaluation = forward_of(state, expression)?;
     // A nothing-known reading narrows nothing, save the structural `coalesce`
     // rule.
     let coalesce = matches!(
@@ -286,13 +363,13 @@ fn single_node<D: EvalDialect, C: Context>(
     // An untyped literal reads through the `boolean` input and has no
     // subject to narrow.
     if *evaluation.ty() == ScalarType::UnknownLiteral {
-        if support::as_condition(evaluation).outcomes().intersection(outcomes).is_empty() {
+        if support::as_condition(evaluation.clone()).outcomes().intersection(outcomes).is_empty() {
             impossible(state);
         }
         return Ok(());
     }
     if support::could_be_boolean(evaluation.ty()) {
-        let pruned = support::prune(&evaluation, outcomes);
+        let pruned = support::prune(evaluation, outcomes);
         if pruned.outcomes().is_empty() {
             impossible(state);
             return Ok(());
@@ -302,11 +379,11 @@ fn single_node<D: EvalDialect, C: Context>(
     }
     // A non-`boolean` subject reads every value as a condition.
     if outcomes.truth || outcomes.falsity {
-        let pruned = support::prune(&evaluation, outcomes);
+        let pruned = support::prune(evaluation, outcomes);
         restrict_subject(state, expression, pruned)?;
         return Ok(());
     }
-    restrict_none(state, expression)
+    restrict_subject(state, expression, evaluation.clone().with_values(Values::none()))
 }
 
 /// The input narrowing of one boolean outcome of `expression`.
@@ -406,19 +483,23 @@ fn disjunctive<D: EvalDialect, C: Context>(
 ) -> Result<(), C::Error> {
     let count = terms.len();
     let mut branches: Vec<Guarantees<C::Reference>> = Vec::with_capacity(count);
-    for &term in terms {
-        branches.push(branch(state, |s| node(s, term, distributed))?);
-    }
-    let joined = match side {
-        None => branches.into_iter().reduce(|a, b| a.join(&b)).unwrap_or_default(),
-        Some(side) => {
-            let mut sides: Vec<Guarantees<C::Reference>> = Vec::with_capacity(count);
-            for &term in terms {
-                sides.push(branch(state, |s| node(s, term, side))?);
-            }
-            disjunctive_side(&sides, &branches)
+    let Some(side) = side else {
+        for &term in terms {
+            branches.push(branch(state, |s| node(s, term, distributed))?);
         }
+        let joined = branches.into_iter().reduce(|a, b| a.join(&b)).unwrap_or_default();
+        *state.guarantees = state.guarantees.meet(&joined);
+        return Ok(());
     };
+    // The side holds the distributed outcome, so each term's two reads share
+    // its narrowing.
+    let mut sides: Vec<Guarantees<C::Reference>> = Vec::with_capacity(count);
+    for &term in terms {
+        let mut narrowed = node_each(state, term, &[distributed, side])?.into_iter();
+        branches.extend(narrowed.next());
+        sides.extend(narrowed.next());
+    }
+    let joined = disjunctive_side(&sides, &branches);
     *state.guarantees = state.guarantees.meet(&joined);
     Ok(())
 }
@@ -3082,6 +3163,37 @@ mod tests {
             assert!(term.may_be_true(), "{name} may be true");
             assert!(!term.may_be_false(), "{name} is not false");
             assert!(!term.may_be_null(), "{name} is not NULL");
+        }
+        // The terms past the limit are left open
+        assert!(guarantees.reference(&"a31".to_string()).is_none());
+        assert!(guarantees.reference(&"a32".to_string()).is_none());
+    }
+
+    #[test]
+    fn a_null_chain_past_the_depth_limit_narrows_only_what_it_reaches() {
+        // A right-nested chain taking `NULL` reads each term's `NULL` and
+        // not-true sides together, one depth per term, so the spine past the
+        // depth limit stops narrowing and leaves the rest open
+        let identifier = |name: &str| Expr::Identifier(sqlparser::ast::Ident::new(name));
+        let mut expression = identifier("a32");
+        for i in (0..32).rev() {
+            expression = Expr::BinaryOp {
+                left: Box::new(identifier(&format!("a{i}"))),
+                op: BinaryOperator::Or,
+                right: Box::new(expression),
+            };
+        }
+        let mut context = ColumnContext::new();
+        for i in 0..33 {
+            context = context.with_column(&format!("a{i}"), unknown_column(ScalarType::Boolean));
+        }
+        let guarantees = implied_with(context, &expression, Outcomes::NULL);
+        assert!(!guarantees.is_impossible());
+        // The terms reached are never true
+        for name in ["a0", "a29", "a30"] {
+            let term = column(&guarantees, name);
+            assert!(!term.may_be_true(), "{name} is not true");
+            assert!(term.may_be_null(), "{name} may be NULL");
         }
         // The terms past the limit are left open
         assert!(guarantees.reference(&"a31".to_string()).is_none());
