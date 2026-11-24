@@ -59,6 +59,14 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
                 .any(|side| *side.ty() == ScalarType::Numeric && !side.is_always_null());
         return Evaluation::null(ty).with_error(error || widened);
     }
+    // A divisor that is zero whenever it is not `NULL` decides the reading
+    // before the dividend's interval does.
+    if matches!(op, BinaryOperator::Divide | BinaryOperator::Modulo)
+        && matches!(ty, ScalarType::Integer(_) | ScalarType::Numeric | ScalarType::Float)
+        && is_always_zero(right.values())
+    {
+        return zero_divisor(left, ty, null, error);
+    }
     // Never folded, and a float may overflow or divide by zero.
     if matches!(ty, ScalarType::Float | ScalarType::Unknown) {
         let error = error || ty == ScalarType::Float;
@@ -75,6 +83,25 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
     let right_interval = number_bounds(right.values());
     let (values, arith_error) = interval_values(op, &ty, &left_interval, &right_interval, error);
     Evaluation::new(ty, null, arith_error, values)
+}
+
+/// Whether every number of the set is zero, which leaves out `NaN`.
+fn is_always_zero(values: &Values) -> bool {
+    number_bounds(values) == Interval::point(PgNumeric::from(0_i64))
+}
+
+/// `left / 0` or `left % 0` of type `ty`, which raises `division by zero`
+/// on a dividend that is not `NULL`, save a `NaN` one, which answers `NaN`.
+fn zero_divisor(left: &Evaluation, ty: ScalarType, null: bool, error: bool) -> Evaluation {
+    let is_nan = |value: &PgValue| value.as_numeric().is_some_and(|number| number.is_nan());
+    let divides = match left.values() {
+        Values::Listed(listed) => !listed.iter().all(is_nan),
+        Values::Unlisted(_) => true,
+    };
+    let nan = PgValue::Numeric(PgNumeric::NAN);
+    let values =
+        if left.may_be(&nan) { Values::Listed(BTreeSet::from([nan])) } else { Values::none() };
+    Evaluation::new(ty, null, error || divides, values)
 }
 
 /// Whether the reading knows every arithmetic operator PostgreSQL has for
@@ -1336,6 +1363,29 @@ mod tests {
         );
         assert!(matches!(values, Values::Unlisted(_)));
         assert!(error);
+    }
+
+    /// A divisor that is zero on every row raises on a dividend that is
+    /// never `NaN`, as `1.5::float8 / 0` does, and answers `NaN` for a `NaN`
+    /// one, as `'NaN'::float8 / 0` does.
+    #[test]
+    fn a_zero_divisor_raises_unless_the_dividend_is_nan() {
+        let float = |values: &[&str]| {
+            let values = values.iter().map(|text| PgValue::Numeric(number(text))).collect();
+            Evaluation::new(ScalarType::Float, false, false, Values::Listed(values))
+        };
+        let zero = known_int(0, IntegerType::Integer);
+        let nan = PgValue::Numeric(PgNumeric::NAN);
+        let result = arithmetic(&float(&["1.5", "2.5"]), &BinaryOperator::Divide, &zero);
+        assert!(result.always_raises());
+        let result = arithmetic(&float(&["NaN"]), &BinaryOperator::Divide, &zero);
+        assert_eq!(result.constant(), Some(&nan));
+        let result = arithmetic(&float(&["1.5", "NaN"]), &BinaryOperator::Divide, &zero);
+        assert!(result.may_raise());
+        assert_eq!(result.constant_value(), Some(&nan));
+        // an operand that raises still raises beside a `NaN`
+        let result = arithmetic(&float(&["NaN"]), &BinaryOperator::Divide, &zero.with_error(true));
+        assert!(result.may_raise());
     }
 
     /// An integer result keeps only the integer values the interval admits,
