@@ -9,7 +9,7 @@ use sqlparser_expr_eval::{
     Builtin, Callee, Collation, EnumType, Evaluation, Guarantees, Interval, Order, Outcomes,
     PostgreSqlOptions, QueryEvaluation, Relation, Rows, ScalarType, Subject, TextRules, Values,
     evaluate, implied,
-    sql_values::postgres::{IntegerType, PgValue},
+    sql_values::postgres::{IntegerType, PgNumeric, PgValue},
 };
 
 mod common;
@@ -78,6 +78,52 @@ fn an_int4_overflow_always_raises() {
 fn a_constant_division_by_zero_always_raises() {
     let evaluation = read(context(), "1 / 0");
     assert!(evaluation.always_raises());
+}
+
+#[test]
+fn a_zero_divisor_raises_on_every_row() {
+    for sql in ["id / 0", "id % 0", "id / (2 - 2)", "id / 0.0", "id * 1.0 / 0"] {
+        assert!(read(context(), sql).always_raises(), "{sql}");
+    }
+    let comparison = read(context(), "id / 0 = 1");
+    assert!(comparison.always_raises());
+    assert!(!comparison.may_be_true());
+}
+
+#[test]
+fn a_zero_divisor_answers_null_for_a_null_operand() {
+    for sql in ["n / 0", "x / (n * 0)"] {
+        let evaluation = read(integers(), sql);
+        assert!(evaluation.may_be_null(), "{sql}");
+        assert!(evaluation.may_raise(), "{sql}");
+        assert!(evaluation.values().is_empty(), "{sql}");
+    }
+}
+
+#[test]
+fn a_zero_divisor_keeps_a_nan_dividend() {
+    let numbers = || {
+        Ctx::with_columns(vec![
+            ("amount".into(), column(ScalarType::Numeric, false)),
+            ("ratio".into(), column(ScalarType::Float, false)),
+        ])
+    };
+    let nan = PgValue::Numeric(PgNumeric::NAN);
+    let constant = read(numbers(), "CAST('NaN' AS numeric) / 0");
+    assert_eq!(constant.constant(), Some(&nan));
+    for sql in ["amount / 0", "amount % 0", "ratio / 0"] {
+        let evaluation = read(numbers(), sql);
+        assert!(evaluation.may_raise(), "{sql}");
+        assert!(evaluation.may_be(&nan), "{sql}");
+        assert!(!evaluation.may_be(&PgValue::Numeric(PgNumeric::from(1_i64))), "{sql}");
+    }
+}
+
+#[test]
+fn a_divisor_that_may_be_zero_leaves_the_quotient_open() {
+    let evaluation = read(integers(), "x / y");
+    assert!(evaluation.may_raise());
+    assert!(evaluation.may_be(&PgValue::Integer(1)));
 }
 
 #[test]
