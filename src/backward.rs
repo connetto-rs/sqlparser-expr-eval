@@ -15,7 +15,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    context::{Context, NullInput},
+    context::{Callee, Context, NullInput},
     dialect::EvalDialect,
     domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
     forward,
@@ -910,40 +910,53 @@ fn call_input<D: EvalDialect, C: Context>(
         return Ok(());
     }
     let callees = state.context.callees(call)?;
-    // A strict callee's `NULL` argument forces the result `NULL` only when
-    // every callee the call may reach is strict.
-    let all_strict = !callees.is_empty()
-        && callees.iter().all(|callee| matches!(callee.null_input, NullInput::Strict));
-    // The arguments some reachable callee answers `NULL` for, each once.
-    let mut positions = BTreeSet::new();
-    for callee in &callees {
-        if callee.null_input == NullInput::Strict && !all_strict {
-            continue;
-        }
-        positions.extend((0..arguments.len()).filter(|&index| callee.null_input.nulls_at(index)));
-    }
-    let nulling = positions.into_iter().filter_map(|position| arguments[position].as_ref());
     if outcomes.truth || outcomes.falsity {
-        for argument in nulling {
+        // A strict callee's `NULL` argument forces the result `NULL` only
+        // when every callee the call may reach is strict.
+        let all_strict = !callees.is_empty()
+            && callees.iter().all(|callee| matches!(callee.null_input, NullInput::Strict));
+        // The arguments some reachable callee answers `NULL` for, each once.
+        let mut positions = BTreeSet::new();
+        for callee in &callees {
+            if callee.null_input == NullInput::Strict && !all_strict {
+                continue;
+            }
+            positions
+                .extend((0..arguments.len()).filter(|&index| callee.null_input.nulls_at(index)));
+        }
+        for argument in positions.into_iter().filter_map(|position| arguments[position].as_ref()) {
             restrict_non_null(state, argument)?;
         }
         return Ok(());
     }
-    // A `NULL` result points at a `NULL` argument only for the built-ins
-    // known to return `NULL` exactly on a `NULL` argument.
-    let null_only_on_null_input =
-        !callees.is_empty() && state.dialect.null_only_on_null_input(&callees, state.options);
-    if !null_only_on_null_input {
+    let Some(sources) = null_sources(&callees, &arguments) else {
         return Ok(());
-    }
-    let mut branches: Vec<Guarantees<C::Reference>> = Vec::new();
-    for argument in nulling {
+    };
+    let mut branches: Vec<Guarantees<C::Reference>> = Vec::with_capacity(sources.len());
+    for argument in sources {
         branches.push(branch(state, |s| restrict_none(s, argument))?);
     }
-    if !branches.is_empty() {
-        merge(state, branches);
-    }
+    // With no source the result is never `NULL`, and merging no branch
+    // leaves the guarantees impossible.
+    merge(state, branches);
     Ok(())
+}
+
+/// The arguments one of which is `NULL` when a call reaching `callees`
+/// returns `NULL`, `None` when the result may be `NULL` with each of them
+/// non-`NULL` or when one of them is no expression.
+fn null_sources<'a>(callees: &[Callee], arguments: &'a [Option<Expr>]) -> Option<Vec<&'a Expr>> {
+    if callees.is_empty()
+        || callees.iter().any(|callee| callee.nulls_on_non_null_arguments(arguments.len()))
+    {
+        return None;
+    }
+    arguments
+        .iter()
+        .enumerate()
+        .filter(|&(position, _)| callees.iter().any(|callee| callee.null_input.nulls_at(position)))
+        .map(|(_, argument)| argument.as_ref())
+        .collect()
 }
 
 /// The operand of a cast taking one outcome.
@@ -1182,22 +1195,15 @@ fn side_null_branch<D: EvalDialect, C: Context>(
                 }
                 let arguments = support::call_arguments(call);
                 let callees = s.context.callees(call)?;
-                // A strict function may still return `NULL` for non-`NULL`
-                // input, so only the built-ins known to return `NULL` exactly
-                // on a `NULL` argument tell which input was `NULL`.
-                let all_strict = !callees.is_empty()
-                    && callees.iter().all(|callee| callee.null_input == NullInput::Strict);
-                let null_only_on_null_input =
-                    all_strict && s.dialect.null_only_on_null_input(&callees, s.options);
-                if !null_only_on_null_input {
+                // A function may return `NULL` for non-`NULL` input, so only
+                // one returning `NULL` on `NULL` input alone tells which input
+                // was `NULL`.
+                let Some(sources) = null_sources(&callees, &arguments) else {
                     return restrict_none(s, side);
-                }
-                let mut branches: Vec<Guarantees<C::Reference>> = Vec::new();
-                for argument in arguments.iter().flatten() {
+                };
+                let mut branches: Vec<Guarantees<C::Reference>> = Vec::with_capacity(sources.len());
+                for argument in sources {
                     branches.push(branch(s, |s2| restrict_none(s2, argument))?);
-                }
-                if branches.is_empty() {
-                    return restrict_none(s, side);
                 }
                 merge(s, branches);
                 Ok(())
@@ -1813,7 +1819,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Builtin, Guarantees, Outcomes, Rows, ScalarType, TextRules, Values,
+        Builtin, Guarantees, NullResult, Outcomes, Rows, ScalarType, TextRules, Values,
         postgres::PostgreSqlOptions,
         test_context::{ColumnContext, parse, strict_callee},
     };
@@ -1828,12 +1834,13 @@ mod tests {
         Evaluation::new(ty, false, false, Values::Unlisted(Unlisted::any()))
     }
 
-    /// A boolean routine that runs on `NULL` input and returns `NULL` for a
-    /// `NULL` at one of `positions`.
+    /// A boolean routine that runs on `NULL` input, returns `NULL` for a
+    /// `NULL` at one of `positions`, and may return `NULL` on any input.
     fn called_on_null(positions: Vec<usize>) -> crate::Callee {
         crate::context::Callee {
             builtin: None,
             null_input: crate::context::NullInput::CalledOnNull(positions),
+            null_result: NullResult::AnyInput,
             volatility: crate::context::Volatility::Immutable,
             kind: crate::context::CalleeKind::Normal,
             returns: ScalarType::Boolean,
@@ -1842,10 +1849,15 @@ mod tests {
         }
     }
 
+    /// `callee`, returning `NULL` only on `NULL` input.
+    fn only_on_null_input(callee: crate::Callee) -> crate::Callee {
+        crate::Callee { null_result: NullResult::OnlyOnNullInput, ..callee }
+    }
+
     /// PostgreSQL's `length(text)`.
     fn length_callee() -> crate::Callee {
-        let mut callee = crate::test_context::strict_callee(ScalarType::Integer(
-            sql_values::postgres::IntegerType::Integer,
+        let mut callee = only_on_null_input(crate::test_context::strict_callee(
+            ScalarType::Integer(sql_values::postgres::IntegerType::Integer),
         ));
         callee.builtin = Some(Builtin::Length);
         callee
@@ -2758,22 +2770,6 @@ mod tests {
         }
     }
 
-    /// A dialect that resolves a `NULL` result of a call to a `NULL`
-    /// argument.
-    struct NullOnNullInput;
-
-    impl EvalDialect for NullOnNullInput {
-        type Options = ();
-
-        fn null_only_on_null_input(
-            &self,
-            _callees: &[crate::Callee],
-            _options: &Self::Options,
-        ) -> bool {
-            true
-        }
-    }
-
     /// A dialect that counts the characters of any call's first argument.
     struct CountsAnyArgument;
 
@@ -2807,18 +2803,6 @@ mod tests {
             &Guarantees::new(),
         )
         .expect("the context resolves")
-    }
-
-    /// The guarantees `expression` takes `outcomes` under, with a dialect
-    /// that resolves a `NULL` call result to a `NULL` argument.
-    fn implied_null_on_null(
-        context: ColumnContext,
-        expression: &Expr,
-        outcomes: Outcomes,
-    ) -> Guarantees<String> {
-        let mut context = context;
-        implied(expression, outcomes, &NullOnNullInput {}, &(), &mut context, &Guarantees::new())
-            .expect("the context resolves")
     }
 
     /// The guarantees `expression` takes `outcomes` under, with a dialect
@@ -4521,11 +4505,11 @@ mod tests {
     }
 
     #[test]
-    fn a_call_null_under_a_null_on_null_input_dialect_points_at_the_argument() {
-        let guarantees = implied_null_on_null(
+    fn a_null_only_on_null_input_call_null_points_at_the_argument() {
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
-                .with_callee("f", crate::test_context::strict_callee(ScalarType::Boolean)),
+                .with_callee("f", only_on_null_input(strict_callee(ScalarType::Boolean))),
             &parse("f(x)"),
             Outcomes::NULL,
         );
@@ -4536,15 +4520,15 @@ mod tests {
     /// `NULL` argument points that argument at `NULL` when the other side
     /// is never `NULL`.
     #[test]
-    fn a_comparison_null_under_a_null_on_null_input_dialect_points_at_the_call_argument() {
+    fn a_comparison_null_points_at_the_argument_of_a_null_only_on_null_input_call() {
         // PostgreSQL reads `NULL < 'b'` as `NULL`.
-        let guarantees = implied_null_on_null(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_column("y", plain_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee(
                     "f",
-                    crate::test_context::strict_callee(ScalarType::Text(TextRules::DEFAULT)),
+                    only_on_null_input(strict_callee(ScalarType::Text(TextRules::DEFAULT))),
                 ),
             &parse("f(x) < y"),
             Outcomes::NULL,
@@ -4552,29 +4536,16 @@ mod tests {
         assert!(column(&guarantees, "x").is_always_null());
     }
 
+    /// A `NULL` comparison with a call that returns `NULL` on any input
+    /// reads the call as `NULL` and points at no argument.
     #[test]
-    fn a_called_on_null_callee_null_points_at_the_argument_under_a_null_on_null_input_dialect() {
-        let called_on_null = called_on_null(vec![0]);
-        let guarantees = implied_null_on_null(
-            ColumnContext::new()
-                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
-                .with_callee("g", called_on_null),
-            &parse("g(x)"),
-            Outcomes::NULL,
-        );
-        assert!(column(&guarantees, "x").is_always_null());
-    }
-
-    #[test]
-    fn a_called_on_null_callee_null_under_postgres_points_at_nothing() {
-        // PostgreSQL's `NULL` result may come from non-`NULL` input, so no
-        // argument is constrained.
-        let called_on_null = called_on_null(vec![0]);
+    fn a_comparison_null_with_an_any_input_call_points_at_no_argument() {
         let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
-                .with_callee("g", called_on_null),
-            &parse("g(x)"),
+                .with_column("y", plain_column(ScalarType::Text(TextRules::DEFAULT)))
+                .with_callee("f", strict_callee(ScalarType::Text(TextRules::DEFAULT))),
+            &parse("f(x) < y"),
             Outcomes::NULL,
         );
         assert!(!guarantees.is_impossible());
@@ -4582,17 +4553,77 @@ mod tests {
     }
 
     #[test]
+    fn a_null_only_on_null_input_called_on_null_callee_null_points_at_its_position() {
+        let guarantees = implied_with(
+            ColumnContext::new()
+                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
+                .with_column("y", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
+                .with_callee("g", only_on_null_input(called_on_null(vec![1]))),
+            &parse("g(x, y)"),
+            Outcomes::NULL,
+        );
+        assert!(column(&guarantees, "y").is_always_null());
+        assert!(guarantees.reference(&"x".to_string()).is_none());
+    }
+
+    #[test]
+    fn a_called_on_null_callee_returning_null_on_any_input_points_at_nothing() {
+        let guarantees = implied_with(
+            ColumnContext::new()
+                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
+                .with_callee("g", called_on_null(vec![0])),
+            &parse("g(x)"),
+            Outcomes::NULL,
+        );
+        assert!(!guarantees.is_impossible());
+        assert!(guarantees.reference(&"x".to_string()).is_none());
+    }
+
+    /// A `NULL` result of a call reaching a strict and a called-on-null
+    /// routine comes from any argument the strict one is `NULL` on.
+    #[test]
+    fn a_null_result_of_strict_and_called_on_null_routines_points_at_every_argument() {
+        let guarantees = implied_with(
+            ColumnContext::new()
+                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
+                .with_column("y", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
+                .with_callee("f", only_on_null_input(strict_callee(ScalarType::Boolean)))
+                .with_callee("f", only_on_null_input(called_on_null(vec![0]))),
+            &parse("f(x, y)"),
+            Outcomes::NULL,
+        );
+        assert!(!guarantees.is_impossible());
+        assert!(guarantees.reference(&"x".to_string()).is_none());
+        assert!(guarantees.reference(&"y".to_string()).is_none());
+    }
+
+    #[test]
     fn a_call_null_over_no_argument_keeps_nothing() {
         // The routine may answer `NULL` however it likes, so no argument is
         // pointed at.
-        let no_position = called_on_null(Vec::new());
-        let guarantees = implied_null_on_null(
-            ColumnContext::new().with_callee("g", no_position),
+        let guarantees = implied_with(
+            ColumnContext::new().with_callee("g", called_on_null(Vec::new())),
             &parse("g()"),
             Outcomes::NULL,
         );
         assert!(!guarantees.is_impossible());
         assert!(guarantees.references().next().is_none());
+    }
+
+    /// A call with no nulling argument that returns `NULL` only on `NULL`
+    /// input, such as `now()`, is never `NULL`.
+    #[test]
+    fn a_null_only_on_null_input_call_over_no_argument_is_never_null() {
+        let context = || {
+            ColumnContext::new()
+                .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
+                .with_callee("g", only_on_null_input(called_on_null(Vec::new())))
+                .with_callee("now", only_on_null_input(strict_callee(ScalarType::Boolean)))
+        };
+        for sql in ["g()", "g(x)", "now()", "now() IS NULL"] {
+            let outcomes = if sql.ends_with("IS NULL") { Outcomes::TRUE } else { Outcomes::NULL };
+            assert!(implied_with(context(), &parse(sql), outcomes).is_impossible(), "{sql}");
+        }
     }
 
     #[test]
@@ -5000,8 +5031,8 @@ mod tests {
     /// Two routines nulling the same argument point a `NULL` result at it once.
     #[test]
     fn two_routines_nulling_one_argument_keep_the_null_subject() {
-        let called_on_null = called_on_null(vec![0]);
-        let guarantees = implied_null_on_null(
+        let called_on_null = only_on_null_input(called_on_null(vec![0]));
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("f", called_on_null.clone())
@@ -5012,12 +5043,12 @@ mod tests {
         assert!(column(&guarantees, "x").is_always_null());
     }
 
-    /// A routine nulling an argument the call holds no points a `NULL` result
-    /// at nothing.
+    /// A routine nulling an argument past the written ones, which a default
+    /// fills, points a `NULL` result at nothing.
     #[test]
     fn an_out_of_range_null_position_keeps_no_subject() {
-        let called_on_null = called_on_null(vec![5]);
-        let guarantees = implied_null_on_null(
+        let called_on_null = only_on_null_input(called_on_null(vec![5]));
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
                 .with_callee("f", called_on_null),
@@ -5031,10 +5062,10 @@ mod tests {
     /// A `NULL` result of a wildcard call points at no argument.
     #[test]
     fn a_wildcard_call_null_keeps_no_subject() {
-        let guarantees = implied_null_on_null(
+        let guarantees = implied_with(
             ColumnContext::new()
                 .with_column("x", unknown_column(ScalarType::Text(TextRules::DEFAULT)))
-                .with_callee("f", crate::test_context::strict_callee(ScalarType::Boolean)),
+                .with_callee("f", only_on_null_input(strict_callee(ScalarType::Boolean))),
             &parse("f(*) = x"),
             Outcomes::NULL,
         );
@@ -5046,7 +5077,7 @@ mod tests {
     #[test]
     fn an_argument_less_call_null_keeps_no_subject() {
         let guarantees =
-            implied_null_on_null(ColumnContext::new(), &parse("current_user = x"), Outcomes::NULL);
+            implied_with(ColumnContext::new(), &parse("current_user = x"), Outcomes::NULL);
         assert!(!guarantees.is_impossible());
     }
 

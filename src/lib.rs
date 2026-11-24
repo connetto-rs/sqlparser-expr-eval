@@ -21,7 +21,8 @@ mod test_context;
 
 pub use backward::implied;
 pub use context::{
-    Builtin, Callee, CalleeKind, Context, NullInput, QueryEvaluation, Resolved, Rows, Volatility,
+    Builtin, Callee, CalleeKind, Context, NullInput, NullResult, QueryEvaluation, Resolved, Rows,
+    Volatility,
 };
 pub use dialect::EvalDialect;
 pub use domain::{Evaluation, Interval, Outcomes, Unlisted, Values};

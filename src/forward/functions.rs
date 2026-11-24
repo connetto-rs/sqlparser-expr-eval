@@ -71,16 +71,10 @@ pub(super) fn call<D: EvalDialect, C: Context>(
     for callee in &callees {
         let nulling = |test| nulling_argument(&callee.null_input, &argument_evaluations, test);
         forced_null &= nulling(Evaluation::is_always_null);
-        null |= nulling(Evaluation::may_be_null);
-        match callee.builtin {
-            None => {
-                // An unknown routine may return `NULL` on non-`NULL` input.
-                null = true;
-            }
-            Some(Builtin::ConcatWs) => {
-                null |= argument_evaluations.first().is_some_and(Evaluation::may_be_null);
-            }
-            Some(_) => {}
+        null |= nulling(Evaluation::may_be_null)
+            || callee.nulls_on_non_null_arguments(argument_evaluations.len());
+        if callee.builtin == Some(Builtin::ConcatWs) {
+            null |= argument_evaluations.first().is_some_and(Evaluation::may_be_null);
         }
     }
     if forced_null {
@@ -1099,7 +1093,7 @@ mod tests {
     use sqlparser::ast::{Expr, Function, FunctionArguments, ObjectName, ObjectNamePart};
 
     use crate::{
-        context::{Builtin, Callee, CalleeKind, NullInput, Rows, Volatility},
+        context::{Builtin, Callee, CalleeKind, NullInput, NullResult, Rows, Volatility},
         domain::{Evaluation, Interval, Unlisted, Values},
         scalar::{ScalarType, TextRules},
         test_context::{ColumnContext, builtin_callee, parse, read},
@@ -1158,12 +1152,14 @@ mod tests {
     fn callee(
         builtin: Option<Builtin>,
         null_input: NullInput,
+        null_result: NullResult,
         kind: CalleeKind,
         returns: ScalarType,
     ) -> Callee {
         Callee {
             builtin,
             null_input,
+            null_result,
             volatility: Volatility::Immutable,
             kind,
             returns,
@@ -1418,7 +1414,13 @@ mod tests {
     fn count_star_is_an_aggregate_and_never_null() {
         let context = ColumnContext::new().with_callee(
             "count",
-            callee(Some(Builtin::Count), NullInput::Strict, CalleeKind::Aggregate, int8()),
+            callee(
+                Some(Builtin::Count),
+                NullInput::Strict,
+                NullResult::OnlyOnNullInput,
+                CalleeKind::Aggregate,
+                int8(),
+            ),
         );
         let evaluation = read(context, "count(*)");
         assert!(!evaluation.may_be_null());
@@ -1441,10 +1443,62 @@ mod tests {
     fn called_on_null_forces_null_for_a_null_position() {
         let context = ColumnContext::new().with_callee(
             "foo",
-            callee(None, NullInput::CalledOnNull(vec![0]), CalleeKind::Normal, int4()),
+            callee(
+                None,
+                NullInput::CalledOnNull(vec![0]),
+                NullResult::AnyInput,
+                CalleeKind::Normal,
+                int4(),
+            ),
         );
         let evaluation = read(context, "foo(NULL)");
         assert!(evaluation.is_always_null());
+    }
+
+    /// A function returning `NULL` only on `NULL` input with no argument
+    /// that may be `NULL` is never `NULL`.
+    #[test]
+    fn a_null_only_on_null_input_call_over_non_null_arguments_is_never_null() {
+        let only_on_null_input = |null_input| {
+            callee(None, null_input, NullResult::OnlyOnNullInput, CalleeKind::Normal, int4())
+        };
+        let context = || {
+            ColumnContext::new()
+                .with_column("id", int_col())
+                .with_callee("now", only_on_null_input(NullInput::Strict))
+                .with_callee("f", only_on_null_input(NullInput::CalledOnNull(vec![1])))
+        };
+        assert!(!read(context(), "now() IS NULL").may_be_true());
+        assert!(!read(context(), "f(id, 1)").may_be_null());
+        assert!(read(context(), "f(1, id)").may_be_null());
+    }
+
+    /// A nulling position past the written arguments names a defaulted
+    /// argument, which may be `NULL`.
+    #[test]
+    fn a_nulling_position_past_the_arguments_may_be_null() {
+        let context = ColumnContext::new().with_callee(
+            "f",
+            callee(
+                None,
+                NullInput::CalledOnNull(vec![1]),
+                NullResult::OnlyOnNullInput,
+                CalleeKind::Normal,
+                int4(),
+            ),
+        );
+        assert!(read(context, "f(1)").may_be_null());
+    }
+
+    /// A function that may return `NULL` on any input stays nullable over
+    /// non-`NULL` arguments.
+    #[test]
+    fn an_any_input_call_over_non_null_arguments_may_be_null() {
+        let context = ColumnContext::new().with_callee(
+            "now",
+            callee(None, NullInput::Strict, NullResult::AnyInput, CalleeKind::Normal, int4()),
+        );
+        assert!(read(context, "now() IS NULL").may_be_true());
     }
 
     /// A strict call over a `NULL` argument is nullable but not forced `NULL`.
@@ -1463,7 +1517,10 @@ mod tests {
     fn a_callee_body_refines_the_call() {
         let context = ColumnContext::new()
             .with_column("id", int_col())
-            .with_callee("foo", callee(None, NullInput::Strict, CalleeKind::Normal, int4()))
+            .with_callee(
+                "foo",
+                callee(None, NullInput::Strict, NullResult::AnyInput, CalleeKind::Normal, int4()),
+            )
             .with_body(0, int(7));
         let evaluation = read(context, "foo(id)");
         assert!(evaluation.may_be(&PgValue::Integer(7)));
@@ -1976,16 +2033,25 @@ mod tests {
     #[test]
     fn a_body_refinement_keeps_the_wrapper_outcomes() {
         let context = ColumnContext::new()
-            .with_callee("f", callee(None, NullInput::Strict, CalleeKind::Normal, int4()))
+            .with_callee(
+                "f",
+                callee(None, NullInput::Strict, NullResult::AnyInput, CalleeKind::Normal, int4()),
+            )
             .with_body(0, Evaluation::known(PgValue::Integer(1), int4()));
         assert!(read(context, "f(1 / 0)").may_raise());
         let context = ColumnContext::new()
-            .with_callee("g", callee(None, NullInput::Strict, CalleeKind::Normal, int4()))
+            .with_callee(
+                "g",
+                callee(None, NullInput::Strict, NullResult::AnyInput, CalleeKind::Normal, int4()),
+            )
             .with_body(0, Evaluation::raising(int4()));
         assert!(read(context, "g(5)").may_raise());
         let context = ColumnContext::new()
             .with_column("id", int_col())
-            .with_callee("foo", callee(None, NullInput::Strict, CalleeKind::Normal, int4()))
+            .with_callee(
+                "foo",
+                callee(None, NullInput::Strict, NullResult::AnyInput, CalleeKind::Normal, int4()),
+            )
             .with_body(0, Evaluation::known(PgValue::Integer(7), int4()));
         let evaluation = read(context, "foo(id)");
         assert!(evaluation.may_be(&PgValue::Integer(7)));
@@ -1997,7 +2063,13 @@ mod tests {
     fn a_folded_builtin_keeps_its_arguments_error() {
         let context = ColumnContext::new().with_callee(
             "length",
-            callee(Some(Builtin::Length), NullInput::Strict, CalleeKind::Normal, int4()),
+            callee(
+                Some(Builtin::Length),
+                NullInput::Strict,
+                NullResult::OnlyOnNullInput,
+                CalleeKind::Normal,
+                int4(),
+            ),
         );
         assert!(read(context, "length('a' || 1 / 0)").may_raise());
     }

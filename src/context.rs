@@ -36,6 +36,16 @@ impl NullInput {
     }
 }
 
+/// Where a `NULL` result of a call comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullResult {
+    /// Only from a `NULL` argument at a position [`NullInput`] names, so a
+    /// call with no such argument never returns `NULL`.
+    OnlyOnNullInput,
+    /// From any input, `NULL` or not.
+    AnyInput,
+}
+
 /// How a function's result may change between calls with equal arguments,
 /// ordered from the least volatile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,6 +100,8 @@ pub struct Callee {
     pub builtin: Option<Builtin>,
     /// What a `NULL` argument does.
     pub null_input: NullInput,
+    /// Where a `NULL` result comes from.
+    pub null_result: NullResult,
     /// Whether equal arguments give equal results.
     pub volatility: Volatility,
     /// Ordinary, aggregate or window.
@@ -105,16 +117,35 @@ pub struct Callee {
 impl Callee {
     /// The callee with its declared reading.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every field is a separate fact a context states, and the struct is non-exhaustive"
+    )]
     pub fn new(
         builtin: Option<Builtin>,
         null_input: NullInput,
+        null_result: NullResult,
         volatility: Volatility,
         kind: CalleeKind,
         returns: ScalarType,
         returns_set: bool,
         token: usize,
     ) -> Self {
-        Self { builtin, null_input, volatility, kind, returns, returns_set, token }
+        Self { builtin, null_input, null_result, volatility, kind, returns, returns_set, token }
+    }
+
+    /// Whether a call writing `arity` arguments may return `NULL` while
+    /// every argument at a position [`NullInput`] names is non-`NULL`. A
+    /// position past the written arguments names a defaulted one, whose
+    /// value the call does not show.
+    pub(crate) fn nulls_on_non_null_arguments(&self, arity: usize) -> bool {
+        match (self.null_result, &self.null_input) {
+            (NullResult::AnyInput, _) => true,
+            (NullResult::OnlyOnNullInput, NullInput::Strict) => false,
+            (NullResult::OnlyOnNullInput, NullInput::CalledOnNull(positions)) => {
+                positions.iter().any(|&position| position >= arity)
+            }
+        }
     }
 }
 
@@ -302,6 +333,7 @@ mod tests {
             Ok(Vec::from([Callee {
                 builtin: None,
                 null_input: NullInput::Strict,
+                null_result: NullResult::AnyInput,
                 volatility: Volatility::Immutable,
                 kind: CalleeKind::Normal,
                 returns: ScalarType::Integer(IntegerType::Integer),

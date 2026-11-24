@@ -174,23 +174,6 @@ impl EvalDialect for PostgreSqlDialect {
         }
     }
 
-    fn null_only_on_null_input(&self, callees: &[Callee], options: &PostgreSqlOptions) -> bool {
-        let _ = options;
-        callees.iter().all(|callee| {
-            matches!(
-                callee.builtin,
-                Some(
-                    Builtin::Length
-                        | Builtin::OctetLength
-                        | Builtin::Lower
-                        | Builtin::Upper
-                        | Builtin::Btrim
-                        | Builtin::Abs
-                )
-            )
-        })
-    }
-
     fn counted_length_argument(
         &self,
         call: &Function,

@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser_expr_eval::{
-    Builtin, Callee, Collation, EnumType, Evaluation, Guarantees, Interval, Order, Outcomes,
-    PostgreSqlOptions, QueryEvaluation, Relation, Rows, ScalarType, Subject, TextRules, Values,
-    evaluate, implied,
+    Builtin, Callee, CalleeKind, Collation, EnumType, Evaluation, Guarantees, Interval, NullInput,
+    NullResult, Order, Outcomes, PostgreSqlOptions, QueryEvaluation, Relation, Rows, ScalarType,
+    Subject, TextRules, Values, Volatility, evaluate, implied,
     sql_values::postgres::{IntegerType, PgNumeric, PgValue},
 };
 
@@ -302,19 +302,30 @@ fn a_null_upper_result_comes_from_a_null_input() {
     assert!(x.values().is_empty());
 }
 
+/// A catalog function the context declares to return `NULL` only on a
+/// `NULL` argument, such as `now()`, which takes none.
+fn now_callee() -> Callee {
+    Callee::new(
+        None,
+        NullInput::Strict,
+        NullResult::OnlyOnNullInput,
+        Volatility::Stable,
+        CalleeKind::Normal,
+        ScalarType::Other,
+        false,
+        0,
+    )
+}
+
 #[test]
-fn a_null_concat_result_comes_from_no_input_reason() {
-    // `concat` returns `NULL` for no argument, so a `NULL` result says
-    // nothing about `x`
-    let guarantees = restrict(
-        context().with_callee(
-            "concat",
-            builtin_callee(Builtin::Concat, ScalarType::Text(TextRules::DEFAULT)),
-        ),
-        "concat(x)",
-        Outcomes::NULL,
-    );
-    assert_eq!(guarantees.reference(&"x".to_string()), None);
+fn a_function_returning_null_only_on_null_input_without_arguments_is_never_null() {
+    for sql in ["now() IS NULL", "pg_catalog.now() IS NULL", "CURRENT_TIMESTAMP IS NULL"] {
+        let context = context().with_callee("now", now_callee());
+        assert_eq!(read(context, sql).outcomes(), Outcomes::FALSE, "{sql}");
+    }
+    let guarantees =
+        restrict(context().with_callee("now", now_callee()), "now() IS NULL", Outcomes::TRUE);
+    assert!(guarantees.is_impossible());
 }
 
 const INTEGER: ScalarType = ScalarType::Integer(IntegerType::Integer);
