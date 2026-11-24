@@ -1161,11 +1161,11 @@ mod tests {
             let mut retained = before.clone();
             let mut decided = Vec::new();
             retained.retain(|subject| {
-                let Subject::Reference(name) = subject else {
-                    panic!("only references were drawn");
-                };
-                let index = names.iter().position(|drawn| drawn == name).expect("a drawn name");
-                assert!(!decided.contains(&index), "seed {seed}: {name} decided twice");
+                let index = names
+                    .iter()
+                    .position(|drawn| matches!(subject, Subject::Reference(name) if name == drawn))
+                    .expect("only drawn names are subjects");
+                assert!(!decided.contains(&index), "seed {seed}: {subject:?} decided twice");
                 decided.push(index);
                 kept[index]
             });
