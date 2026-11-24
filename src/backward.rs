@@ -156,34 +156,26 @@ fn node_each<D: EvalDialect, C: Context>(
         .iter()
         .map(|&outcomes| if negated { outcomes.negated() } else { outcomes })
         .collect();
+    let wanted = requests.iter().fold(Outcomes::NONE, |wanted, &outcomes| wanted.union(outcomes));
+    let mut narrowed: [Option<Guarantees<C::Reference>>; 3] = [None, None, None];
     if state.depth >= forward::DEPTH_LIMIT {
         // Past the depth limit the pass narrows nothing more, which is a
         // safe over-approximation.
-        return Ok(requests
-            .iter()
-            .map(|outcomes| {
-                if outcomes.is_empty() {
-                    Guarantees::impossible()
-                } else {
-                    state.guarantees.clone()
-                }
-            })
-            .collect());
-    }
-    let wanted = requests.iter().fold(Outcomes::NONE, |wanted, &outcomes| wanted.union(outcomes));
-    // An error abandons the pass, so only the success paths restore the
-    // depth.
-    state.depth += 1;
-    let mut narrowed: [Option<Guarantees<C::Reference>>; 3] = [None, None, None];
-    if !wanted.is_empty() {
+        for (slot, single) in narrowed.iter_mut().zip(singles(wanted)) {
+            *slot = single.map(|_| state.guarantees.clone());
+        }
+    } else if !wanted.is_empty() {
+        // An error abandons the pass, so only the success paths restore the
+        // depth.
+        state.depth += 1;
         let evaluation = forward_of(state, expression)?;
         for (slot, single) in narrowed.iter_mut().zip(singles(wanted)) {
             if let Some(single) = single {
                 *slot = Some(branch(state, |s| single_node(s, expression, &evaluation, single))?);
             }
         }
+        state.depth -= 1;
     }
-    state.depth -= 1;
     Ok(requests
         .iter()
         .map(|&outcomes| {
