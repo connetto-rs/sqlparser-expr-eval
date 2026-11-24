@@ -668,6 +668,53 @@ impl<R: Ord + Clone> Guarantees<R> {
         joined
     }
 
+    /// Forgets every subject `keep` refuses, with its evaluation, relations
+    /// and pairs held apart, keeping what held among the kept subjects.
+    ///
+    /// `keep` sees each subject the guarantees name once.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Subject<R>) -> bool) {
+        if self.impossible {
+            return;
+        }
+        let mut forgotten = Vec::new();
+        let evaluated =
+            self.references.keys().map(|reference| Subject::Reference(reference.clone())).chain(
+                self.expressions.keys().map(|expression| Subject::Expression(expression.clone())),
+            );
+        forgotten.extend(evaluated.filter(|subject| !keep(subject)));
+        let mut unevaluated: Vec<_> = self
+            .relations
+            .values()
+            .flat_map(Map::keys)
+            .chain(self.apart.keys())
+            .filter(|subject| self.get(subject).is_none())
+            .collect();
+        unevaluated.sort_unstable();
+        unevaluated.dedup();
+        forgotten.extend(unevaluated.into_iter().filter(|subject| !keep(subject)).cloned());
+        if forgotten.is_empty() {
+            return;
+        }
+        for subject in &forgotten {
+            match subject {
+                Subject::Reference(reference) => self.references.remove_mut(reference),
+                Subject::Expression(expression) => self.expressions.remove_mut(expression),
+            };
+            isolate(&mut self.apart, subject);
+        }
+        self.relations = self
+            .relations
+            .iter()
+            .filter_map(|(order, network)| {
+                let mut network = network.clone();
+                for subject in &forgotten {
+                    isolate(&mut network, subject);
+                }
+                (!network.is_empty()).then_some((*order, network))
+            })
+            .collect();
+    }
+
     /// Stores the orders either `first` or `second` allows `left` to stand
     /// in to `right`, when that is neither every order nor none.
     fn keep_union(
@@ -763,6 +810,27 @@ fn forget<R: Ord + Clone>(network: &mut Network<R>, left: &Subject<R>, right: &S
         });
         if emptied {
             network.remove_mut(from);
+        }
+    }
+}
+
+/// Drops `subject` from `neighbours`, which lists each subject's neighbours
+/// in both directions, with every entry naming it.
+fn isolate<R: Ord + Clone, V: Clone>(
+    neighbours: &mut Map<Subject<R>, Map<Subject<R>, V>>,
+    subject: &Subject<R>,
+) {
+    let Some(row) = neighbours.get(subject).cloned() else {
+        return;
+    };
+    neighbours.remove_mut(subject);
+    for neighbour in row.keys() {
+        let emptied = neighbours.get_mut(neighbour).is_some_and(|row| {
+            row.remove_mut(subject);
+            row.is_empty()
+        });
+        if emptied {
+            neighbours.remove_mut(neighbour);
         }
     }
 }
@@ -1080,6 +1148,116 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn retain_keeps_what_held_among_the_kept_subjects() {
+        for seed in 0..4000_u64 {
+            let mut draws = Draws(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let names = names(2 + draws.below(7));
+            let names: Vec<_> = names.iter().map(String::as_str).collect();
+            let (_, before) = Script::draw(&mut draws, &names);
+            let kept: Vec<bool> = names.iter().map(|_| draws.below(3) != 0).collect();
+            let mut retained = before.clone();
+            let mut decided = Vec::new();
+            retained.retain(|subject| {
+                let Subject::Reference(name) = subject else {
+                    panic!("only references were drawn");
+                };
+                let index = names.iter().position(|drawn| drawn == name).expect("a drawn name");
+                assert!(!decided.contains(&index), "seed {seed}: {name} decided twice");
+                decided.push(index);
+                kept[index]
+            });
+            if before.is_impossible() {
+                assert!(retained.is_impossible(), "seed {seed}");
+                continue;
+            }
+            // What held among the kept subjects, replayed as a run of its own.
+            let mut script = Script {
+                non_null: alloc::vec![false; names.len()],
+                null: alloc::vec![false; names.len()],
+                constraints: Vec::new(),
+            };
+            for (index, name) in names.iter().enumerate() {
+                let evaluation = retained.reference(&(*name).to_string());
+                if !kept[index] {
+                    assert_eq!(evaluation, None, "seed {seed}: {name}");
+                    continue;
+                }
+                assert_eq!(evaluation, before.reference(&(*name).to_string()), "seed {seed}");
+                let evaluation = evaluation.expect("every drawn name is restricted");
+                script.non_null[index] = !evaluation.may_be_null();
+                script.null[index] = evaluation.values().is_empty();
+                for (other, other_name) in
+                    names.iter().enumerate().filter(|(other, _)| kept[*other])
+                {
+                    let (left, right) = (&ref_subject(name), &ref_subject(other_name));
+                    for order in [Order::Number, Order::Time] {
+                        let relation = retained.relation(order, left, right);
+                        assert_eq!(relation, before.relation(order, left, right), "seed {seed}");
+                    }
+                    let relation = retained.relation(Order::Number, left, right);
+                    script.constraints.push((index, other, relation));
+                }
+            }
+            assert_closure(&retained, &script, &names);
+            // Relating more stays closed through the kept subjects alone.
+            let (more_script, more) = Script::draw(&mut draws, &names);
+            assert_closure(&retained.meet(&more), &script.and(&more_script), &names);
+            let mut every = before.clone();
+            every.retain(|_| true);
+            assert_eq!(every, before, "seed {seed}");
+            let mut none = before.clone();
+            none.retain(|_| false);
+            assert_eq!(none, Guarantees::new(), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn retain_forgets_a_written_subject_and_keeps_what_it_implied() {
+        let now = Subject::Expression(Expr::Identifier(Ident::new("now")));
+        let (x, y, z) = (ref_subject("x"), ref_subject("y"), ref_subject("z"));
+        let mut guarantees = integers(&["x", "y", "z"], &[]);
+        guarantees.restrict(now.clone(), int4_known(3));
+        guarantees.relate(Order::Number, &x, &y, Relation::GREATER);
+        guarantees.relate(Order::Number, &z, &x, Relation::GREATER);
+        guarantees.relate(Order::Number, &now, &x, Relation::LESS);
+        guarantees.retain(|subject| *subject != x && *subject != now);
+        assert_eq!(guarantees.reference(&"x".to_string()), None);
+        assert_eq!(guarantees.get(&now), None);
+        assert_eq!(guarantees.reference(&"y".to_string()), Some(&integer(false)));
+        assert_eq!(guarantees.relation(Order::Number, &x, &y), Relation::ANY);
+        assert_eq!(guarantees.relation(Order::Number, &now, &z), Relation::ANY);
+        // `z > x > y` still held of `z` and `y` once `x` is forgotten.
+        assert_eq!(guarantees.relation(Order::Number, &z, &y), Relation::GREATER);
+        guarantees.restrict(x.clone(), int4_known(0));
+        assert_eq!(guarantees.reference(&"x".to_string()), Some(&int4_known(0)));
+        let mut impossible = Guarantees::<String>::impossible();
+        impossible.retain(|_| false);
+        assert!(impossible.is_impossible());
+    }
+
+    #[test]
+    fn retain_forgets_subjects_only_a_relation_names_deciding_each_once() {
+        let (y, u, w) = (ref_subject("y"), ref_subject("u"), ref_subject("w"));
+        let mut guarantees = integers(&["y"], &[]);
+        // Nothing is known of `u` and `w`, so `u` is only held apart from `y`.
+        guarantees.relate(Order::Number, &y, &u, Relation::NONE);
+        guarantees.relate(Order::Number, &y, &w, Relation::LESS);
+        guarantees.relate(Order::Time, &y, &w, Relation::GREATER);
+        let mut decided = Vec::new();
+        guarantees.retain(|subject| {
+            decided.push(subject.clone());
+            *subject == y
+        });
+        decided.sort_unstable();
+        assert_eq!(decided.iter().collect::<Vec<_>>(), [&u, &w, &y]);
+        for order in [Order::Number, Order::Time] {
+            assert_eq!(guarantees.relation(order, &y, &u), Relation::ANY);
+            assert_eq!(guarantees.relation(order, &w, &y), Relation::ANY);
+        }
+        assert_eq!(guarantees, integers(&["y"], &[]));
     }
 
     #[test]
