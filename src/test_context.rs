@@ -158,11 +158,13 @@ pub fn read_default(mut context: ColumnContext, sql: &str) -> Evaluation {
         .expect("the context resolves")
 }
 
-/// A callee that returns `returns` and is strict.
+/// A callee that returns `returns`, is strict and may return `NULL` on any
+/// input.
 pub fn strict_callee(returns: ScalarType) -> Callee {
     Callee {
         builtin: None,
         null_input: super::context::NullInput::Strict,
+        null_result: super::context::NullResult::AnyInput,
         volatility: Volatility::Immutable,
         kind: super::context::CalleeKind::Normal,
         returns,
@@ -171,11 +173,13 @@ pub fn strict_callee(returns: ScalarType) -> Callee {
     }
 }
 
-/// A callee that folds the built-in `builtin` and returns `returns`.
+/// A callee that folds the built-in `builtin`, returns `returns`, is strict
+/// and returns `NULL` only on `NULL` input.
 pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
     Callee {
         builtin: Some(builtin),
         null_input: super::context::NullInput::Strict,
+        null_result: super::context::NullResult::OnlyOnNullInput,
         volatility: Volatility::Immutable,
         kind: super::context::CalleeKind::Normal,
         returns,

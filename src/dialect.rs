@@ -157,13 +157,6 @@ pub trait EvalDialect {
         None
     }
 
-    /// Whether a `NULL` result of a call that may reach `callees` comes from
-    /// a `NULL` at one of the arguments that return `NULL`.
-    fn null_only_on_null_input(&self, callees: &[Callee], options: &Self::Options) -> bool {
-        let _ = (callees, options);
-        false
-    }
-
     /// The position of the argument a `length`-like call that may reach
     /// `callees` counts the characters of.
     fn counted_length_argument(

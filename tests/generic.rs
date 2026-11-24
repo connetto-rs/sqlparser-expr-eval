@@ -6,8 +6,8 @@ extern crate alloc;
 use alloc::collections::BTreeSet;
 
 use sqlparser_expr_eval::{
-    Builtin, Callee, CalleeKind, Evaluation, Guarantees, NullInput, Outcomes, ScalarType, Values,
-    Volatility, evaluate, implied,
+    Builtin, Callee, CalleeKind, Evaluation, Guarantees, NullInput, NullResult, Outcomes,
+    ScalarType, Values, Volatility, evaluate, implied,
     sql_values::postgres::{IntegerType, PgValue},
 };
 
@@ -46,11 +46,12 @@ fn imply(mut context: Ctx, sql: &str, outcomes: Outcomes) -> Guarantees<String> 
     .expect("the context resolves")
 }
 
-/// A strict callee returning `returns`.
-fn strict_callee(returns: ScalarType) -> Callee {
+/// A strict callee returning `returns` with `NULL` results from `null_result`.
+fn strict_callee(returns: ScalarType, null_result: NullResult) -> Callee {
     Callee::new(
         None,
         NullInput::Strict,
+        null_result,
         Volatility::Immutable,
         CalleeKind::Normal,
         returns,
@@ -149,14 +150,25 @@ fn a_call_with_no_callees_reads_unknown() {
 
 #[test]
 fn a_strict_boolean_call_nulls_for_no_input_reason() {
-    // The conservative dialect knows no builtin returning `NULL` exactly on
-    // a `NULL` argument, so a `NULL` result says nothing about `x`
+    // `f` may return `NULL` on any input, so a `NULL` result says nothing
+    // about `x`
     let guarantees = imply(
-        context().with_callee("f", strict_callee(ScalarType::Boolean)),
+        context().with_callee("f", strict_callee(ScalarType::Boolean, NullResult::AnyInput)),
         "f(x)",
         Outcomes::NULL,
     );
     assert_eq!(guarantees.reference(&"x".to_string()), None);
+}
+
+#[test]
+fn a_null_only_on_null_input_call_nulls_for_a_null_argument_under_any_dialect() {
+    let guarantees = imply(
+        context().with_callee("f", strict_callee(ScalarType::Boolean, NullResult::OnlyOnNullInput)),
+        "f(x)",
+        Outcomes::NULL,
+    );
+    let x = guarantees.reference(&"x".to_string()).expect("the result names x");
+    assert!(x.is_always_null());
 }
 
 #[test]

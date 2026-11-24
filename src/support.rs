@@ -493,7 +493,7 @@ mod tests {
         prune, subject, unnest, values_share,
     };
     use crate::{
-        context::{Callee, CalleeKind, Context, NullInput, Resolved, Volatility},
+        context::{Callee, CalleeKind, Context, NullInput, NullResult, Resolved, Volatility},
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
         guarantees::Subject,
         scalar::{ScalarType, TextRules},
@@ -523,6 +523,7 @@ mod tests {
         Callee {
             builtin: None,
             null_input: NullInput::Strict,
+            null_result: NullResult::AnyInput,
             volatility: Volatility::Volatile,
             kind: CalleeKind::Normal,
             returns: ScalarType::Float,

@@ -9,8 +9,8 @@ use sqlparser::{
     parser::{Parser, ParserError},
 };
 use sqlparser_expr_eval::{
-    Builtin, Callee, CalleeKind, Context, Evaluation, Guarantees, NullInput, QueryEvaluation,
-    Resolved, ScalarType, TextRules, Unlisted, Values, Volatility,
+    Builtin, Callee, CalleeKind, Context, Evaluation, Guarantees, NullInput, NullResult,
+    QueryEvaluation, Resolved, ScalarType, TextRules, Unlisted, Values, Volatility,
 };
 
 /// A context that resolves a fixed set of columns, callees, collations and
@@ -126,11 +126,13 @@ pub fn parse(expression: &str) -> Expr {
     expr.clone()
 }
 
-/// A callee that folds the built-in `builtin` and returns `returns`.
+/// A callee that folds the built-in `builtin`, returns `returns`, is strict
+/// and returns `NULL` only on `NULL` input.
 pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
     Callee::new(
         Some(builtin),
         NullInput::Strict,
+        NullResult::OnlyOnNullInput,
         Volatility::Immutable,
         CalleeKind::Normal,
         returns,
