@@ -64,7 +64,8 @@ pub struct Minimal<'a> {
 /// since on a row with a `NULL` field both are false.
 ///
 /// Quine–McCluskey proposes the candidates over two-valued logic, reading a
-/// `NULL` literal as true in a check and as false in a filter, and a
+/// `NULL` literal as the constant that reaches the top as true in a check and
+/// as false in a filter, and a
 /// candidate is kept when a truth table over the atoms agrees with
 /// `condition` on every row. An atom takes true and false, and `NULL` too
 /// when it may be `NULL`, independently of the others. A kept candidate is
@@ -101,20 +102,20 @@ pub fn minimal(
     let mut reader = Reader { leaves: Vec::new(), null: None, read, connectives: 0, cost: 0 };
     let read_condition = reader.condition(condition)?;
     let mut leaves = reader.leaves;
-    // The `NULL` literal is the last leaf of the truth table, and
-    // Quine–McCluskey reads it as the outcome the site takes it for, or as an
-    // atom in a value.
+    // The `NULL` literal is the last leaf of the truth table. Quine–McCluskey
+    // reads it as an atom in a value, and elsewhere as whichever constant
+    // reaches the top as the outcome the site takes `NULL` for.
     let (written, proposed) = match reader.null {
         None => (read_condition, None),
         Some(expression) => {
             let null = Bool::Term(u8::try_from(leaves.len()).ok()?);
             leaves.push(Leaf { expression, atom: NULL_LITERAL, values: NULL });
             let proposed = match site {
-                Site::Check => Some(substitute(&read_condition, &Bool::True)),
-                Site::Filter => Some(substitute(&read_condition, &Bool::False)),
+                Site::Check => Some(substitute(&read_condition, &Bool::True, &Bool::False)),
+                Site::Filter => Some(substitute(&read_condition, &Bool::False, &Bool::True)),
                 Site::Value => None,
             };
-            (substitute(&read_condition, &null), proposed)
+            (substitute(&read_condition, &null, &null), proposed)
         }
     };
     let proposed = proposed.as_ref().unwrap_or(&written);
@@ -306,19 +307,24 @@ impl<'a, F: FnMut(&Expr) -> Atom> Reader<'a, F> {
     }
 }
 
-/// `expression` with `null` in place of [`NULL_TERM`].
-fn substitute(expression: &Bool, null: &Bool) -> Bool {
+/// `expression` with `positive` in place of [`NULL_TERM`] under an even
+/// number of `NOT`s and `negative` under an odd number.
+fn substitute(expression: &Bool, positive: &Bool, negative: &Bool) -> Bool {
     match expression {
-        Bool::Term(NULL_TERM) => null.clone(),
+        Bool::Term(NULL_TERM) => positive.clone(),
         Bool::True => Bool::True,
         Bool::False => Bool::False,
         Bool::Term(index) => Bool::Term(*index),
-        Bool::Not(inner) => Bool::Not(Box::new(substitute(inner, null))),
+        Bool::Not(inner) => Bool::Not(Box::new(substitute(inner, negative, positive))),
         Bool::And(operands) => {
-            Bool::And(operands.iter().map(|operand| substitute(operand, null)).collect())
+            Bool::And(
+                operands.iter().map(|operand| substitute(operand, positive, negative)).collect(),
+            )
         }
         Bool::Or(operands) => {
-            Bool::Or(operands.iter().map(|operand| substitute(operand, null)).collect())
+            Bool::Or(
+                operands.iter().map(|operand| substitute(operand, positive, negative)).collect(),
+            )
         }
     }
 }
@@ -472,8 +478,7 @@ fn build(expression: &Bool, leaves: &[Leaf<'_>]) -> Expr {
                 operand @ (Expr::Identifier(_)
                 | Expr::CompoundIdentifier(_)
                 | Expr::Function(_)
-                | Expr::Value(_)
-                | Expr::Nested(_)) => operand,
+                | Expr::Value(_)) => operand,
                 operand => Expr::Nested(Box::new(operand)),
             };
             Expr::UnaryOp { op: UnaryOperator::Not, expr: Box::new(operand) }

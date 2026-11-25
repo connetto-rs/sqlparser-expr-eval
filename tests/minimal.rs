@@ -145,6 +145,31 @@ fn constants_are_read_as_constants() {
 }
 
 #[test]
+fn null_literal_under_not_keeps_its_site_reading() {
+    assert_eq!(answer("a OR NOT NULL", Site::Check, |_| NULLABLE), form("true", &["a", "NULL"]));
+    assert_eq!(answer("a OR NOT NULL", Site::Filter, |_| NULLABLE), form("a", &["NULL"]));
+    assert_eq!(answer("NOT (a AND NULL)", Site::Check, |_| NULLABLE), form("true", &["a", "NULL"]));
+    assert_eq!(answer("NOT (a AND NULL)", Site::Filter, |_| NULLABLE), form("NOT a", &["NULL"]));
+    assert_eq!(answer("a OR NULL OR FALSE", Site::Filter, |_| NULLABLE), form("a", &["NULL"]));
+    assert_eq!(
+        answer("(a OR NULL) AND TRUE", Site::Check, |_| NULLABLE),
+        form("true", &["a", "NULL"])
+    );
+}
+
+#[test]
+fn other_operators_stay_two_atoms() {
+    for site in SITES {
+        assert_eq!(answer("x @> y OR x <@ y", site, |_| NON_NULL), None);
+        assert_eq!(answer("NOT (x @> y)", site, |_| NON_NULL), None);
+    }
+    assert_eq!(
+        answer("NOT (x @> y) AND NOT (x @> y)", Site::Value, |_| NULLABLE),
+        form("NOT (x @> y)", &[]),
+    );
+}
+
+#[test]
 fn form_reads_no_atom_more_often() {
     // Each two-level form reads `a` or `d` twice.
     let sql = "NOT (NOT (a AND (b OR c)) AND NOT d)";
@@ -173,6 +198,10 @@ fn form_parenthesises_what_precedence_needs() {
     assert_eq!(
         answer("NOT (x IS NULL) AND NOT (x IS NULL)", Site::Value, |_| NULLABLE),
         form("NOT (x IS NULL)", &[]),
+    );
+    assert_eq!(
+        answer("(a AND NOT b) OR (a AND NOT b AND c)", Site::Value, |_| NULLABLE),
+        form("a AND NOT b", &["c"]),
     );
 }
 
