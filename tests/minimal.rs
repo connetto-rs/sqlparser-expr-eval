@@ -186,6 +186,19 @@ fn minimal_condition_has_no_answer() {
 }
 
 #[test]
+fn de_morgan_rewrite_is_no_improvement() {
+    for site in SITES {
+        assert_eq!(answer("NOT a AND NOT b", site, |_| NULLABLE), None);
+        assert_eq!(answer("NOT (a OR b)", site, |_| NULLABLE), None);
+        assert_eq!(answer("NOT (NOT a)", site, |_| NULLABLE), form("a", &[]));
+        assert_eq!(
+            answer("NOT a AND NOT b AND TRUE", site, |_| NULLABLE),
+            form("NOT a AND NOT b", &[]),
+        );
+    }
+}
+
+#[test]
 fn form_parenthesises_what_precedence_needs() {
     assert_eq!(
         answer("(a AND b) OR (a AND c)", Site::Value, |_| NULLABLE),

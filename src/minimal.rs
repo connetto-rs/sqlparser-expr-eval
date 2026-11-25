@@ -54,7 +54,8 @@ pub struct Minimal<'a> {
 }
 
 /// Answers the shortest form Quine–McCluskey finds for `condition` that
-/// agrees with it at `site`, reading each atom through `read`.
+/// agrees with it at `site` and improves on it as clippy's `nonminimal_bool`
+/// counts, reading each atom through `read`.
 ///
 /// Two occurrences are one atom when they are written alike, spans aside, and
 /// `read` does not answer them volatile. A comparison and its negation are
@@ -69,9 +70,18 @@ pub struct Minimal<'a> {
 /// candidate is kept when a truth table over the atoms agrees with
 /// `condition` on every row. An atom takes true and false, and `NULL` too
 /// when it may be `NULL`, independently of the others. A kept candidate is
-/// shorter in atoms read and connectives, reads no atom more often, and drops
-/// no atom that may raise or is volatile. A `NULL` literal the form drops is
-/// listed with the dropped atoms.
+/// shorter in atoms read, `NOT`s, connectives and constants, reads no atom
+/// more often, and drops no atom that may raise or is volatile. A `NULL`
+/// literal the form drops is listed with the dropped atoms.
+///
+/// A kept candidate also passes the improvement test of clippy's
+/// `nonminimal_bool`, reading some atom fewer times, or writing fewer
+/// negations and as many operators, or fewer operators and as many
+/// negations. An operator is an `AND` or `OR` connective, a `NOT` over an
+/// `AND` or `OR` group, or a `TRUE` or `FALSE` constant, and a negation is
+/// any other `NOT`, which a negated comparison written as its opposite does
+/// without. So `NOT a AND NOT b` has no answer, since `NOT (a OR b)` trades
+/// two negations for an operator.
 ///
 /// A condition with more than [`MAX_CONNECTIVES`] connectives has no answer,
 /// and neither has one already minimal.
@@ -98,7 +108,8 @@ pub fn minimal(
     site: Site,
     read: impl FnMut(&Expr) -> Atom,
 ) -> Option<Minimal<'_>> {
-    let mut reader = Reader { leaves: Vec::new(), null: None, read, connectives: 0, cost: 0 };
+    let mut reader =
+        Reader { leaves: Vec::new(), null: None, read, connectives: 0, stats: Stats::default() };
     let read_condition = reader.condition(condition)?;
     let mut leaves = reader.leaves;
     // The `NULL` literal is the last leaf of the truth table. Quine–McCluskey
@@ -128,15 +139,15 @@ pub fn minimal(
         }
         candidates.push(!simple);
     }
-    let mut candidates: Vec<(usize, Bool)> = candidates
+    let mut candidates: Vec<(Stats, Bool)> = candidates
         .into_iter()
-        .map(|candidate| (cost(&candidate, &leaves), candidate))
-        .filter(|(cost, _)| *cost < reader.cost)
+        .map(|candidate| (Stats::of(&candidate, &leaves), candidate))
+        .filter(|(stats, _)| stats.cost() < reader.stats.cost())
         .collect();
-    candidates.sort_by_key(|(cost, _)| *cost);
+    candidates.sort_by_key(|(stats, _)| stats.cost());
 
     let mut candidate_reads = vec![0; leaves.len()];
-    for (_, candidate) in candidates {
+    for (stats, candidate) in candidates {
         candidate_reads.fill(0);
         reads(&candidate, &mut candidate_reads);
         let mut dropped = Vec::new();
@@ -149,7 +160,7 @@ pub fn minimal(
                 dropped.push(leaf.expression);
             }
         }
-        if kept && agrees(&written, &candidate, &leaves, site) {
+        if kept && stats.improves_on(reader.stats) && agrees(&written, &candidate, &leaves, site) {
             return Some(Minimal { form: build(&candidate, &leaves), dropped });
         }
     }
@@ -222,8 +233,8 @@ struct Reader<'a, F> {
     read: F,
     /// The `AND` and `OR` connectives read.
     connectives: usize,
-    /// The atoms, literals and connectives read.
-    cost: usize,
+    /// What the condition writes, counted as written.
+    stats: Stats,
 }
 
 impl<'a, F: FnMut(&Expr) -> Atom> Reader<'a, F> {
@@ -242,15 +253,22 @@ impl<'a, F: FnMut(&Expr) -> Atom> Reader<'a, F> {
                 })
             }
             Expr::UnaryOp { op: UnaryOperator::Not, expr } => {
-                self.cost += 1;
+                if matches!(
+                    unnested(expr),
+                    Expr::BinaryOp { op: BinaryOperator::And | BinaryOperator::Or, .. }
+                ) {
+                    self.stats.operators += 1;
+                } else {
+                    self.stats.negations += 1;
+                }
                 Some(Bool::Not(Box::new(self.condition(expr)?)))
             }
             Expr::Value(value) if matches!(value.value, Value::Boolean(_)) => {
-                self.cost += 1;
+                self.stats.operators += 1;
                 Some(if value.value == Value::Boolean(true) { Bool::True } else { Bool::False })
             }
             Expr::Value(value) if value.value == Value::Null => {
-                self.cost += 1;
+                self.stats.reads += 1;
                 self.null.get_or_insert(expression);
                 Some(Bool::Term(NULL_TERM))
             }
@@ -280,12 +298,12 @@ impl<'a, F: FnMut(&Expr) -> Atom> Reader<'a, F> {
 
     fn connective(&mut self) -> Option<()> {
         self.connectives += 1;
-        self.cost += 1;
+        self.stats.operators += 1;
         (self.connectives <= MAX_CONNECTIVES).then_some(())
     }
 
     fn leaf(&mut self, expression: &'a Expr) -> Option<Bool> {
-        self.cost += 1;
+        self.stats.reads += 1;
         for (index, leaf) in self.leaves.iter().enumerate() {
             if leaf.atom.volatility == Volatility::Volatile {
                 continue;
@@ -402,20 +420,60 @@ fn reads(expression: &Bool, counts: &mut [usize]) {
     }
 }
 
-/// The atoms, literals and connectives [`build`] writes for `expression`.
-fn cost(expression: &Bool, leaves: &[Leaf<'_>]) -> usize {
-    match expression {
-        Bool::True | Bool::False | Bool::Term(_) => 1,
-        Bool::Not(inner) => {
-            match **inner {
-                Bool::Term(index) if negation(leaves[usize::from(index)].expression).is_some() => 1,
-                _ => 1 + cost(inner, leaves),
+/// What clippy's `nonminimal_bool` weighs a condition by, besides the reads
+/// of each atom.
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    /// The atoms and `NULL` literals read.
+    reads: usize,
+    /// The `NOT`s over anything but an `AND` or `OR` group.
+    negations: usize,
+    /// The `AND` and `OR` connectives, the `NOT`s over an `AND` or `OR` group
+    /// and the `TRUE` and `FALSE` constants.
+    operators: usize,
+}
+
+impl Stats {
+    /// What [`build`] writes for `expression`.
+    fn of(expression: &Bool, leaves: &[Leaf<'_>]) -> Self {
+        let mut stats = Self::default();
+        stats.count(expression, leaves);
+        stats
+    }
+
+    fn count(&mut self, expression: &Bool, leaves: &[Leaf<'_>]) {
+        match expression {
+            Bool::True | Bool::False => self.operators += 1,
+            Bool::Term(_) => self.reads += 1,
+            Bool::Not(inner) => {
+                match **inner {
+                    Bool::Term(index)
+                        if negation(leaves[usize::from(index)].expression).is_some() => {}
+                    Bool::And(_) | Bool::Or(_) => self.operators += 1,
+                    _ => self.negations += 1,
+                }
+                self.count(inner, leaves);
+            }
+            Bool::And(operands) | Bool::Or(operands) => {
+                self.operators += operands.len().saturating_sub(1);
+                for operand in operands {
+                    self.count(operand, leaves);
+                }
             }
         }
-        Bool::And(operands) | Bool::Or(operands) => {
-            operands.len().saturating_sub(1)
-                + operands.iter().map(|operand| cost(operand, leaves)).sum::<usize>()
-        }
+    }
+
+    /// The atoms, literals, `NOT`s, connectives and constants written.
+    fn cost(self) -> usize {
+        self.reads + self.negations + self.operators
+    }
+
+    /// Whether `self` improves on `written` under the test of clippy's
+    /// `nonminimal_bool`, given that it reads no atom more often.
+    fn improves_on(self, written: Self) -> bool {
+        self.reads < written.reads
+            || (self.negations < written.negations && self.operators == written.operators)
+            || (self.operators < written.operators && self.negations == written.negations)
     }
 }
 
