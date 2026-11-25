@@ -661,8 +661,68 @@ pub(super) fn comparison<D: EvalDialect, C: Context>(
 ) -> Result<Evaluation, C::Error> {
     let left_evaluation = forward(state, left)?;
     let right_evaluation = forward(state, right)?;
+    if strict_raises(state, (left, &left_evaluation), (right, &right_evaluation))? {
+        return Ok(Evaluation::raising(ScalarType::Boolean));
+    }
     let comparison = related(state, (left, left_evaluation), op, (right, right_evaluation))?;
     Ok(Evaluation::condition(comparison.outcomes(), comparison.error))
+}
+
+/// What the planner makes of an operand of a strict operator.
+#[derive(Clone, Copy)]
+struct Planned {
+    constant: bool,
+    may_fold_to_null: bool,
+}
+
+impl Planned {
+    /// What the planner makes of `operand`.
+    fn of<C: Context>(context: &mut C, operand: &Expr) -> Result<Self, C::Error> {
+        Ok(Self {
+            constant: support::fixed(context, operand, Volatility::Immutable)?,
+            may_fold_to_null: support::may_fold_to_null(context, operand)?,
+        })
+    }
+
+    /// What the planner makes of a strict operator over `self` and `other`.
+    fn joined(self, other: Self) -> Self {
+        Self {
+            constant: self.constant && other.constant,
+            may_fold_to_null: self.may_fold_to_null || other.may_fold_to_null,
+        }
+    }
+}
+
+/// Whether a strict operator over `left` and `right`, both with an outcome,
+/// always raises because one operand always raises and is constant or the
+/// other cannot fold to `NULL`.
+fn raises_through(left: (&Evaluation, Planned), right: (&Evaluation, Planned)) -> bool {
+    if left.0.is_impossible() || right.0.is_impossible() {
+        return false;
+    }
+    let raises = |(raising, planned): (&Evaluation, Planned),
+                  (other, other_planned): (&Evaluation, Planned)| {
+        raising.always_raises()
+            && (planned.constant || !other.may_be_null() || !other_planned.may_fold_to_null)
+    };
+    raises(left, right) || raises(right, left)
+}
+
+/// [`raises_through`] under the dialect, reading the operands' plans only
+/// when one always raises.
+fn strict_raises<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    (left, left_evaluation): (&Expr, &Evaluation),
+    (right, right_evaluation): (&Expr, &Evaluation),
+) -> Result<bool, C::Error> {
+    if !(left_evaluation.always_raises() || right_evaluation.always_raises())
+        || !state.dialect.strict_operators_raise_with_operands(state.options)
+    {
+        return Ok(false);
+    }
+    let left_planned = Planned::of(state.context, left)?;
+    let right_planned = Planned::of(state.context, right)?;
+    Ok(raises_through((left_evaluation, left_planned), (right_evaluation, right_planned)))
 }
 
 /// The comparison of the operands `left` and `right` read as their
@@ -1093,11 +1153,12 @@ fn left_deep<D: EvalDialect, C: Context>(
     right: &Expr,
     class: Class,
 ) -> Result<Evaluation, C::Error> {
-    // The spine's (operator, right operand) pairs read top-down, the root
-    // first; the walk stops at a different class or a non-operator.
-    let mut pairs: alloc::vec::Vec<(&BinaryOperator, &Expr)> = alloc::vec::Vec::new();
+    // The spine's (operator, left operand, right operand) triples read
+    // top-down, the root first; the walk stops at a different class or a
+    // non-operator.
+    let mut triples: alloc::vec::Vec<(&BinaryOperator, &Expr, &Expr)> = alloc::vec::Vec::new();
     let mut spine = support::unnest(left);
-    pairs.push((op, right));
+    triples.push((op, spine, right));
     loop {
         let node = support::unnest(spine);
         let Expr::BinaryOp { left: l, op: o, right: r } = node else {
@@ -1106,15 +1167,34 @@ fn left_deep<D: EvalDialect, C: Context>(
         if chain_class(o) != Some(class) {
             break;
         }
-        pairs.push((o, support::unnest(r)));
         spine = support::unnest(l);
+        triples.push((o, spine, support::unnest(r)));
     }
-    let mut acc = forward(state, support::unnest(spine))?;
-    for (o, r) in pairs.iter().rev() {
+    let strict = state.dialect.strict_operators_raise_with_operands(state.options);
+    // The folded prefix's plan, read once an operand always raises and then
+    // carried up so a long spine is walked once.
+    let mut planned: Option<Planned> = None;
+    let mut acc = forward(state, spine)?;
+    for (o, l, r) in triples.iter().rev() {
         let right = forward(state, r)?;
-        acc = match class {
+        let mut raises = strict && (acc.always_raises() || right.always_raises());
+        if raises || planned.is_some() {
+            let left_planned = match planned {
+                Some(left_planned) => left_planned,
+                None => Planned::of(state.context, l)?,
+            };
+            let right_planned = Planned::of(state.context, r)?;
+            raises &= raises_through((&acc, left_planned), (&right, right_planned));
+            planned = Some(left_planned.joined(right_planned));
+        }
+        let combined = match class {
             Class::Additive | Class::Multiplicative => arithmetic_combine(state, acc, o, right),
             Class::Concat => concat_combine(state, &acc, &right),
+        };
+        acc = if raises {
+            combined.with_null(false).with_error(true).with_values(Values::none())
+        } else {
+            combined
         };
     }
     Ok(acc)

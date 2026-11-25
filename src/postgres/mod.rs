@@ -201,6 +201,13 @@ impl EvalDialect for PostgreSqlDialect {
         let _ = options;
         true
     }
+
+    /// `eval_const_expressions` raises on a constant argument that raises and
+    /// folds a strict operator over a `NULL` constant argument to `NULL`.
+    fn strict_operators_raise_with_operands(&self, options: &PostgreSqlOptions) -> bool {
+        let _ = options;
+        true
+    }
 }
 
 /// The text `||` reads a value as, which for a `boolean` is its text cast.
@@ -347,12 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn concat_does_not_fold_when_a_side_holds_no_value() {
-        // `1 / 0` raises, so the right side holds no value the fold can use
+    fn concat_over_a_raising_side_always_raises() {
         let evaluation = read("'a' || (1 / 0)", false);
-        assert!(matches!(evaluation.values(), Values::Unlisted(_)));
-        assert!(evaluation.may_raise());
-        assert!(!evaluation.may_be_null());
+        assert!(evaluation.always_raises());
     }
 
     #[test]

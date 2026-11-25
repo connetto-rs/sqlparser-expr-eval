@@ -781,3 +781,64 @@ fn an_enum_too_large_to_list_stays_undecided() {
     assert_eq!(equality.outcomes(), Outcomes { null: false, ..Outcomes::ANY });
     assert!(!read(wide_context(), "kind::wide_kind").may_raise());
 }
+
+#[test]
+fn an_operator_over_a_constant_raising_operand_always_raises() {
+    for sql in ["1 / 0 > n", "n < 1 / 0", "(1 / 0) + n > 0", "NULL::int > 1 / 0", "n * 0 + 1 / 0"] {
+        assert!(read(integers(), sql).always_raises(), "{sql}");
+    }
+}
+
+#[test]
+fn an_operator_over_a_raising_operand_beside_a_column_always_raises() {
+    for sql in [
+        "x / 0 > n",
+        "n <> x / 0",
+        "x / 0 + n",
+        "x / 0 + n + 1",
+        "x / 0 > n + 1",
+        "x / 0 > -n",
+        "x / 0 || CAST(n AS text)",
+        "CAST(n AS text) || x / 0",
+    ] {
+        assert!(read(integers(), sql).always_raises(), "{sql}");
+    }
+}
+
+#[test]
+fn an_operator_beside_a_null_constant_folds_to_null() {
+    for sql in [
+        "x / 0 > NULL::int",
+        "NULL::int > x / 0",
+        "x / 0 + NULL::int",
+        "x / 0 || NULL::text",
+        "(x / 0 + NULL) > x / 0",
+        "x / 0 > CASE WHEN true THEN NULL ELSE n END",
+    ] {
+        let evaluation = read(integers(), sql);
+        assert!(evaluation.may_be_null(), "{sql}");
+        assert!(!evaluation.always_raises(), "{sql}");
+    }
+}
+
+#[test]
+fn an_operator_beside_a_parameter_planned_as_a_constant_folds_to_null() {
+    let parameters = || {
+        let mut context = integers();
+        context.plan_constants = vec!["n".into()];
+        context
+    };
+    for sql in ["x / 0 > n", "x / 0 + n * 2"] {
+        let evaluation = read(parameters(), sql);
+        assert!(evaluation.may_be_null(), "{sql}");
+        assert!(!evaluation.always_raises(), "{sql}");
+    }
+    assert!(read(parameters(), "1 / 0 > n").always_raises());
+}
+
+#[test]
+fn an_operator_beside_an_operand_without_outcome_has_none() {
+    let mut context = integers();
+    context.columns.push(("none".into(), Evaluation::impossible(INTEGER)));
+    assert!(read(context, "1 / 0 + none").is_impossible());
+}

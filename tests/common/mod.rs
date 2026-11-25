@@ -21,6 +21,8 @@ pub struct Ctx {
     pub collations: Vec<(String, TextRules)>,
     pub types: Vec<(String, ScalarType)>,
     pub query: Option<QueryEvaluation>,
+    /// The references the engine may plan as constants.
+    pub plan_constants: Vec<String>,
 }
 
 impl Ctx {
@@ -32,6 +34,7 @@ impl Ctx {
             collations: Vec::new(),
             types: Vec::new(),
             query: None,
+            plan_constants: Vec::new(),
         }
     }
 
@@ -102,6 +105,10 @@ impl Context for Ctx {
             .iter()
             .find(|(known, _)| name.is_some_and(|name| name.value == *known))
             .map_or_else(|| ScalarType::of(data_type), |(_, ty)| ty.clone())
+    }
+
+    fn may_plan_as_constant(&self, reference: &Self::Reference) -> bool {
+        self.plan_constants.contains(reference)
     }
 }
 

@@ -5,8 +5,8 @@ use core::ops::Bound;
 
 use sql_values::postgres::{PgArray, PgNumeric, PgValue};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName, Value,
-    ValueWithSpan,
+    BinaryOperator, CastKind, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    InTarget, ObjectName, Value, ValueWithSpan,
 };
 
 use super::{
@@ -156,6 +156,50 @@ fn push_fixed_call<'a, C: Context>(
         && callees
             .iter()
             .all(|callee| callee.kind == CalleeKind::Normal && callee.volatility <= most_volatile))
+}
+
+/// Whether the planner may fold `expression` to a `NULL` constant, which a
+/// tree of run-time references, non-`NULL` literals, casts, unary operators
+/// and comparison, arithmetic and `||` operators never does.
+pub(crate) fn may_fold_to_null<C: Context>(
+    context: &mut C,
+    expression: &Expr,
+) -> Result<bool, C::Error> {
+    let mut stack = vec![expression];
+    while let Some(node) = stack.pop() {
+        let node = unnest(node);
+        if is_reference(node) {
+            match context.reference(node)? {
+                Some(resolved) if !context.may_plan_as_constant(&resolved.reference) => continue,
+                _ => return Ok(true),
+            }
+        }
+        match node {
+            Expr::Value(value) if matches!(value.value, Value::Null) => return Ok(true),
+            Expr::Value(_) | Expr::TypedString(_) => {}
+            Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, expr, .. }
+            | Expr::UnaryOp { expr, .. } => stack.push(expr),
+            Expr::BinaryOp {
+                left,
+                op:
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::StringConcat,
+                right,
+            } => stack.extend([&**left, &**right]),
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 /// `expression` without the parentheses around it.

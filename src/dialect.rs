@@ -178,6 +178,14 @@ pub trait EvalDialect {
         let _ = options;
         false
     }
+
+    /// Whether a comparison, an arithmetic operator or `||` always raises when
+    /// one operand does, save when the planner folds it to `NULL` over a
+    /// `NULL` constant operand before a non-constant raising operand runs.
+    fn strict_operators_raise_with_operands(&self, options: &Self::Options) -> bool {
+        let _ = options;
+        false
+    }
 }
 
 /// Implements [`EvalDialect`] with the default bodies and no settings on a
