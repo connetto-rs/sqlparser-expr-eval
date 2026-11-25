@@ -281,6 +281,16 @@ pub trait Context {
         let _ = name;
         Ok(TextRules::UNKNOWN)
     }
+
+    /// Whether the engine may plan `reference` as a constant, which a strict
+    /// operator over a `NULL` one folds to `NULL` before its other operands
+    /// run. A PostgreSQL context answers `true` for a function parameter and
+    /// a PL/pgSQL variable, which a custom plan or an inlined SQL function
+    /// binds as a constant.
+    fn may_plan_as_constant(&self, reference: &Self::Reference) -> bool {
+        let _ = reference;
+        false
+    }
 }
 
 #[cfg(test)]
