@@ -124,6 +124,29 @@ fn negated_comparison_is_one_atom_negated() {
     }
 }
 
+#[test]
+fn negated_comparisons_are_negations() {
+    for site in SITES {
+        for sql in [
+            "NOT (x < y OR x < z)",
+            "NOT (x < y AND x < z)",
+            "NOT (x = y OR x = z)",
+            "NOT (x IS TRUE OR y IS TRUE)",
+        ] {
+            assert_eq!(answer(sql, site, |_| NULLABLE), None, "{sql}");
+        }
+        assert_eq!(answer("a AND NOT (x < y)", site, |_| NULLABLE), form("a AND x >= y", &[]));
+        assert_eq!(
+            answer("NOT (x < y) AND NOT (x < z)", site, |_| NULLABLE),
+            form("x >= y AND x >= z", &[]),
+        );
+        assert_eq!(
+            answer("(a OR b) AND NOT (x < y)", site, |_| NULLABLE),
+            form("(a OR b) AND x >= y", &[]),
+        );
+    }
+}
+
 // PostgreSQL 18.7 answers both `r IS NULL` and `r IS NOT NULL` false on
 // `ROW(1, NULL)`.
 #[test]
