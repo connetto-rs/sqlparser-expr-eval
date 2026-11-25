@@ -795,6 +795,7 @@ fn an_operator_over_a_raising_operand_beside_a_column_always_raises() {
         "x / 0 > n",
         "n <> x / 0",
         "x / 0 + n",
+        "x / 0 + n + 1",
         "x / 0 > n + 1",
         "x / 0 > -n",
         "x / 0 || CAST(n AS text)",
@@ -833,4 +834,11 @@ fn an_operator_beside_a_parameter_planned_as_a_constant_folds_to_null() {
         assert!(!evaluation.always_raises(), "{sql}");
     }
     assert!(read(parameters(), "1 / 0 > n").always_raises());
+}
+
+#[test]
+fn an_operator_beside_an_operand_without_outcome_has_none() {
+    let mut context = integers();
+    context.columns.push(("none".into(), Evaluation::impossible(INTEGER)));
+    assert!(read(context, "1 / 0 + none").is_impossible());
 }

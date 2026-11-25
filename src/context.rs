@@ -300,13 +300,13 @@ mod tests {
     use sql_values::postgres::IntegerType;
     use sqlparser::{
         ast::{Expr, Function, Ident, ObjectNamePart},
-        dialect::GenericDialect,
+        dialect::{GenericDialect, PostgreSqlDialect},
     };
 
     use super::*;
     use crate::{
-        CalleeKind, Evaluation, NullInput, ScalarType, TextRules, Values, Volatility,
-        forward::evaluate, guarantees::Guarantees, test_context::parse,
+        CalleeKind, Evaluation, NullInput, PostgreSqlOptions, ScalarType, TextRules, Values,
+        Volatility, forward::evaluate, guarantees::Guarantees, test_context::parse,
     };
 
     /// A context that answers only `reference` and `callees`, so the default
@@ -364,6 +364,21 @@ mod tests {
         assert!(evaluation.may_be_null());
         assert!(!evaluation.may_raise());
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
+    }
+
+    /// A reference plans at run time by default, so it never folds a strict
+    /// operator to `NULL` beside an operand that always raises.
+    #[test]
+    fn a_reference_plans_at_run_time_by_default() {
+        let evaluation = evaluate(
+            &parse("x || (CASE WHEN x IS NULL THEN 1 ELSE 2 END / 0)"),
+            &PostgreSqlDialect {},
+            &PostgreSqlOptions::default(),
+            &mut Minimal,
+            &Guarantees::new(),
+        )
+        .unwrap();
+        assert!(evaluation.always_raises());
     }
 
     /// A context that names no collation leaves an explicit one unknown,
