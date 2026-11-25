@@ -81,18 +81,17 @@ pub struct Minimal<'a> {
 /// use sqlparser_expr_eval::{Atom, Site, Volatility, minimal};
 ///
 /// let condition = Parser::new(&PostgreSqlDialect {})
-///     .try_with_sql("(a AND b) OR (a AND NOT b)")?
-///     .parse_expr()?;
-/// let nullable =
-///     |_: &_| Atom { may_be_null: true, may_raise: false, volatility: Volatility::Immutable };
+///     .try_with_sql("(a AND b) OR (a AND NOT b)")
+///     .and_then(|mut parser| parser.parse_expr())
+///     .expect("the condition parses");
+/// let nullable = Atom { may_be_null: true, may_raise: false, volatility: Volatility::Immutable };
 ///
 /// // A CHECK admits the NULL the condition takes where `a` is true and `b`
 /// // is NULL, and a WHERE clause rejects it.
-/// let minimal_form = minimal(&condition, Site::Check, nullable).expect("`a` agrees");
+/// let minimal_form = minimal(&condition, Site::Check, |_| nullable).expect("`a` agrees");
 /// assert_eq!(minimal_form.form.to_string(), "a");
 /// assert_eq!(minimal_form.dropped.len(), 1);
-/// assert!(minimal(&condition, Site::Filter, nullable).is_none());
-/// # Ok::<(), sqlparser::parser::ParserError>(())
+/// assert!(minimal(&condition, Site::Filter, |_| nullable).is_none());
 /// ```
 pub fn minimal(
     condition: &Expr,
@@ -488,23 +487,11 @@ fn build(expression: &Bool, leaves: &[Leaf<'_>]) -> Expr {
     }
 }
 
-/// The first leaf `expression` reads, past every leaf when it reads none.
-fn first_read(expression: &Bool) -> u8 {
-    match expression {
-        Bool::True | Bool::False => u8::MAX,
-        Bool::Term(index) => *index,
-        Bool::Not(inner) => first_read(inner),
-        Bool::And(operands) | Bool::Or(operands) => {
-            operands.iter().map(first_read).min().unwrap_or(u8::MAX)
-        }
-    }
-}
-
 /// Joins `operands` with `op` in the order the condition first reads them,
 /// parenthesising an `OR` under an `AND`.
 fn connect(operands: &[Bool], op: &BinaryOperator, leaves: &[Leaf<'_>]) -> Expr {
     let mut ordered: Vec<&Bool> = operands.iter().collect();
-    ordered.sort_by_key(|operand| first_read(operand));
+    ordered.sort_by_key(|operand| operand.terms().trailing_zeros());
     let mut written = ordered.into_iter().map(|operand| {
         let built = build(operand, leaves);
         if *op == BinaryOperator::And && matches!(operand, Bool::Or(_)) {
