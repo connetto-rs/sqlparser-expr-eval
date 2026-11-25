@@ -15,6 +15,7 @@ categories = ["database", "no-std"]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", default-features = false, features = ["visitor"] }
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
 rpds = { version = "1.2", default-features = false }
+quine-mc_cluskey = { version = "0.2.4", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -23,9 +24,14 @@ criterion = { version = "0.8", features = ["html_reports"] }
 name = "evaluation"
 harness = false
 
+[[bench]]
+name = "minimal"
+harness = false
+required-features = ["std"]
+
 [features]
 default = ["std"]
-std = ["sqlparser/std", "sqlparser/recursive-protection"]
+std = ["sqlparser/std", "sqlparser/recursive-protection", "dep:quine-mc_cluskey"]
 
 [lints.rust]
 missing_docs = "forbid"

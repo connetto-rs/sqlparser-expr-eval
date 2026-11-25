@@ -12,6 +12,8 @@ mod dialect;
 mod domain;
 mod forward;
 mod guarantees;
+#[cfg(feature = "std")]
+mod minimal;
 mod postgres;
 mod relation;
 mod scalar;
@@ -31,6 +33,8 @@ pub use forward::{
     fold::{Comparison, RowKinds},
 };
 pub use guarantees::{Guarantees, Subject};
+#[cfg(feature = "std")]
+pub use minimal::{Atom, MAX_CONNECTIVES, Minimal, Site, minimal};
 pub use postgres::PostgreSqlOptions;
 pub use relation::{Order, Relation};
 pub use scalar::{ArrayElement, Collation, EnumType, ScalarType, TextRules};
