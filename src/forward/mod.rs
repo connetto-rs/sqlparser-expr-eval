@@ -847,7 +847,7 @@ mod tests {
         let answered = || {
             ColumnContext::new().with_expression(
                 cast,
-                Evaluation::unknown(ScalarType::Other).with_null(false).with_error(false),
+                Evaluation::unknown(ScalarType::catalog("uuid")).with_null(false).with_error(false),
             )
         };
         assert!(!read(answered(), cast).may_raise());

@@ -73,9 +73,9 @@ pub(super) fn value_function(name: &str, arguments: &[Evaluation]) -> Option<Eva
         ("system_user", []) => (ScalarType::Text(TextRules::DEFAULT), true),
         ("current_date", []) => (ScalarType::Date, false),
         ("localtimestamp", [] | [_]) => (ScalarType::Timestamp, false),
-        ("current_time" | "current_timestamp" | "localtime", [] | [_]) => {
-            (ScalarType::Other, false)
-        }
+        ("current_time", [] | [_]) => (ScalarType::catalog("timetz"), false),
+        ("current_timestamp", [] | [_]) => (ScalarType::catalog("timestamptz"), false),
+        ("localtime", [] | [_]) => (ScalarType::catalog("time"), false),
         _ => return None,
     };
     let error = arguments.iter().any(Evaluation::may_raise);
@@ -157,7 +157,9 @@ fn common_type(current: &ScalarType, ty: &ScalarType) -> Option<(ScalarType, boo
     let number = |t: &ScalarType| t.is_number() || *t == ScalarType::Float;
     let temporal = |t: &ScalarType| matches!(t, ScalarType::Date | ScalarType::Timestamp);
     Some(match (current, ty) {
-        _ if current.is_unmodelled() || ty.is_unmodelled() => (ScalarType::Other, true),
+        // Two values of one unmodelled type meet at it.
+        (ScalarType::Other(Some(_)), _) if current == ty => (current.clone(), false),
+        _ if current.is_unmodelled() || ty.is_unmodelled() => (ScalarType::Other(None), true),
         _ if current == ty => (current.clone(), false),
         // Two implicit collations leave the comparison's collation undecided.
         (ScalarType::Text(_), ScalarType::Text(_)) => (ScalarType::Text(TextRules::UNKNOWN), true),
@@ -237,7 +239,7 @@ fn extremum(
             ty,
             ScalarType::UnknownLiteral
                 | ScalarType::Unknown
-                | ScalarType::Other
+                | ScalarType::Other(_)
                 | ScalarType::Float
         );
     // The extremum folds only when every argument is a constant.
@@ -405,7 +407,7 @@ mod tests {
     #[test]
     fn an_unmodelled_argument_may_raise() {
         for name in ["coalesce", "nullif", "greatest", "least"] {
-            let arguments = [column(ScalarType::Other), int(5)];
+            let arguments = [column(ScalarType::catalog("uuid")), int(5)];
             let call = super::name_recognised(name, &arguments, false).expect("resolves");
             assert!(call.may_raise(), "{name}");
             assert!(!call.always_raises(), "{name}");

@@ -47,7 +47,8 @@ pub(super) fn arithmetic(left: &Evaluation, op: &BinaryOperator, right: &Evaluat
     // a date past the `timestamp` range.
     let temporal = |ty: &ScalarType| matches!(ty, ScalarType::Date | ScalarType::Timestamp);
     if temporal(left.ty()) && temporal(right.ty()) {
-        return Evaluation::new(ScalarType::Other, null, true, Values::Unlisted(Unlisted::any()));
+        let interval = ScalarType::catalog("interval");
+        return Evaluation::new(interval, null, true, Values::Unlisted(Unlisted::any()));
     }
     // The operator is strict, so a `NULL` operand answers `NULL` without a
     // raise, save the widening of a `numeric` side to `double precision`
@@ -762,7 +763,7 @@ mod tests {
             (&timestamp, &known_date("2020-01-01")),
         ] {
             let difference = arithmetic(left, &BinaryOperator::Minus, right);
-            assert_eq!(*difference.ty(), ScalarType::Other);
+            assert_eq!(*difference.ty(), ScalarType::catalog("interval"));
             assert!(difference.may_raise());
             assert!(matches!(difference.values(), Values::Unlisted(_)));
         }

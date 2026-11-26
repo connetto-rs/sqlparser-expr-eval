@@ -595,7 +595,7 @@ impl Evaluation {
         } else if self.ty.is_untyped() {
             other.ty.clone()
         } else {
-            ScalarType::Other
+            ScalarType::Other(None)
         };
         Self::new(
             ty,
@@ -703,7 +703,7 @@ impl Evaluation {
                 ScalarType::Unknown
                 | ScalarType::UnknownLiteral
                 | ScalarType::Float
-                | ScalarType::Other => true,
+                | ScalarType::Other(_) => true,
                 ScalarType::Enum(enumeration) => {
                     matches!(value, PgValue::Text(label) if enumeration.position(label).is_some())
                 }
@@ -869,13 +869,13 @@ mod tests {
             ScalarType::Integer(IntegerType::Integer),
         ));
         assert_eq!(*typed.ty(), ScalarType::Integer(IntegerType::Integer));
-        // Two unrelated types join to `Other`
+        // Two unrelated types join to an `Other` naming no type
         let mixed = Evaluation::known(
             PgValue::Text(alloc::string::String::from("a")),
             ScalarType::Text(TextRules::DEFAULT),
         )
         .join(&Evaluation::known(PgValue::Integer(1), ScalarType::Integer(IntegerType::Integer)));
-        assert_eq!(*mixed.ty(), ScalarType::Other);
+        assert_eq!(*mixed.ty(), ScalarType::Other(None));
     }
 
     #[test]
@@ -1174,7 +1174,7 @@ mod tests {
     #[test]
     fn listed_ranges_read_the_members_of_their_kind() {
         let mixed = Evaluation::new(
-            ScalarType::Other,
+            ScalarType::Other(None),
             false,
             false,
             Values::Listed(BTreeSet::from([PgValue::Integer(1), PgValue::Text("ab".to_string())])),

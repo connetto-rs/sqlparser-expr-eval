@@ -289,7 +289,7 @@ fn comparable(left: &Evaluation, right: &Evaluation) -> bool {
     let reads_as = |literal: &Evaluation, other: &Evaluation| {
         match other.ty() {
             ScalarType::UnknownLiteral | ScalarType::Unknown | ScalarType::Text(_) => true,
-            ScalarType::Float | ScalarType::Other => false,
+            ScalarType::Float | ScalarType::Other(_) => false,
             ty => !reinterpret_unknown(literal.clone(), ty).may_raise(),
         }
     };
