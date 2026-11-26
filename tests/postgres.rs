@@ -953,6 +953,72 @@ fn an_operator_beside_a_parameter_planned_as_a_constant_folds_to_null() {
     assert!(read(parameters(), "1 / 0 > n").always_raises());
 }
 
+/// `VALUE IS NOT NULL`, which refuses `NULL`.
+fn refuse_null(converted: Evaluation) -> Evaluation {
+    let error = converted.may_raise() || converted.may_be_null();
+    converted.with_null(false).with_error(error)
+}
+
+/// `VALUE > 0`, which refuses any value but `NULL` or a known positive one.
+fn refuse_non_positive(converted: Evaluation) -> Evaluation {
+    let positive = matches!(converted.constant(), Some(PgValue::Integer(value)) if *value > 0);
+    if positive || converted.is_always_null() { converted } else { converted.with_error(true) }
+}
+
+/// [`integers`] with the integer domains `present` checking
+/// `VALUE IS NOT NULL`, `positive` checking `VALUE > 0`, `vacuous` checking
+/// `true` and `loose` checking nothing.
+fn domains() -> Ctx {
+    let mut context = integers();
+    context.types = ["present", "positive", "vacuous", "loose"]
+        .into_iter()
+        .map(|name| (name.into(), INTEGER))
+        .collect();
+    context.checks = vec![
+        ("present".into(), refuse_null),
+        ("positive".into(), refuse_non_positive),
+        ("vacuous".into(), |converted| converted),
+    ];
+    context
+}
+
+#[test]
+fn a_cast_to_a_domain_raises_where_its_checks_refuse_the_value() {
+    assert!(read(domains(), "NULL::present").always_raises());
+    assert!(read(domains(), "n::present").may_raise());
+    assert!(!read(domains(), "x::present").may_raise());
+    let null = read(domains(), "NULL::positive");
+    assert!(null.is_always_null() && !null.may_raise());
+    assert!(!read(domains(), "5::positive").may_raise());
+    assert!(read(domains(), "0::positive").may_raise());
+    assert!(read(domains(), "positive '0'").may_raise());
+    assert!(!read(domains(), "positive '5'").may_raise());
+    assert!(read(domains(), "ARRAY[NULL]::present[]").may_raise());
+    assert!(read(domains(), "'x'::vacuous").always_raises());
+}
+
+#[test]
+fn the_planner_leaves_a_checked_cast_for_run_time() {
+    for sql in [
+        "x / 0 > 0 OR 5::positive > 0",
+        "x / 0 > 0 OR 5::vacuous > 0",
+        "x / 0 > 0 OR vacuous '5' > 0",
+        "x / 0 > 0 OR ARRAY[5]::vacuous[] IS NOT NULL",
+        "'x'::vacuous > 0 OR true",
+    ] {
+        assert!(read(domains(), sql).may_raise(), "{sql}");
+    }
+    for sql in [
+        "x / 0 > 0 OR 5::loose > 0",
+        "x / 0 > 0 OR '{5}'::vacuous[] IS NOT NULL",
+        "NULL::present IS NULL OR true",
+    ] {
+        assert!(!read(domains(), sql).may_raise(), "{sql}");
+    }
+    let beside_null = read(domains(), "NULL::present = NULL::int");
+    assert!(beside_null.may_be_null() && !beside_null.always_raises());
+}
+
 #[test]
 fn an_operator_beside_an_operand_without_outcome_has_none() {
     let mut context = integers();

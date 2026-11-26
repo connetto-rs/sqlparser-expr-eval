@@ -117,7 +117,10 @@ fn evaluate_node<D: EvalDialect, C: Context>(
 ) -> Result<Evaluation, C::Error> {
     Ok(match expression {
         Expr::Value(value) => literals::value(value),
-        Expr::TypedString(typed) => literals::typed_string(state.context, typed),
+        Expr::TypedString(typed) => {
+            let converted = literals::typed_string(state.context, typed);
+            literals::checked(state.context, &typed.data_type, converted)?
+        }
         Expr::UnaryOp { op, expr } => fold::unary(state, *op, expr)?,
         Expr::BinaryOp { left, op, right } => fold::binary(state, left, op, right)?,
         Expr::Cast { kind, expr, data_type, .. } => literals::cast(state, kind, expr, data_type)?,

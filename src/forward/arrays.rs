@@ -74,7 +74,7 @@ pub(super) fn cast_constructor<D: EvalDialect, C: Context>(
             item => {
                 let source = forward(state, item)?;
                 let target = if source.ty().is_array() { array_data_type } else { element };
-                super::literals::cast_evaluation(state, kind, source, target)
+                super::literals::cast_evaluation(state, kind, source, target)?
             }
         });
     }

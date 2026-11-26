@@ -70,11 +70,24 @@ pub(super) fn cast<D: EvalDialect, C: Context>(
         return super::arrays::cast_constructor(state, kind, array, data_type, element);
     }
     let source = forward(state, expr)?;
-    Ok(cast_evaluation(state, kind, source, data_type))
+    cast_evaluation(state, kind, source, data_type)
 }
 
-/// The dialect's reading of a cast of the already-evaluated `source`.
+/// The dialect's reading of a cast of the already-evaluated `source`, met
+/// with the checks of `data_type`.
 pub(super) fn cast_evaluation<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    kind: &CastKind,
+    source: Evaluation,
+    data_type: &DataType,
+) -> Result<Evaluation, C::Error> {
+    let converted = conversion(state, kind, source, data_type);
+    checked(state.context, data_type, converted)
+}
+
+/// The dialect's reading of a cast of `source` to `data_type` before the
+/// type's checks.
+pub(super) fn conversion<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     kind: &CastKind,
     source: Evaluation,
@@ -89,6 +102,46 @@ pub(super) fn cast_evaluation<D: EvalDialect, C: Context>(
         |element| state.context.data_type(element),
         state.options,
     )
+}
+
+/// `converted`, the value a cast or a typed literal of `data_type` converts
+/// to, met with what the context says the type's checks make of it.
+pub(super) fn checked<C: Context>(
+    context: &mut C,
+    data_type: &DataType,
+    converted: Evaluation,
+) -> Result<Evaluation, C::Error> {
+    if !context.cast_checks(data_type)? {
+        return Ok(converted);
+    }
+    let raises = converted.may_raise();
+    let checked = context.checked_cast(data_type, converted)?;
+    Ok(if raises { checked.with_error(true) } else { checked })
+}
+
+/// Whether `node` is a cast or a typed literal whose type checks the
+/// converted value as the expression runs, which the planner never folds.
+/// An array's input function runs its elements' checks as an untyped
+/// literal is parsed, so a cast of one to an array checks nothing later.
+pub(super) fn checks_at_run_time<C: Context>(
+    context: &mut C,
+    node: &Expr,
+) -> Result<bool, C::Error> {
+    let (data_type, untyped) = match node {
+        Expr::Cast { expr, data_type, .. } => {
+            let untyped = match crate::support::unnest(expr) {
+                Expr::Value(literal) => value(literal).is_untyped(),
+                _ => false,
+            };
+            (data_type, untyped)
+        }
+        Expr::TypedString(typed) => (&typed.data_type, true),
+        _ => return Ok(false),
+    };
+    if untyped && matches!(data_type, DataType::Array(_)) {
+        return Ok(false);
+    }
+    context.cast_checks(data_type)
 }
 
 /// The forward evaluation of `expr COLLATE collation`, the operand's values
