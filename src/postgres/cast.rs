@@ -228,7 +228,8 @@ fn numeric_modifier(data_type: &DataType) -> Option<(u64, i64)> {
     }
 }
 
-/// Whether `data_type` states a modifier on a type the casts do not model.
+/// Whether `data_type` states a length on an unmodelled type, which
+/// PostgreSQL may refuse, as it refuses `char(0)`. A precision only rounds.
 fn states_modifier(data_type: &DataType) -> bool {
     match data_type {
         DataType::Custom(_, modifiers) => !modifiers.is_empty(),
@@ -236,8 +237,6 @@ fn states_modifier(data_type: &DataType) -> bool {
         DataType::Bit(length) | DataType::BitVarying(length) | DataType::VarBit(length) => {
             length.is_some()
         }
-        DataType::Time(precision, _) | DataType::Timestamp(precision, _) => precision.is_some(),
-        DataType::Interval { fields, precision } => fields.is_some() || precision.is_some(),
         _ => false,
     }
 }

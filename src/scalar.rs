@@ -7,10 +7,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{
-    fmt,
-    hash::{Hash, Hasher},
-};
+use core::hash::{Hash, Hasher};
 
 use sql_values::postgres::{
     CastError, CastTarget, CastValue, IntegerType, PgArray, PgNumeric, PgValue, cast_value,
@@ -190,11 +187,11 @@ impl EnumType {
 /// assert_ne!(ScalarType::of(&DataType::JSONB), uuid);
 /// assert_eq!(OtherType::new(String::from("uuid")), OtherType::catalog("uuid"));
 /// ```
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct OtherType(OtherName);
 
 /// The name of an [`OtherType`], borrowed for a catalog type.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum OtherName {
     Catalog(&'static str),
     Named(Arc<str>),
@@ -267,12 +264,6 @@ impl Eq for OtherType {}
 impl Hash for OtherType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.name().hash(state);
-    }
-}
-
-impl fmt::Debug for OtherType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("OtherType").field(&self.name()).finish()
     }
 }
 
@@ -1042,6 +1033,22 @@ mod tests {
         // Only the context resolves a type in another schema.
         assert_eq!(spelled("app.uuid"), ScalarType::Other(None));
         assert_eq!(spelled("\"app.uuid\""), ScalarType::Other(None));
+        assert_eq!(spelled("\"pg_catalog\".inet"), named("inet"));
+        assert_eq!(spelled("\"PG_CATALOG\".inet"), ScalarType::Other(None));
+        for (data_type, name) in [
+            (DataType::Regclass, "regclass"),
+            (DataType::TsVector, "tsvector"),
+            (DataType::TsQuery, "tsquery"),
+            (DataType::GeometricType(GeometricTypeKind::Point), "point"),
+            (DataType::GeometricType(GeometricTypeKind::Line), "line"),
+            (DataType::GeometricType(GeometricTypeKind::LineSegment), "lseg"),
+            (DataType::GeometricType(GeometricTypeKind::GeometricBox), "box"),
+            (DataType::GeometricType(GeometricTypeKind::GeometricPath), "path"),
+            (DataType::GeometricType(GeometricTypeKind::Polygon), "polygon"),
+            (DataType::GeometricType(GeometricTypeKind::Circle), "circle"),
+        ] {
+            assert_eq!(ScalarType::of(&data_type), named(name), "{data_type}");
+        }
     }
 
     #[test]

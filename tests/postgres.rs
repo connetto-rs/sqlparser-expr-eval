@@ -2,7 +2,7 @@
 //! backward pass places on the columns a condition names, and the relations
 //! it keeps between two compared operands.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser_expr_eval::{
@@ -788,8 +788,9 @@ fn catalog(name: &'static str) -> ScalarType {
 }
 
 /// A context with two non-null `uuid` columns, `id` and `other_id`, a
-/// non-null `jsonb` `doc`, a nullable `boolean` `flag` and a non-null
-/// `geometry` `shape`.
+/// non-null `jsonb` `doc`, a nullable `boolean` `flag`, a non-null
+/// `geometry` `shape`, and non-null `bpchar`, `bit`, `timestamptz` and
+/// `interval` columns named after their types.
 fn identified() -> Ctx {
     Ctx::with_columns(vec![
         ("id".into(), column(catalog("uuid"), false)),
@@ -797,7 +798,23 @@ fn identified() -> Ctx {
         ("doc".into(), column(catalog("jsonb"), false)),
         ("flag".into(), column(ScalarType::Boolean, true)),
         ("shape".into(), column(ScalarType::Other(Some(OtherType::new("geometry"))), false)),
+        ("pad".into(), column(catalog("bpchar"), false)),
+        ("bits".into(), column(catalog("bit"), false)),
+        ("moment".into(), column(catalog("timestamptz"), false)),
+        ("span".into(), column(catalog("interval"), false)),
     ])
+}
+
+#[test]
+fn one_unmodelled_type_hashes_alike_however_built() {
+    let types: HashSet<ScalarType> = [
+        catalog("uuid"),
+        ScalarType::Other(Some(OtherType::new(String::from("uuid")))),
+        catalog("jsonb"),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(types.len(), 2);
 }
 
 #[test]
@@ -818,11 +835,25 @@ fn an_unmodelled_type_keeps_its_identity_where_values_meet() {
 
 #[test]
 fn a_cast_of_an_unmodelled_value_to_its_own_type_never_raises() {
-    for sql in ["id::uuid", "id::pg_catalog.UUID", "CAST(shape AS geometry)"] {
+    for sql in [
+        "id::uuid",
+        "id::pg_catalog.UUID",
+        "CAST(shape AS geometry)",
+        "pad::bpchar",
+        "moment::timestamptz(3)",
+        "span::interval(0)",
+    ] {
         assert!(!read(identified(), sql).may_raise(), "{sql}");
     }
-    // Another type, or a modifier the type reads, may refuse the value.
-    for sql in ["doc::uuid", "id::jsonb", "shape::geometry(Point, 4326)"] {
+    // Another type, or a length the type may refuse, may raise.
+    for sql in [
+        "doc::uuid",
+        "id::jsonb",
+        "shape::geometry(Point, 4326)",
+        "pad::char(0)",
+        "bits::bit(0)",
+        "bits::varbit(0)",
+    ] {
         assert!(read(identified(), sql).may_raise(), "{sql}");
     }
 }
