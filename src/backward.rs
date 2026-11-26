@@ -1092,6 +1092,14 @@ fn comparison<D: EvalDialect, C: Context>(
     restrict_non_null(state, right)?;
     let left_evaluation = forward_of(state, left)?;
     let right_evaluation = forward_of(state, right)?;
+    if matches!(op, CmpOp::Eq | CmpOp::NotEq)
+        && *left_evaluation.ty() == ScalarType::Boolean
+        && *right_evaluation.ty() == ScalarType::Boolean
+        && state.budget.get() > 0
+    {
+        state.budget.set(state.budget.get() - 1);
+        return boolean_equality(state, (left, right), op, outcomes.truth);
+    }
     let left_restriction =
         restriction(family, op, outcomes.truth, &right_evaluation, &left_evaluation);
     apply(state, left, &left_evaluation, &left_restriction)?;
@@ -1114,6 +1122,32 @@ fn comparison<D: EvalDialect, C: Context>(
     }
     let types = (left_evaluation.ty(), right_evaluation.ty());
     relate(state, (left, right), types, op, outcomes.truth)
+}
+
+/// The inputs of `left = right` or `left <> right` taking `is_true`, between
+/// two non-`NULL` `boolean` operands, narrowed per pair of truth values. Each
+/// side is read under both outcomes, so the caller spends the path budget on
+/// every use.
+fn boolean_equality<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    (left, right): (&Expr, &Expr),
+    op: CmpOp,
+    is_true: bool,
+) -> Result<(), C::Error> {
+    let pairs = if (op == CmpOp::Eq) == is_true {
+        [(Outcomes::TRUE, Outcomes::TRUE), (Outcomes::FALSE, Outcomes::FALSE)]
+    } else {
+        [(Outcomes::TRUE, Outcomes::FALSE), (Outcomes::FALSE, Outcomes::TRUE)]
+    };
+    let mut branches = Vec::with_capacity(pairs.len());
+    for (left_outcome, right_outcome) in pairs {
+        branches.push(branch(state, |s| {
+            node(s, left, left_outcome)?;
+            node(s, right, right_outcome)
+        })?);
+    }
+    merge(state, branches);
+    relate(state, (left, right), (&ScalarType::Boolean, &ScalarType::Boolean), op, is_true)
 }
 
 /// Records the relation `left op right` taking `is_true` leaves between two
@@ -3516,6 +3550,94 @@ mod tests {
         assert!(!guarantees.is_impossible());
         assert!(guarantees.reference(&"x".to_string()).is_none());
         assert!(guarantees.reference(&"y".to_string()).is_none());
+    }
+
+    /// A never-null `integer` `k` holding `value` alone, beside a nullable
+    /// `integer` `a`.
+    fn kind_and_a(value: i64) -> ColumnContext {
+        let integer = ScalarType::Integer(IntegerType::Integer);
+        let k = Evaluation::new(
+            integer.clone(),
+            false,
+            false,
+            Values::Listed(BTreeSet::from([PgValue::Integer(value)])),
+        );
+        ColumnContext::new().with_column("k", k).with_column("a", unknown_column(integer))
+    }
+
+    #[test]
+    fn an_equality_of_conditions_pairs_their_truth_values() {
+        let equal = "(k = 1) = (a IS NULL)";
+        let different = "(k = 1) <> (a IS NULL)";
+        for (sql, outcomes, k, a_null) in [
+            (equal, Outcomes::TRUE, 1, true),
+            (equal, Outcomes::TRUE, 2, false),
+            (equal, Outcomes::FALSE, 1, false),
+            (equal, Outcomes::FALSE, 2, true),
+            (different, Outcomes::TRUE, 1, false),
+            (different, Outcomes::TRUE, 2, true),
+            (different, Outcomes::FALSE, 2, false),
+        ] {
+            let guarantees = implied_with(kind_and_a(k), &parse(sql), outcomes);
+            let a = column(&guarantees, "a");
+            assert_eq!(a.is_always_null(), a_null, "{sql} {outcomes:?} with k = {k}");
+            assert_eq!(a.may_be_null(), a_null, "{sql} {outcomes:?} with k = {k}");
+        }
+    }
+
+    #[test]
+    fn an_equality_of_null_tests_carries_one_side_to_the_other() {
+        for (a, b_null) in [
+            (Evaluation::null(ScalarType::Unknown), true),
+            (plain_column(ScalarType::Unknown), false),
+        ] {
+            let guarantees = implied_with(
+                ColumnContext::new()
+                    .with_column("a", a)
+                    .with_column("b", unknown_column(ScalarType::Unknown)),
+                &parse("(a IS NULL) = (b IS NULL)"),
+                Outcomes::TRUE,
+            );
+            let b = column(&guarantees, "b");
+            assert_eq!(b.is_always_null(), b_null);
+            assert_eq!(b.may_be_null(), b_null);
+        }
+    }
+
+    #[test]
+    fn an_equality_of_conditions_reads_a_listed_side_as_false() {
+        let value = |text: &str| PgValue::Text(text.to_string());
+        let kind = Evaluation::new(
+            ScalarType::Text(TextRules::DEFAULT),
+            false,
+            false,
+            Values::Listed(BTreeSet::from([value("folder"), value("project")])),
+        );
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("kind", kind).with_column(
+                "created_by_id",
+                unknown_column(ScalarType::Integer(IntegerType::Integer)),
+            ),
+            &parse("(kind = 'ownable') = (created_by_id IS NOT NULL)"),
+            Outcomes::TRUE,
+        );
+        assert!(column(&guarantees, "created_by_id").is_always_null());
+    }
+
+    #[test]
+    fn a_deep_chain_of_condition_equalities_stays_within_the_path_budget() {
+        // Each equality reads its left side under both outcomes, so the
+        // narrowing doubles per level until the budget runs out.
+        let mut sql = "x IS NULL".to_string();
+        for _ in 0..forward::DEPTH_LIMIT {
+            sql = format!("({sql}) = (x IS NULL)");
+        }
+        let guarantees = implied_with(
+            ColumnContext::new().with_column("x", unknown_column(ScalarType::Unknown)),
+            &parse(&sql),
+            Outcomes::TRUE,
+        );
+        assert!(!guarantees.is_impossible());
     }
 
     #[test]
