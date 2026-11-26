@@ -31,7 +31,7 @@ pub(super) fn cast(
     if let DataType::Array(definition) = data_type {
         // An array without a stated element type casts nothing we can fold.
         let Some(element) = scalar::array_element(definition) else {
-            return Evaluation::unknown(ScalarType::Other).with_error(source.may_raise());
+            return Evaluation::unknown(ScalarType::Other(None)).with_error(source.may_raise());
         };
         return cast_array(element, &element_type(element), source);
     }
@@ -70,7 +70,16 @@ pub(super) fn cast(
             let raise = numeric_typmod_raises(source, typmod) || evaluation.may_raise();
             evaluation = round_numeric(evaluation, typmod).with_error(raise);
         }
-        Modifier::None => {}
+        Modifier::None => {
+            // A modifier on an unmodelled type may refuse a value of the type
+            // itself, as `geometry(Point)` refuses a polygon.
+            if matches!(evaluation.ty(), ScalarType::Other(_))
+                && states_modifier(data_type)
+                && !source.is_always_null()
+            {
+                evaluation = evaluation.with_error(true);
+            }
+        }
     }
     evaluation
 }
@@ -86,7 +95,7 @@ fn cast_array(element: &DataType, ty: &ScalarType, source: &Evaluation) -> Evalu
             | ScalarType::Text(_)
             | ScalarType::UnknownLiteral
             | ScalarType::Unknown
-            | ScalarType::Other
+            | ScalarType::Other(_)
     );
     if !readable {
         return Evaluation::raising(array);
@@ -219,6 +228,20 @@ fn numeric_modifier(data_type: &DataType) -> Option<(u64, i64)> {
     }
 }
 
+/// Whether `data_type` states a modifier on a type the casts do not model.
+fn states_modifier(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Custom(_, modifiers) => !modifiers.is_empty(),
+        DataType::Character(length) | DataType::Char(length) => length.is_some(),
+        DataType::Bit(length) | DataType::BitVarying(length) | DataType::VarBit(length) => {
+            length.is_some()
+        }
+        DataType::Time(precision, _) | DataType::Timestamp(precision, _) => precision.is_some(),
+        DataType::Interval { fields, precision } => fields.is_some() || precision.is_some(),
+        _ => false,
+    }
+}
+
 /// The value cast to `numeric` under `typmod`, `None` when the cast raises.
 fn apply_typmod(value: &PgNumeric, typmod: NumericTypmod) -> Option<PgNumeric> {
     match cast_value(CastValue::Numeric(value.clone()), CastTarget::Numeric(Some(typmod))) {
@@ -289,9 +312,10 @@ fn cast_raises(source: &Evaluation, to: &ScalarType) -> bool {
         }
         // An integer always fits a `float`, a `numeric` or `float` may not.
         ScalarType::Float => !matches!(from, ScalarType::Integer(_)),
-        // A label reads only as its own enum, and text may hold no label.
-        ScalarType::Enum(_) => from != to,
-        ScalarType::Other | ScalarType::Array(_) => true,
+        // A label reads only as its own enum, and text may hold no label,
+        // while a value of an unmodelled type reads as its own type unchanged.
+        ScalarType::Enum(_) | ScalarType::Other(Some(_)) => from != to,
+        ScalarType::Other(None) | ScalarType::Array(_) => true,
     }
 }
 
@@ -457,7 +481,7 @@ mod tests {
     fn a_cast_to_an_untyped_array_is_unknown() {
         let source = text("1");
         let data_type = DataType::Array(ArrayElemTypeDef::None);
-        let evaluation = cast(&source, &data_type, ScalarType::Other);
+        let evaluation = cast(&source, &data_type, ScalarType::Other(None));
         assert!(evaluation.may_be_null());
         assert!(matches!(evaluation.values(), Values::Unlisted(_)));
     }
@@ -485,7 +509,12 @@ mod tests {
     fn a_jsonb_null_casts_to_null() {
         let jsonb = |texts: &[&str]| {
             let listed = texts.iter().map(|text| PgValue::Jsonb(PgJsonb::parse(text).unwrap()));
-            Evaluation::new(ScalarType::Other, false, false, Values::Listed(listed.collect()))
+            Evaluation::new(
+                ScalarType::catalog("jsonb"),
+                false,
+                false,
+                Values::Listed(listed.collect()),
+            )
         };
         let int4 = ScalarType::Integer(IntegerType::Integer);
         let evaluation = cast(&jsonb(&["null"]), &DataType::Integer(None), int4.clone());
@@ -514,7 +543,7 @@ mod tests {
         assert!(cast(&text("abc"), &varchar(0), text_type.clone()).always_raises());
         assert!(cast(&column(text_type.clone()), &varchar(0), text_type).always_raises());
         let array = DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(varchar(0)), None));
-        assert!(cast(&text("ab"), &array, ScalarType::Other).always_raises());
+        assert!(cast(&text("ab"), &array, ScalarType::Other(None)).always_raises());
     }
 
     /// A `varchar` bound does not shrink a listed non-text value.

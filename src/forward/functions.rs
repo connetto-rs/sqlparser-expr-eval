@@ -339,7 +339,7 @@ pub(super) fn joined_type(ty: &ScalarType, branch: &ScalarType) -> (ScalarType, 
     } else if number(ty) && number(branch) {
         (super::fold::arithmetic_type(ty, branch), false)
     } else {
-        (ScalarType::Other, true)
+        (ScalarType::Other(None), true)
     }
 }
 
@@ -352,7 +352,7 @@ pub(super) fn coerce_to(evaluation: Evaluation, ty: &ScalarType) -> Evaluation {
     match (from, ty) {
         (ScalarType::UnknownLiteral, _) => super::fold::reinterpret_unknown(evaluation, ty),
         // A `numeric` may overflow a `float`, and unmodelled values stay open.
-        (_, ScalarType::Float | ScalarType::Other) => {
+        (_, ScalarType::Float | ScalarType::Other(_)) => {
             Evaluation::new(
                 ty.clone(),
                 evaluation.may_be_null(),
@@ -801,7 +801,7 @@ fn array_operand<D: EvalDialect, C: Context>(
     let mut error = value.may_raise() || operand.may_raise();
     let ScalarType::Array(element) = operand.ty() else {
         // An unmodelled type may be an array, and no other type is.
-        let array = matches!(operand.ty(), ScalarType::Other | ScalarType::Unknown);
+        let array = matches!(operand.ty(), ScalarType::Other(_) | ScalarType::Unknown);
         return unknown_outcome(error || !array);
     };
     if operand.is_impossible() {

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser_expr_eval::{
     Builtin, Callee, CalleeKind, Collation, EnumType, Evaluation, Guarantees, Interval, NullInput,
-    NullResult, Order, Outcomes, PostgreSqlOptions, QueryEvaluation, Relation, Rows, ScalarType,
-    Subject, TextRules, Values, Volatility, evaluate, implied,
+    NullResult, Order, OtherType, Outcomes, PostgreSqlOptions, QueryEvaluation, Relation, Rows,
+    ScalarType, Subject, TextRules, Values, Volatility, evaluate, implied,
     sql_values::postgres::{IntegerType, PgNumeric, PgValue},
 };
 
@@ -311,7 +311,7 @@ fn now_callee() -> Callee {
         NullResult::OnlyOnNullInput,
         Volatility::Stable,
         CalleeKind::Normal,
-        ScalarType::Other,
+        catalog("timestamptz"),
         false,
         0,
     )
@@ -578,12 +578,12 @@ fn sql_value_functions_take_their_type_and_never_raise() {
         ("current_schema", name(), true),
         ("system_user", ScalarType::Text(TextRules::DEFAULT), true),
         ("current_date", ScalarType::Date, false),
-        ("current_time", ScalarType::Other, false),
-        ("current_time(3)", ScalarType::Other, false),
-        ("current_timestamp", ScalarType::Other, false),
-        ("current_timestamp(3)", ScalarType::Other, false),
-        ("localtime", ScalarType::Other, false),
-        ("localtime(3)", ScalarType::Other, false),
+        ("current_time", catalog("timetz"), false),
+        ("current_time(3)", catalog("timetz"), false),
+        ("current_timestamp", catalog("timestamptz"), false),
+        ("current_timestamp(3)", catalog("timestamptz"), false),
+        ("localtime", catalog("time"), false),
+        ("localtime(3)", catalog("time"), false),
         ("localtimestamp", ScalarType::Timestamp, false),
         ("localtimestamp(3)", ScalarType::Timestamp, false),
     ] {
@@ -780,6 +780,51 @@ fn an_enum_too_large_to_list_stays_undecided() {
     let equality = read(wide_context(), "kind = 'label_0'");
     assert_eq!(equality.outcomes(), Outcomes { null: false, ..Outcomes::ANY });
     assert!(!read(wide_context(), "kind::wide_kind").may_raise());
+}
+
+/// The unmodelled built-in type `name`.
+fn catalog(name: &'static str) -> ScalarType {
+    ScalarType::Other(Some(OtherType::catalog(name)))
+}
+
+/// A context with two non-null `uuid` columns, `id` and `other_id`, a
+/// non-null `jsonb` `doc`, a nullable `boolean` `flag` and a non-null
+/// `geometry` `shape`.
+fn identified() -> Ctx {
+    Ctx::with_columns(vec![
+        ("id".into(), column(catalog("uuid"), false)),
+        ("other_id".into(), column(catalog("uuid"), false)),
+        ("doc".into(), column(catalog("jsonb"), false)),
+        ("flag".into(), column(ScalarType::Boolean, true)),
+        ("shape".into(), column(ScalarType::Other(Some(OtherType::new("geometry"))), false)),
+    ])
+}
+
+#[test]
+fn an_unmodelled_type_keeps_its_identity_where_values_meet() {
+    for sql in ["COALESCE(id, other_id)", "CASE WHEN flag THEN id ELSE other_id END"] {
+        let met = read(identified(), sql);
+        assert_eq!(*met.ty(), catalog("uuid"), "{sql}");
+        assert!(!met.may_raise(), "{sql}");
+    }
+    // PostgreSQL matches no `uuid` with a `jsonb`.
+    for sql in ["COALESCE(id, doc)", "CASE WHEN flag THEN id ELSE doc END"] {
+        let met = read(identified(), sql);
+        assert_eq!(*met.ty(), ScalarType::Other(None), "{sql}");
+        assert!(met.may_raise(), "{sql}");
+    }
+    assert_eq!(*read(identified(), "'10.0.0.1'::INET").ty(), catalog("inet"));
+}
+
+#[test]
+fn a_cast_of_an_unmodelled_value_to_its_own_type_never_raises() {
+    for sql in ["id::uuid", "id::pg_catalog.UUID", "CAST(shape AS geometry)"] {
+        assert!(!read(identified(), sql).may_raise(), "{sql}");
+    }
+    // Another type, or a modifier the type reads, may refuse the value.
+    for sql in ["doc::uuid", "id::jsonb", "shape::geometry(Point, 4326)"] {
+        assert!(read(identified(), sql).may_raise(), "{sql}");
+    }
 }
 
 #[test]

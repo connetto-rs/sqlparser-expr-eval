@@ -7,12 +7,18 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use core::{
+    fmt,
+    hash::{Hash, Hasher},
+};
 
 use sql_values::postgres::{
     CastError, CastTarget, CastValue, IntegerType, PgArray, PgNumeric, PgValue, cast_value,
     number_constant,
 };
-use sqlparser::ast::{ArrayElemTypeDef, DataType, TimezoneInfo};
+use sqlparser::ast::{
+    ArrayElemTypeDef, DataType, GeometricTypeKind, ObjectName, ObjectNamePart, TimezoneInfo,
+};
 
 /// What a text collation lets the evaluator decide about text values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -168,6 +174,108 @@ impl EnumType {
     }
 }
 
+/// A type the evaluator does not model, by the name that identifies it.
+///
+/// Two values of one such type share it, so assigning one to the other
+/// converts nothing, while a `uuid` and a `jsonb` stay distinct. A
+/// built-in type goes by its name in PostgreSQL's catalog, as `uuid` or
+/// `timestamptz`, and any other by the name the context identifies it by.
+///
+/// ```
+/// use sqlparser::ast::DataType;
+/// use sqlparser_expr_eval::{OtherType, ScalarType};
+///
+/// let uuid = ScalarType::Other(Some(OtherType::catalog("uuid")));
+/// assert_eq!(ScalarType::of(&DataType::Uuid), uuid);
+/// assert_ne!(ScalarType::of(&DataType::JSONB), uuid);
+/// assert_eq!(OtherType::new(String::from("uuid")), OtherType::catalog("uuid"));
+/// ```
+#[derive(Clone)]
+pub struct OtherType(OtherName);
+
+/// The name of an [`OtherType`], borrowed for a catalog type.
+#[derive(Clone)]
+enum OtherName {
+    Catalog(&'static str),
+    Named(Arc<str>),
+}
+
+impl OtherType {
+    /// The built-in type `name` names in PostgreSQL's catalog.
+    #[must_use]
+    pub const fn catalog(name: &'static str) -> Self {
+        Self(OtherName::Catalog(name))
+    }
+
+    /// The type the context identifies by `name`.
+    #[must_use]
+    pub fn new(name: impl Into<Arc<str>>) -> Self {
+        Self(OtherName::Named(name.into()))
+    }
+
+    /// The name that identifies the type.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match &self.0 {
+            OtherName::Catalog(name) => name,
+            OtherName::Named(name) => name,
+        }
+    }
+
+    /// The type a custom type name spells bare or in `pg_catalog`, folding
+    /// an unquoted name to lower case as PostgreSQL does. A name in another
+    /// schema, or holding a dot that would read as one, is `None`, since
+    /// only the context resolves it.
+    fn spelled(name: &ObjectName) -> Option<Self> {
+        let names = |ident: &sqlparser::ast::Ident, name: &str| {
+            if ident.quote_style.is_some() {
+                ident.value == name
+            } else {
+                ident.value.eq_ignore_ascii_case(name)
+            }
+        };
+        let ident = match name.0.as_slice() {
+            [ObjectNamePart::Identifier(ident)] => ident,
+            [ObjectNamePart::Identifier(schema), ObjectNamePart::Identifier(ident)]
+                if names(schema, "pg_catalog") =>
+            {
+                ident
+            }
+            _ => return None,
+        };
+        if ident.value.contains('.') {
+            return None;
+        }
+        Some(
+            if ident.quote_style.is_none() && ident.value.bytes().any(|b| b.is_ascii_uppercase()) {
+                Self::new(ident.value.to_ascii_lowercase())
+            } else {
+                Self::new(ident.value.as_str())
+            },
+        )
+    }
+}
+
+impl PartialEq for OtherType {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
+impl Eq for OtherType {}
+
+impl Hash for OtherType {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl fmt::Debug for OtherType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("OtherType").field(&self.name()).finish()
+    }
+}
+
 /// The scalar type a value or an expression's result carries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScalarType {
@@ -193,8 +301,10 @@ pub enum ScalarType {
     /// A PostgreSQL enum type, whose values are its labels held as
     /// [`PgValue::Text`] and ordered by declaration.
     Enum(Arc<EnumType>),
-    /// Any other known type whose values are not modelled.
-    Other,
+    /// Any other known type whose values are not modelled, with the type it
+    /// stands for, `None` when the reading cannot name one type, as for a
+    /// join of two unrelated types.
+    Other(Option<OtherType>),
     /// An array of the element type, of any number of dimensions.
     Array(ArrayElement),
 }
@@ -226,7 +336,8 @@ pub enum ArrayElement {
 impl ArrayElement {
     /// The element type of an array of `ty`, the element of an array being
     /// its own element, an untyped literal being `text`, and an enum, whose
-    /// arrays the evaluator does not model, being `Other`.
+    /// arrays the evaluator does not model, being `Other`. An array of an
+    /// unmodelled type keeps no identity for its element.
     #[must_use]
     pub fn of(ty: &ScalarType) -> Self {
         match ty {
@@ -239,7 +350,7 @@ impl ArrayElement {
             ScalarType::Text(rules) => ArrayElement::Text(*rules),
             ScalarType::Date => ArrayElement::Date,
             ScalarType::Timestamp => ArrayElement::Timestamp,
-            ScalarType::Enum(_) | ScalarType::Other => ArrayElement::Other,
+            ScalarType::Enum(_) | ScalarType::Other(_) => ArrayElement::Other,
             ScalarType::Array(element) => *element,
         }
     }
@@ -256,7 +367,7 @@ impl ArrayElement {
             ArrayElement::Text(rules) => ScalarType::Text(rules),
             ArrayElement::Date => ScalarType::Date,
             ArrayElement::Timestamp => ScalarType::Timestamp,
-            ArrayElement::Other => ScalarType::Other,
+            ArrayElement::Other => ScalarType::Other(None),
         }
     }
 
@@ -298,11 +409,17 @@ impl ScalarType {
             DataType::Array(definition) => {
                 match array_element(definition) {
                     Some(element) => ScalarType::Array(ArrayElement::of(&ScalarType::of(element))),
-                    None => ScalarType::Other,
+                    None => ScalarType::Other(None),
                 }
             }
-            _ => ScalarType::Other,
+            DataType::Custom(name, _) => ScalarType::Other(OtherType::spelled(name)),
+            _ => ScalarType::Other(catalog_name(data_type).map(OtherType::catalog)),
         }
+    }
+
+    /// The unmodelled built-in type PostgreSQL's catalog names `name`.
+    pub(crate) const fn catalog(name: &'static str) -> Self {
+        ScalarType::Other(Some(OtherType::catalog(name)))
     }
 
     /// The element type of an array type.
@@ -331,7 +448,7 @@ impl ScalarType {
     /// a known type the evaluator does not model.
     #[must_use]
     pub fn is_unmodelled(&self) -> bool {
-        matches!(self, ScalarType::Unknown | ScalarType::Other)
+        matches!(self, ScalarType::Unknown | ScalarType::Other(_))
     }
 
     /// Whether the type is a number, an integer or `numeric`.
@@ -361,6 +478,41 @@ impl ScalarType {
             _ => None,
         }
     }
+}
+
+/// The name in PostgreSQL's catalog of a type sqlparser spells by a variant
+/// of its own and the evaluator does not model, `None` for a type
+/// PostgreSQL does not have. The name carries no modifier, so `char(3)` and
+/// `char` both name `bpchar`.
+fn catalog_name(data_type: &DataType) -> Option<&'static str> {
+    Some(match data_type {
+        DataType::Uuid => "uuid",
+        DataType::JSON => "json",
+        DataType::JSONB => "jsonb",
+        DataType::Bytea => "bytea",
+        DataType::Regclass => "regclass",
+        DataType::TsVector => "tsvector",
+        DataType::TsQuery => "tsquery",
+        DataType::Interval { .. } => "interval",
+        DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => "timetz",
+        DataType::Time(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => "time",
+        DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => "timestamptz",
+        DataType::Character(_) | DataType::Char(_) => "bpchar",
+        DataType::Bit(_) => "bit",
+        DataType::BitVarying(_) | DataType::VarBit(_) => "varbit",
+        DataType::GeometricType(kind) => {
+            match kind {
+                GeometricTypeKind::Point => "point",
+                GeometricTypeKind::Line => "line",
+                GeometricTypeKind::LineSegment => "lseg",
+                GeometricTypeKind::GeometricBox => "box",
+                GeometricTypeKind::GeometricPath => "path",
+                GeometricTypeKind::Polygon => "polygon",
+                GeometricTypeKind::Circle => "circle",
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// The element type an array type spells, `None` for an array that names
@@ -463,7 +615,7 @@ pub(crate) fn cast(datum: &PgValue, from: &ScalarType, to: &ScalarType) -> Cast 
         // date or a timestamp through `DateStyle`, and to no other type.
         return match (to, datum.output()) {
             (ScalarType::Text(_), Some(output)) => Cast::Folded(PgValue::Text(output.to_string())),
-            (ScalarType::Text(_) | ScalarType::Unknown | ScalarType::Other, _) => Cast::Unknown,
+            (ScalarType::Text(_) | ScalarType::Unknown | ScalarType::Other(_), _) => Cast::Unknown,
             _ => Cast::Raises,
         };
     }
@@ -507,10 +659,10 @@ fn enum_cast(datum: &PgValue, from: &ScalarType, to: &ScalarType) -> Option<Cast
             }
         }
         (ScalarType::Enum(_), ScalarType::Text(_)) => Cast::Folded(datum.clone()),
-        (ScalarType::Other, ScalarType::Enum(_))
+        (ScalarType::Other(_), ScalarType::Enum(_))
         | (
             ScalarType::Enum(_),
-            ScalarType::Unknown | ScalarType::UnknownLiteral | ScalarType::Other,
+            ScalarType::Unknown | ScalarType::UnknownLiteral | ScalarType::Other(_),
         ) => Cast::Unknown,
         (_, ScalarType::Enum(_)) | (ScalarType::Enum(_), _) => Cast::Raises,
         _ => return None,
@@ -533,7 +685,7 @@ pub(crate) fn cast_target(ty: &ScalarType) -> Option<CastTarget> {
         | ScalarType::UnknownLiteral
         | ScalarType::Float
         | ScalarType::Enum(_)
-        | ScalarType::Other
+        | ScalarType::Other(_)
         | ScalarType::Array(_) => return None,
     })
 }
@@ -768,18 +920,13 @@ mod tests {
     fn jsonb_casts_fold_null_to_null() {
         let jsonb = |text: &str| PgValue::Jsonb(PgJsonb::parse(text).unwrap());
         let int4 = ScalarType::Integer(IntegerType::Integer);
-        assert_eq!(cast(&jsonb("null"), &ScalarType::Other, &int4), Cast::Null);
-        assert_eq!(cast(&jsonb("null"), &ScalarType::Other, &ScalarType::Boolean), Cast::Null);
-        assert_eq!(
-            cast(&jsonb("42"), &ScalarType::Other, &int4),
-            Cast::Folded(PgValue::Integer(42))
-        );
-        assert_eq!(cast(&jsonb("true"), &ScalarType::Other, &int4), Cast::Raises);
+        let from = ScalarType::catalog("jsonb");
+        assert_eq!(cast(&jsonb("null"), &from, &int4), Cast::Null);
+        assert_eq!(cast(&jsonb("null"), &from, &ScalarType::Boolean), Cast::Null);
+        assert_eq!(cast(&jsonb("42"), &from, &int4), Cast::Folded(PgValue::Integer(42)));
+        assert_eq!(cast(&jsonb("true"), &from, &int4), Cast::Raises);
         let text_type = ScalarType::Text(TextRules::DEFAULT);
-        assert_eq!(
-            cast(&jsonb("null"), &ScalarType::Other, &text_type),
-            Cast::Folded(text("null"))
-        );
+        assert_eq!(cast(&jsonb("null"), &from, &text_type), Cast::Folded(text("null")));
     }
 
     #[test]
@@ -844,10 +991,57 @@ mod tests {
             ScalarType::of(&DataType::Timestamp(None, TimezoneInfo::WithoutTimeZone)),
             ScalarType::Timestamp
         );
-        // A type the evaluator does not model stays `Other`
-        assert_eq!(ScalarType::of(&DataType::Time(None, TimezoneInfo::None)), ScalarType::Other);
+        // A type the evaluator does not model stays `Other`, under its name
+        assert_eq!(
+            ScalarType::of(&DataType::Time(None, TimezoneInfo::None)),
+            ScalarType::Other(Some(OtherType::catalog("time")))
+        );
         // PostgreSQL has no `string` type
-        assert_eq!(ScalarType::of(&DataType::String(Some(3))), ScalarType::Other);
+        assert_eq!(ScalarType::of(&DataType::String(Some(3))), ScalarType::Other(None));
+    }
+
+    /// The type a PostgreSQL spelling names.
+    fn spelled(spelling: &str) -> ScalarType {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let data_type = sqlparser::parser::Parser::new(&dialect)
+            .try_with_sql(spelling)
+            .and_then(|mut parser| parser.parse_data_type())
+            .unwrap();
+        ScalarType::of(&data_type)
+    }
+
+    #[test]
+    fn every_spelling_of_an_unmodelled_type_names_one_identity() {
+        let named = |name| ScalarType::Other(Some(OtherType::catalog(name)));
+        for (spellings, name) in [
+            (&["uuid", "UUID", "pg_catalog.uuid", "\"uuid\""][..], "uuid"),
+            (&["inet", "INET", "PG_CATALOG.Inet", "pg_catalog.\"inet\""], "inet"),
+            (&["jsonb", "JSONB"], "jsonb"),
+            (&["json"], "json"),
+            (&["bytea"], "bytea"),
+            (
+                &["timestamptz", "timestamp with time zone", "TIMESTAMP(3) WITH TIME ZONE"],
+                "timestamptz",
+            ),
+            (&["time", "time without time zone", "time(0)"], "time"),
+            (&["timetz", "time with time zone"], "timetz"),
+            (&["interval", "interval(0)", "interval year to month"], "interval"),
+            (&["char", "character(3)", "bpchar"], "bpchar"),
+            (&["bit", "bit(3)"], "bit"),
+            (&["bit varying(3)", "varbit"], "varbit"),
+            (&["point"], "point"),
+            // The quoted `"char"` is PostgreSQL's one-byte type, not `bpchar`.
+            (&["\"char\""], "char"),
+        ] {
+            for spelling in spellings {
+                assert_eq!(spelled(spelling), named(name), "{spelling}");
+            }
+        }
+        // A quoted name keeps its case, naming no catalog type.
+        assert_eq!(spelled("\"UUID\""), ScalarType::Other(Some(OtherType::new("UUID"))));
+        // Only the context resolves a type in another schema.
+        assert_eq!(spelled("app.uuid"), ScalarType::Other(None));
+        assert_eq!(spelled("\"app.uuid\""), ScalarType::Other(None));
     }
 
     #[test]
@@ -937,7 +1131,7 @@ mod tests {
             ScalarType::Text(TextRules::C),
             ScalarType::Date,
             ScalarType::Timestamp,
-            ScalarType::Other,
+            ScalarType::Other(None),
         ] {
             let array = ScalarType::Array(ArrayElement::of(&ty));
             assert_eq!(ArrayElement::of(&array), ArrayElement::of(&ty));
@@ -954,7 +1148,10 @@ mod tests {
             ScalarType::of(&int_array).element(),
             Some(ScalarType::Integer(IntegerType::Integer))
         );
-        assert_eq!(ScalarType::of(&DataType::Array(ArrayElemTypeDef::None)), ScalarType::Other);
+        assert_eq!(
+            ScalarType::of(&DataType::Array(ArrayElemTypeDef::None)),
+            ScalarType::Other(None)
+        );
     }
 
     /// Only text and arrays cast to an array.

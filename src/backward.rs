@@ -841,7 +841,7 @@ fn typed_members(values: Values, null: bool) -> Evaluation {
             PgValue::Boolean(_) => ScalarType::Boolean,
             PgValue::Date(_) => ScalarType::Date,
             PgValue::Timestamp(_) => ScalarType::Timestamp,
-            PgValue::Jsonb(_) => ScalarType::Other,
+            PgValue::Jsonb(_) => ScalarType::catalog("jsonb"),
             PgValue::Text(_) | PgValue::Array(_) => ScalarType::Unknown,
         }
     };
@@ -1718,7 +1718,7 @@ fn apply_length<D: EvalDialect, C: Context>(
     range: &Interval<PgNumeric>,
 ) -> Result<(), C::Error> {
     let evaluation = forward_of(state, arg)?;
-    if matches!(evaluation.ty(), ScalarType::Unknown | ScalarType::Other) {
+    if matches!(evaluation.ty(), ScalarType::Unknown | ScalarType::Other(_)) {
         // A type the evaluator does not model, such as `char(n)`, may hold
         // text of any length.
         return Ok(());
@@ -1969,8 +1969,8 @@ mod tests {
         let jsonb =
             |text: &str| PgValue::Jsonb(sql_values::postgres::PgJsonb::parse(text).unwrap());
         let context = ColumnContext::new()
-            .with_column("j", plain_column(ScalarType::Other))
-            .with_column("k", Evaluation::known(jsonb("[1, 2]"), ScalarType::Other));
+            .with_column("j", plain_column(ScalarType::catalog("jsonb")))
+            .with_column("k", Evaluation::known(jsonb("[1, 2]"), ScalarType::catalog("jsonb")));
         let guarantees = implied_with(context, &parse("j IN (k)"), Outcomes::TRUE);
         let j = column(&guarantees, "j");
         assert!(j.may_be(&jsonb("[1, 2]")));
@@ -5351,7 +5351,7 @@ mod tests {
     fn a_length_over_an_unmodelled_value_bounds_nothing() {
         for (ty, sql) in [
             (ScalarType::Date, "char_length(x::char(2)) < 5"),
-            (ScalarType::Other, "char_length(x) < 5"),
+            (ScalarType::catalog("bpchar"), "char_length(x) < 5"),
             (ScalarType::Unknown, "char_length(x) < 5"),
         ] {
             let guarantees = implied_with(
