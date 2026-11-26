@@ -115,6 +115,10 @@ pub struct Callee {
     /// tightens it with what it reads of a builtin and of a body
     /// [`Context::evaluate_body`] answers.
     pub error: bool,
+    /// Whether the planner may inline the function's body into the call and
+    /// fold the constants of the inlined body before the call runs, which
+    /// PostgreSQL does for a `LANGUAGE sql` function.
+    pub inlinable: bool,
     /// A token the context reads back in [`Context::evaluate_body`].
     pub token: usize,
 }
@@ -135,6 +139,7 @@ impl Callee {
         returns: ScalarType,
         returns_set: bool,
         error: bool,
+        inlinable: bool,
         token: usize,
     ) -> Self {
         Self {
@@ -146,6 +151,7 @@ impl Callee {
             returns,
             returns_set,
             error,
+            inlinable,
             token,
         }
     }
@@ -381,6 +387,7 @@ mod tests {
                 returns: ScalarType::Integer(IntegerType::Integer),
                 returns_set: false,
                 error: false,
+                inlinable: false,
                 token: 0,
             }]))
         }

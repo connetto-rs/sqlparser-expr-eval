@@ -1178,6 +1178,7 @@ mod tests {
             returns,
             returns_set: false,
             error: true,
+            inlinable: false,
             token: 0,
         }
     }

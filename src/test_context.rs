@@ -188,6 +188,7 @@ pub fn strict_callee(returns: ScalarType) -> Callee {
         returns,
         returns_set: false,
         error: true,
+        inlinable: false,
         token: 0,
     }
 }
@@ -204,6 +205,7 @@ pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
         returns,
         returns_set: false,
         error: true,
+        inlinable: false,
         token: 0,
     }
 }

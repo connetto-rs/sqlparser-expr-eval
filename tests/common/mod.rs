@@ -145,6 +145,7 @@ pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
         returns,
         false,
         true,
+        false,
         0,
     )
 }
