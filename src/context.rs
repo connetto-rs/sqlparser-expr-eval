@@ -326,7 +326,8 @@ pub trait Context {
     /// [`cast_checks`](Self::cast_checks) answers `true`. A PostgreSQL
     /// context reads a domain's constraints over `converted`, `NULL`
     /// included, and answers a raise wherever one may refuse it. The
-    /// evaluator keeps what the conversion raises.
+    /// default may refuse any value. The evaluator keeps what the
+    /// conversion raises.
     ///
     /// # Errors
     ///
@@ -337,7 +338,7 @@ pub trait Context {
         converted: Evaluation,
     ) -> Result<Evaluation, Self::Error> {
         let _ = data_type;
-        Ok(converted)
+        Ok(converted.with_error(true))
     }
 
     /// The rules of the collation `name` names, under the identity a column
@@ -508,6 +509,47 @@ mod tests {
                 .unwrap();
         assert!(evaluation.is_always_null());
         assert!(!evaluation.may_raise());
+    }
+
+    /// A context whose every type checks its values, reading none of the
+    /// checks.
+    struct Checking;
+
+    impl Context for Checking {
+        type Reference = &'static str;
+        type Error = Infallible;
+
+        fn reference(
+            &mut self,
+            _expression: &Expr,
+        ) -> Result<Option<Resolved<&'static str>>, Infallible> {
+            Ok(None)
+        }
+
+        fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+            Ok(Vec::new())
+        }
+
+        fn cast_checks(&mut self, _data_type: &DataType) -> Result<bool, Infallible> {
+            Ok(true)
+        }
+    }
+
+    /// A type whose checks the context does not read may refuse any value,
+    /// `NULL` included.
+    #[test]
+    fn an_unread_check_may_refuse_any_value() {
+        for sql in ["5::int", "NULL::int", "x::int", "f(1)::int"] {
+            let evaluation = evaluate(
+                &parse(sql),
+                &PostgreSqlDialect {},
+                &PostgreSqlOptions::default(),
+                &mut Checking,
+                &Guarantees::new(),
+            )
+            .unwrap();
+            assert!(evaluation.may_raise() && !evaluation.always_raises(), "{sql}");
+        }
     }
 
     #[test]

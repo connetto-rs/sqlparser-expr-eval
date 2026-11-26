@@ -1005,6 +1005,8 @@ fn the_planner_leaves_a_checked_cast_for_run_time() {
         "x / 0 > 0 OR vacuous '5' > 0",
         "x / 0 > 0 OR ARRAY[5]::vacuous[] IS NOT NULL",
         "'x'::vacuous > 0 OR true",
+        "vacuous 'x' > 0 OR true",
+        "(1 / 0)::vacuous > 0 OR true",
     ] {
         assert!(read(domains(), sql).may_raise(), "{sql}");
     }
@@ -1012,6 +1014,9 @@ fn the_planner_leaves_a_checked_cast_for_run_time() {
         "x / 0 > 0 OR 5::loose > 0",
         "x / 0 > 0 OR '{5}'::vacuous[] IS NOT NULL",
         "NULL::present IS NULL OR true",
+        "x::vacuous > 0 OR true",
+        "(x / 0)::vacuous > 0 OR true",
+        "vacuous '5' > 0 OR true",
     ] {
         assert!(!read(domains(), sql).may_raise(), "{sql}");
     }

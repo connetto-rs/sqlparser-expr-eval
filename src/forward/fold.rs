@@ -1047,26 +1047,29 @@ fn folding_may_raise<D: EvalDialect, C: Context>(
         if support::is_reference(node) {
             continue;
         }
-        if super::literals::checks_at_run_time(state.context, node)? {
-            match node {
-                Expr::Cast { kind, expr, data_type, .. } => {
-                    if planner_constant(state.context, expr)? {
-                        let source = forward(state, expr)?;
-                        if super::literals::conversion(state, kind, source, data_type).may_raise() {
-                            return Ok(true);
-                        }
-                    } else {
-                        stack.push(expr);
-                    }
+        match node {
+            Expr::Cast { kind, expr, data_type, .. }
+                if super::literals::checks_at_run_time(state.context, node)? =>
+            {
+                if !planner_constant(state.context, expr)? {
+                    stack.push(expr);
+                    continue;
                 }
-                Expr::TypedString(typed) => {
-                    if super::literals::typed_string(state.context, typed).may_raise() {
-                        return Ok(true);
-                    }
+                let source = forward(state, expr)?;
+                if super::literals::conversion(state, kind, source, data_type).may_raise() {
+                    return Ok(true);
                 }
-                _ => {}
+                continue;
             }
-            continue;
+            Expr::TypedString(typed)
+                if super::literals::checks_at_run_time(state.context, node)? =>
+            {
+                if super::literals::typed_string(state.context, typed).may_raise() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            _ => {}
         }
         let walked = !planner_constant(state.context, node)?
             && match node {
