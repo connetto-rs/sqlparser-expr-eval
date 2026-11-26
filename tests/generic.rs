@@ -58,6 +58,7 @@ fn strict_callee(returns: ScalarType, null_result: NullResult) -> Callee {
         returns,
         false,
         true,
+        false,
         0,
     )
 }

@@ -314,6 +314,7 @@ fn now_callee() -> Callee {
         catalog("timestamptz"),
         false,
         false,
+        false,
         0,
     )
 }
@@ -671,6 +672,45 @@ fn a_deciding_constant_folds_the_chain_before_it_runs() {
     assert!(!read(context(), "true OR 1 / 0 = 1").may_raise());
     // A term that reads a column is not folded, whatever it evaluates to.
     assert!(read(conflicting_texts(), "icu < bytes OR plain = plain").may_raise());
+}
+
+/// A catalog function the context declares to raise wherever it runs, such
+/// as `current_setting(text, boolean)`, which the planner may inline when
+/// `inlinable`.
+fn setting_callee(inlinable: bool) -> Callee {
+    Callee::new(
+        None,
+        NullInput::Strict,
+        NullResult::AnyInput,
+        Volatility::Stable,
+        CalleeKind::Normal,
+        ScalarType::Text(TextRules::DEFAULT),
+        false,
+        true,
+        inlinable,
+        0,
+    )
+}
+
+#[test]
+fn the_planner_folds_the_arguments_of_a_call_it_does_not_evaluate() {
+    // PostgreSQL leaves a stable call for run time, so a deciding constant
+    // drops it unrun, but it folds the call's arguments first.
+    let settings = || context().with_callee("current_setting", setting_callee(false));
+    for (sql, decided) in [
+        ("x = current_setting('app.user_id', true) OR true", Outcomes::TRUE),
+        ("x = current_setting('app.user_id', true) AND false", Outcomes::FALSE),
+        ("current_setting(x) = 'a' OR true", Outcomes::TRUE),
+    ] {
+        let evaluation = read(settings(), sql);
+        assert_eq!((evaluation.outcomes(), evaluation.may_raise()), (decided, false), "{sql}");
+    }
+    assert!(read(settings(), "x = current_setting((1 / 0)::text) OR true").may_raise());
+    // The planner folds the body of a `LANGUAGE sql` function it inlines,
+    // and a callee the context does not know may be one.
+    let inlined = context().with_callee("current_setting", setting_callee(true));
+    assert!(read(inlined, "x = current_setting('app.user_id', true) OR true").may_raise());
+    assert!(read(context(), "x = current_setting('app.user_id', true) OR true").may_raise());
 }
 
 /// An enum type `name` declaring `project`, `note` and `folder` in that

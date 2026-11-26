@@ -10,7 +10,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    context::{CalleeKind, Context, Resolved, Volatility},
+    context::{Callee, CalleeKind, Context, Resolved, Volatility},
     domain::{Evaluation, Interval, Outcomes, Values},
     guarantees::Subject,
     scalar::ScalarType,
@@ -71,7 +71,11 @@ pub(crate) fn fixed<C: Context>(
     let mut stack = vec![expression];
     while let Some(node) = stack.pop() {
         let fixed = match node {
-            Expr::Function(call) => push_fixed_call(context, &mut stack, call, most_volatile)?,
+            Expr::Function(call) => {
+                push_call_arguments(context, &mut stack, call, |callee| {
+                    callee.volatility <= most_volatile
+                })?
+            }
             _ => push_operands(&mut stack, node),
         };
         if !fixed {
@@ -122,12 +126,25 @@ pub(crate) fn push_operands<'a>(stack: &mut Vec<&'a Expr>, node: &'a Expr) -> bo
 }
 
 /// Pushes the arguments of `call` when it is a plain call whose every callee
-/// is an ordinary function no more volatile than `most_volatile`.
-fn push_fixed_call<'a, C: Context>(
+/// is an ordinary function the planner neither evaluates nor inlines, so that
+/// folding the call folds its arguments alone. The planner evaluates such a
+/// call only when the whole call is [`fixed`] over immutable callees.
+pub(crate) fn push_unfolded_call<'a, C: Context>(
     context: &mut C,
     stack: &mut Vec<&'a Expr>,
     call: &'a Function,
-    most_volatile: Volatility,
+) -> Result<bool, C::Error> {
+    push_call_arguments(context, stack, call, |callee| !callee.inlinable)
+}
+
+/// Pushes the arguments of `call` when it is a plain call whose every callee
+/// is an ordinary function `admits`, answering `false` with `stack` left as
+/// it was otherwise.
+fn push_call_arguments<'a, C: Context>(
+    context: &mut C,
+    stack: &mut Vec<&'a Expr>,
+    call: &'a Function,
+    admits: impl Fn(&Callee) -> bool,
 ) -> Result<bool, C::Error> {
     let arguments = match &call.args {
         FunctionArguments::None => &[][..],
@@ -145,17 +162,21 @@ fn push_fixed_call<'a, C: Context>(
     {
         return Ok(false);
     }
+    let height = stack.len();
     for argument in arguments {
         let Some(value) = argument_expression(argument) else {
+            stack.truncate(height);
             return Ok(false);
         };
         stack.push(value);
     }
     let callees = context.callees(call)?;
-    Ok(!callees.is_empty()
-        && callees
-            .iter()
-            .all(|callee| callee.kind == CalleeKind::Normal && callee.volatility <= most_volatile))
+    let admitted = !callees.is_empty()
+        && callees.iter().all(|callee| callee.kind == CalleeKind::Normal && admits(callee));
+    if !admitted {
+        stack.truncate(height);
+    }
+    Ok(admitted)
 }
 
 /// Whether the planner may fold `expression` to a `NULL` constant, which a
@@ -573,6 +594,7 @@ mod tests {
             returns: ScalarType::Float,
             returns_set: false,
             error: false,
+            inlinable: false,
             token: 0,
         }
     }

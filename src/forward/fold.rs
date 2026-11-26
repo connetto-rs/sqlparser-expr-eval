@@ -1020,9 +1020,11 @@ fn folded_chain<D: EvalDialect, C: Context>(
 }
 
 /// Whether the planner may raise as it folds the immutable constants within
-/// `expression`, which it does before the expression runs. A call over a
-/// column or a node without operands to walk, such as a subquery, may
-/// raise wherever it raises.
+/// `expression`, which it does before the expression runs. It folds the
+/// arguments of a call it leaves for run time, and the body of a callee it
+/// inlines. A call that may reach an inlinable callee or one the context
+/// does not know, or a node without operands to walk, such as a subquery,
+/// may raise wherever it raises.
 fn folding_may_raise<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     expression: &Expr,
@@ -1033,7 +1035,12 @@ fn folding_may_raise<D: EvalDialect, C: Context>(
             continue;
         }
         let walked = !support::fixed(state.context, node, Volatility::Immutable)?
-            && support::push_operands(&mut stack, node);
+            && match node {
+                Expr::Function(call) => {
+                    support::push_unfolded_call(state.context, &mut stack, call)?
+                }
+                _ => support::push_operands(&mut stack, node),
+            };
         if !walked && forward(state, node)?.may_raise() {
             return Ok(true);
         }

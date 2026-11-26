@@ -1846,6 +1846,7 @@ mod tests {
             returns: ScalarType::Boolean,
             returns_set: false,
             error: true,
+            inlinable: false,
             token: 1,
         }
     }
