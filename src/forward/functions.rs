@@ -10,7 +10,7 @@ use sqlparser::ast::{
 
 use super::{
     super::{
-        context::{Builtin, CalleeKind, Context, NullInput, Rows},
+        context::{Builtin, Callee, CalleeKind, Context, NullInput, Rows},
         dialect::EvalDialect,
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
         scalar::{ArrayElement, ScalarType, TextRules},
@@ -62,6 +62,7 @@ pub(super) fn call<D: EvalDialect, C: Context>(
         let count = callees
             .iter()
             .all(|callee| callee.builtin.is_some_and(|builtin| builtin == Builtin::Count));
+        let error = error || callees.iter().any(|callee| callee_raises(callee, false));
         return Ok(Evaluation::new(returns, !count, error, Values::Unlisted(Unlisted::any())));
     }
     let mut null = false;
@@ -78,9 +79,14 @@ pub(super) fn call<D: EvalDialect, C: Context>(
         }
     }
     if forced_null {
-        return Ok(Evaluation::null(returns).with_error(error));
+        // A strict callee does not run on a `NULL` argument.
+        let raises = callees
+            .iter()
+            .any(|callee| callee.null_input != NullInput::Strict && callee_raises(callee, false));
+        return Ok(Evaluation::null(returns).with_error(error || raises));
     }
     let mut evaluation = Evaluation::new(returns, null, error, Values::Unlisted(Unlisted::any()));
+    let mut folded_error = false;
     // The values fold only when every callee is the same builtin.
     let first_builtin = callees.first().and_then(|callee| callee.builtin);
     if function.over.is_none()
@@ -89,14 +95,15 @@ pub(super) fn call<D: EvalDialect, C: Context>(
         && let Some(builtin) = first_builtin
         && let Some(folded) = fold_builtin(builtin, &argument_evaluations, evaluation.ty().clone())
     {
-        let raises = folded.may_raise() || error;
-        evaluation = folded.with_error(raises);
+        folded_error = folded.may_raise();
+        evaluation = folded.with_error(error || folded_error);
     }
     // The call may reach any callee, so the answer joins each callee's
     // refined reading, unrefined for a callee the context reads no body of.
     let mut refinements: Vec<Evaluation> = Vec::with_capacity(callees.len());
     for callee in &callees {
         let mut refined = evaluation.clone();
+        let mut raises = callee_raises(callee, folded_error);
         if let Some(body) = state.context.evaluate_body(callee, &argument_evaluations)? {
             // The arguments raise before the body runs, and a `NULL` argument
             // the callee is strict in answers `NULL` without running it.
@@ -106,14 +113,20 @@ pub(super) fn call<D: EvalDialect, C: Context>(
                     &argument_evaluations,
                     Evaluation::may_be_null,
                 );
-            refined = refined.meet(&body).with_null(null).with_error(body.may_raise() || error);
+            raises &= body.may_raise();
+            refined = refined.meet(&body).with_null(null);
         }
-        refinements.push(refined);
+        refinements.push(refined.with_error(error || raises));
     }
     Ok(refinements
         .into_iter()
         .reduce(|joined, refined| joined.join(&refined))
         .unwrap_or(evaluation))
+}
+
+/// Whether running `callee` may raise, a builtin only where its fold does.
+fn callee_raises(callee: &Callee, folded_error: bool) -> bool {
+    callee.error && (callee.builtin.is_none() || folded_error)
 }
 
 /// Whether an argument the callee answers `NULL` for passes `test`.
@@ -1164,6 +1177,7 @@ mod tests {
             kind,
             returns,
             returns_set: false,
+            error: true,
             token: 0,
         }
     }
@@ -1441,16 +1455,14 @@ mod tests {
     /// A `NULL` at a called-on-null position forces the call to `NULL`.
     #[test]
     fn called_on_null_forces_null_for_a_null_position() {
-        let context = ColumnContext::new().with_callee(
-            "foo",
-            callee(
-                None,
-                NullInput::CalledOnNull(vec![0]),
-                NullResult::AnyInput,
-                CalleeKind::Normal,
-                int4(),
-            ),
+        let callee = callee(
+            None,
+            NullInput::CalledOnNull(vec![0]),
+            NullResult::AnyInput,
+            CalleeKind::Normal,
+            int4(),
         );
+        let context = ColumnContext::new().with_callee("foo", Callee { error: false, ..callee });
         let evaluation = read(context, "foo(NULL)");
         assert!(evaluation.is_always_null());
     }
@@ -1524,6 +1536,45 @@ mod tests {
             .with_body(0, int(7));
         let evaluation = read(context, "foo(id)");
         assert!(evaluation.may_be(&PgValue::Integer(7)));
+    }
+
+    /// A call may raise where a callee it reaches may, as the context
+    /// declares it and as a builtin fold or a read body tightens it.
+    #[test]
+    fn a_call_raises_where_a_reachable_callee_may() {
+        let declared = |error| {
+            Callee {
+                error,
+                ..callee(None, NullInput::Strict, NullResult::AnyInput, CalleeKind::Normal, int4())
+            }
+        };
+        let read_f = |callees: Vec<Callee>, sql| {
+            let context = callees
+                .into_iter()
+                .fold(ColumnContext::new(), |context, callee| context.with_callee("f", callee));
+            read(context, sql)
+        };
+        assert!(read_f(vec![declared(true)], "f(1)").may_raise());
+        assert!(read_f(vec![declared(true)], "f()").may_raise());
+        assert!(!read_f(vec![declared(false)], "f(1)").may_raise());
+        assert!(read_f(vec![declared(false), declared(true)], "f(1)").may_raise());
+        // A strict callee does not run on a `NULL` argument, and one called
+        // on `NULL` input does.
+        assert!(!read_f(vec![declared(true)], "f(NULL)").may_raise());
+        let called_on_null =
+            Callee { null_input: NullInput::CalledOnNull(vec![0]), ..declared(true) };
+        assert!(read_f(vec![called_on_null], "f(NULL)").may_raise());
+        let aggregate = |error| Callee { kind: CalleeKind::Aggregate, ..declared(error) };
+        assert!(read_f(vec![aggregate(true)], "f(1)").may_raise());
+        assert!(!read_f(vec![aggregate(false)], "f(1)").may_raise());
+        // A body that never raises answers for the callee.
+        let context = ColumnContext::new().with_callee("f", declared(true)).with_body(0, int(7));
+        assert!(!read(context, "f(1)").may_raise());
+        // A builtin raises only where its fold does.
+        let context = ColumnContext::new()
+            .with_column("note", text_len(Bound::Unbounded, Bound::Unbounded))
+            .with_callee("lower", builtin_callee(Builtin::Lower, default_text()));
+        assert!(!read(context, "lower(note)").may_raise());
     }
 
     /// The `length` and `octet_length` folds reach their builtin arms.

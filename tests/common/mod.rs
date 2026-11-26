@@ -133,8 +133,8 @@ pub fn parse(expression: &str) -> Expr {
     expr.clone()
 }
 
-/// A callee that folds the built-in `builtin`, returns `returns`, is strict
-/// and returns `NULL` only on `NULL` input.
+/// A callee that folds the built-in `builtin`, returns `returns`, is strict,
+/// returns `NULL` only on `NULL` input and raises where its fold does.
 pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
     Callee::new(
         Some(builtin),
@@ -144,6 +144,7 @@ pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
         CalleeKind::Normal,
         returns,
         false,
+        true,
         0,
     )
 }

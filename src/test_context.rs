@@ -176,8 +176,8 @@ pub fn read_default(mut context: ColumnContext, sql: &str) -> Evaluation {
         .expect("the context resolves")
 }
 
-/// A callee that returns `returns`, is strict and may return `NULL` on any
-/// input.
+/// A callee that returns `returns`, is strict, may return `NULL` on any
+/// input and may raise.
 pub fn strict_callee(returns: ScalarType) -> Callee {
     Callee {
         builtin: None,
@@ -187,12 +187,13 @@ pub fn strict_callee(returns: ScalarType) -> Callee {
         kind: super::context::CalleeKind::Normal,
         returns,
         returns_set: false,
+        error: true,
         token: 0,
     }
 }
 
-/// A callee that folds the built-in `builtin`, returns `returns`, is strict
-/// and returns `NULL` only on `NULL` input.
+/// A callee that folds the built-in `builtin`, returns `returns`, is strict,
+/// returns `NULL` only on `NULL` input and raises where its fold does.
 pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
     Callee {
         builtin: Some(builtin),
@@ -202,6 +203,7 @@ pub fn builtin_callee(builtin: Builtin, returns: ScalarType) -> Callee {
         kind: super::context::CalleeKind::Normal,
         returns,
         returns_set: false,
+        error: true,
         token: 0,
     }
 }

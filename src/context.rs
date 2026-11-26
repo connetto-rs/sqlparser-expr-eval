@@ -69,7 +69,8 @@ pub enum CalleeKind {
     Window,
 }
 
-/// The PostgreSQL built-in functions whose results the evaluator folds.
+/// The PostgreSQL built-in functions whose results the evaluator folds, each
+/// read as raising only where its fold does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Builtin {
     /// `length(text)`, `char_length`, `character_length`: characters.
@@ -110,6 +111,10 @@ pub struct Callee {
     pub returns: ScalarType,
     /// Whether the function returns a set of rows.
     pub returns_set: bool,
+    /// Whether running the function may raise an error. The evaluator
+    /// tightens it with what it reads of a builtin and of a body
+    /// [`Context::evaluate_body`] answers.
+    pub error: bool,
     /// A token the context reads back in [`Context::evaluate_body`].
     pub token: usize,
 }
@@ -129,9 +134,20 @@ impl Callee {
         kind: CalleeKind,
         returns: ScalarType,
         returns_set: bool,
+        error: bool,
         token: usize,
     ) -> Self {
-        Self { builtin, null_input, null_result, volatility, kind, returns, returns_set, token }
+        Self {
+            builtin,
+            null_input,
+            null_result,
+            volatility,
+            kind,
+            returns,
+            returns_set,
+            error,
+            token,
+        }
     }
 
     /// Whether a call writing `arity` arguments may return `NULL` while
@@ -364,6 +380,7 @@ mod tests {
                 kind: CalleeKind::Normal,
                 returns: ScalarType::Integer(IntegerType::Integer),
                 returns_set: false,
+                error: false,
                 token: 0,
             }]))
         }

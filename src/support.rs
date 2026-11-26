@@ -572,6 +572,7 @@ mod tests {
             kind: CalleeKind::Normal,
             returns: ScalarType::Float,
             returns_set: false,
+            error: false,
             token: 0,
         }
     }
