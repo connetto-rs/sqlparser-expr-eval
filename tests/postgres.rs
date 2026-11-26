@@ -303,7 +303,7 @@ fn a_null_upper_result_comes_from_a_null_input() {
 }
 
 /// A catalog function the context declares to return `NULL` only on a
-/// `NULL` argument, such as `now()`, which takes none.
+/// `NULL` argument and never to raise, such as `now()`, which takes none.
 fn now_callee() -> Callee {
     Callee::new(
         None,
@@ -312,6 +312,7 @@ fn now_callee() -> Callee {
         Volatility::Stable,
         CalleeKind::Normal,
         catalog("timestamptz"),
+        false,
         false,
         0,
     )

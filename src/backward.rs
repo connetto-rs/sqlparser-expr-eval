@@ -1845,6 +1845,7 @@ mod tests {
             kind: crate::context::CalleeKind::Normal,
             returns: ScalarType::Boolean,
             returns_set: false,
+            error: true,
             token: 1,
         }
     }
@@ -4683,11 +4684,14 @@ mod tests {
 
     #[test]
     fn a_null_call_comparison_points_at_the_call_and_the_other_side() {
-        // `f(1)` carries no column, so its `NULL` reading stands on the
-        // call alone.
+        // `f(1)` carries no column and never raises, so its `NULL` reading
+        // stands on the call alone.
+        let never_raises = crate::Callee {
+            error: false,
+            ..crate::test_context::strict_callee(ScalarType::Boolean)
+        };
         let guarantees = implied_with(
-            ColumnContext::new()
-                .with_callee("f", crate::test_context::strict_callee(ScalarType::Boolean)),
+            ColumnContext::new().with_callee("f", never_raises),
             &parse("f(1) IS NULL"),
             Outcomes::TRUE,
         );

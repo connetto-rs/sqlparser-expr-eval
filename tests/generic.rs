@@ -46,7 +46,8 @@ fn imply(mut context: Ctx, sql: &str, outcomes: Outcomes) -> Guarantees<String> 
     .expect("the context resolves")
 }
 
-/// A strict callee returning `returns` with `NULL` results from `null_result`.
+/// A strict callee returning `returns` with `NULL` results from `null_result`,
+/// which may raise.
 fn strict_callee(returns: ScalarType, null_result: NullResult) -> Callee {
     Callee::new(
         None,
@@ -56,6 +57,7 @@ fn strict_callee(returns: ScalarType, null_result: NullResult) -> Callee {
         CalleeKind::Normal,
         returns,
         false,
+        true,
         0,
     )
 }
