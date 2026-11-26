@@ -679,7 +679,7 @@ impl Planned {
     /// What the planner makes of `operand`.
     fn of<C: Context>(context: &mut C, operand: &Expr) -> Result<Self, C::Error> {
         Ok(Self {
-            constant: support::fixed(context, operand, Volatility::Immutable)?,
+            constant: planner_constant(context, operand)?,
             may_fold_to_null: support::may_fold_to_null(context, operand)?,
         })
     }
@@ -691,6 +691,18 @@ impl Planned {
             may_fold_to_null: self.may_fold_to_null || other.may_fold_to_null,
         }
     }
+}
+
+/// Whether the planner folds `expression` to a constant before it runs, as
+/// it does a [`support::fixed`] expression over immutable functions with no
+/// cast whose checks run at run time.
+fn planner_constant<C: Context>(context: &mut C, expression: &Expr) -> Result<bool, C::Error> {
+    support::fixed_unless(
+        context,
+        expression,
+        Volatility::Immutable,
+        super::literals::checks_at_run_time,
+    )
 }
 
 /// Whether a strict operator over `left` and `right`, both with an outcome,
@@ -1000,7 +1012,7 @@ fn folded_chain<D: EvalDialect, C: Context>(
     }
     let mut deciding = None;
     for (position, term) in flat.iter().enumerate() {
-        if support::fixed(state.context, term, Volatility::Immutable)? {
+        if planner_constant(state.context, term)? {
             let evaluation = support::as_condition(forward(state, term)?);
             if evaluation.outcomes() == decided && !evaluation.may_raise() {
                 deciding = Some(position);
@@ -1021,10 +1033,11 @@ fn folded_chain<D: EvalDialect, C: Context>(
 
 /// Whether the planner may raise as it folds the immutable constants within
 /// `expression`, which it does before the expression runs. It folds the
-/// arguments of a call it leaves for run time, and the body of a callee it
-/// inlines. A call that may reach an inlinable callee or one the context
-/// does not know, or a node without operands to walk, such as a subquery,
-/// may raise wherever it raises.
+/// arguments of a call it leaves for run time, the body of a callee it
+/// inlines, and the conversion of a cast whose checks it leaves for run
+/// time. A call that may reach an inlinable callee or one the context does
+/// not know, or a node without operands to walk, such as a subquery, may
+/// raise wherever it raises.
 fn folding_may_raise<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     expression: &Expr,
@@ -1034,7 +1047,31 @@ fn folding_may_raise<D: EvalDialect, C: Context>(
         if support::is_reference(node) {
             continue;
         }
-        let walked = !support::fixed(state.context, node, Volatility::Immutable)?
+        match node {
+            Expr::Cast { kind, expr, data_type, .. }
+                if super::literals::checks_at_run_time(state.context, node)? =>
+            {
+                if !planner_constant(state.context, expr)? {
+                    stack.push(expr);
+                    continue;
+                }
+                let source = forward(state, expr)?;
+                if super::literals::conversion(state, kind, source, data_type).may_raise() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            Expr::TypedString(typed)
+                if super::literals::checks_at_run_time(state.context, node)? =>
+            {
+                if super::literals::typed_string(state.context, typed).may_raise() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let walked = !planner_constant(state.context, node)?
             && match node {
                 Expr::Function(call) => {
                     support::push_unfolded_call(state.context, &mut stack, call)?

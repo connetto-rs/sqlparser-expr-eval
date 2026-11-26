@@ -66,10 +66,24 @@ pub(crate) fn fixed<C: Context>(
     expression: &Expr,
     most_volatile: Volatility,
 ) -> Result<bool, C::Error> {
+    fixed_unless(context, expression, most_volatile, |_, _| Ok(false))
+}
+
+/// Whether `expression` is [`fixed`] with no node `excluded` answers `true`
+/// for.
+pub(crate) fn fixed_unless<C: Context>(
+    context: &mut C,
+    expression: &Expr,
+    most_volatile: Volatility,
+    mut excluded: impl FnMut(&mut C, &Expr) -> Result<bool, C::Error>,
+) -> Result<bool, C::Error> {
     // The walk keeps its own stack, so a long left-deep chain costs no
     // recursion.
     let mut stack = vec![expression];
     while let Some(node) = stack.pop() {
+        if excluded(context, node)? {
+            return Ok(false);
+        }
         let fixed = match node {
             Expr::Function(call) => {
                 push_call_arguments(context, &mut stack, call, |callee| {

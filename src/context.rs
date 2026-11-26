@@ -307,6 +307,40 @@ pub trait Context {
         ScalarType::of(data_type)
     }
 
+    /// Whether a cast or a typed literal of `data_type` checks the value it
+    /// converts to, as one to a PostgreSQL domain with a constraint, or to
+    /// an array of such a domain, does. The planner never folds such a cast,
+    /// unless it casts an untyped literal to an array, whose input function
+    /// runs the elements' checks as the literal is parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's error when resolution fails.
+    fn cast_checks(&mut self, data_type: &DataType) -> Result<bool, Self::Error> {
+        let _ = data_type;
+        Ok(false)
+    }
+
+    /// What the checks of `data_type` make of `converted`, the value a cast
+    /// or a typed literal converts to, asked only when
+    /// [`cast_checks`](Self::cast_checks) answers `true`. A PostgreSQL
+    /// context reads a domain's constraints over `converted`, `NULL`
+    /// included, and answers a raise wherever one may refuse it. The
+    /// default may refuse any value. The evaluator keeps what the
+    /// conversion raises.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's error when resolution fails.
+    fn checked_cast(
+        &mut self,
+        data_type: &DataType,
+        converted: Evaluation,
+    ) -> Result<Evaluation, Self::Error> {
+        let _ = data_type;
+        Ok(converted.with_error(true))
+    }
+
     /// The rules of the collation `name` names, under the identity a column
     /// declared with it carries, [`TextRules::UNKNOWN`] when the context
     /// cannot identify it. The evaluator marks them
@@ -475,6 +509,47 @@ mod tests {
                 .unwrap();
         assert!(evaluation.is_always_null());
         assert!(!evaluation.may_raise());
+    }
+
+    /// A context whose every type checks its values, reading none of the
+    /// checks.
+    struct Checking;
+
+    impl Context for Checking {
+        type Reference = &'static str;
+        type Error = Infallible;
+
+        fn reference(
+            &mut self,
+            _expression: &Expr,
+        ) -> Result<Option<Resolved<&'static str>>, Infallible> {
+            Ok(None)
+        }
+
+        fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+            Ok(Vec::new())
+        }
+
+        fn cast_checks(&mut self, _data_type: &DataType) -> Result<bool, Infallible> {
+            Ok(true)
+        }
+    }
+
+    /// A type whose checks the context does not read may refuse any value,
+    /// `NULL` included.
+    #[test]
+    fn an_unread_check_may_refuse_any_value() {
+        for sql in ["5::int", "NULL::int", "x::int", "f(1)::int"] {
+            let evaluation = evaluate(
+                &parse(sql),
+                &PostgreSqlDialect {},
+                &PostgreSqlOptions::default(),
+                &mut Checking,
+                &Guarantees::new(),
+            )
+            .unwrap();
+            assert!(evaluation.may_raise() && !evaluation.always_raises(), "{sql}");
+        }
     }
 
     #[test]

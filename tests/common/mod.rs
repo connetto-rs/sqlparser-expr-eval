@@ -3,7 +3,8 @@
 
 use sqlparser::{
     ast::{
-        DataType, Expr, Function, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Statement,
+        ArrayElemTypeDef, DataType, Expr, Function, ObjectName, ObjectNamePart, Query, SelectItem,
+        SetExpr, Statement,
     },
     dialect::PostgreSqlDialect,
     parser::{Parser, ParserError},
@@ -13,13 +14,19 @@ use sqlparser_expr_eval::{
     QueryEvaluation, Resolved, ScalarType, TextRules, Unlisted, Values, Volatility,
 };
 
-/// A context that resolves a fixed set of columns, callees, collations and
-/// named types and one nested query.
+/// What a checking type's checks make of a value converted to it.
+pub type Check = fn(Evaluation) -> Evaluation;
+
+/// A context that resolves a fixed set of columns, callees, collations,
+/// named types and domain checks and one nested query.
 pub struct Ctx {
     pub columns: Vec<(String, Evaluation)>,
     pub callees: Vec<(String, Callee)>,
     pub collations: Vec<(String, TextRules)>,
     pub types: Vec<(String, ScalarType)>,
+    /// The named types that check a converted value, each with what its
+    /// checks make of one, read the same over an array of the type.
+    pub checks: Vec<(String, Check)>,
     pub query: Option<QueryEvaluation>,
     /// The references the engine may plan as constants.
     pub plan_constants: Vec<String>,
@@ -33,6 +40,7 @@ impl Ctx {
             callees: Vec::new(),
             collations: Vec::new(),
             types: Vec::new(),
+            checks: Vec::new(),
             query: None,
             plan_constants: Vec::new(),
         }
@@ -42,6 +50,20 @@ impl Ctx {
     pub fn with_callee(mut self, name: &str, callee: Callee) -> Self {
         self.callees.push((name.to_string(), callee));
         self
+    }
+
+    /// The checks of `data_type`, or of its element type when it is an
+    /// array, when it names a checking type.
+    fn check(&self, data_type: &DataType) -> Option<Check> {
+        let data_type = match data_type {
+            DataType::Array(ArrayElemTypeDef::SquareBracket(element, _)) => element,
+            data_type => data_type,
+        };
+        let DataType::Custom(name, _) = data_type else {
+            return None;
+        };
+        let name = name.0.last().and_then(ObjectNamePart::as_ident)?;
+        self.checks.iter().find(|(known, _)| name.value == *known).map(|(_, check)| *check)
     }
 }
 
@@ -105,6 +127,21 @@ impl Context for Ctx {
             .iter()
             .find(|(known, _)| name.is_some_and(|name| name.value == *known))
             .map_or_else(|| ScalarType::of(data_type), |(_, ty)| ty.clone())
+    }
+
+    fn cast_checks(&mut self, data_type: &DataType) -> Result<bool, Self::Error> {
+        Ok(self.check(data_type).is_some())
+    }
+
+    fn checked_cast(
+        &mut self,
+        data_type: &DataType,
+        converted: Evaluation,
+    ) -> Result<Evaluation, Self::Error> {
+        Ok(match self.check(data_type) {
+            Some(check) => check(converted),
+            None => converted,
+        })
     }
 
     fn may_plan_as_constant(&self, reference: &Self::Reference) -> bool {
