@@ -205,7 +205,8 @@ impl QueryEvaluation {
 
 /// The scope an expression is evaluated in.
 ///
-/// The context only resolves names, calls and subqueries. The dialect an
+/// The context resolves names, calls and subqueries, and may answer a whole
+/// expression it knows better than its parts tell. The dialect an
 /// expression is evaluated under is passed to the entry points, and nothing
 /// the context answers depends on it.
 pub trait Context {
@@ -244,6 +245,21 @@ pub trait Context {
         arguments: &[Evaluation],
     ) -> Result<Option<Evaluation>, Self::Error> {
         let _ = (callee, arguments);
+        Ok(None)
+    }
+
+    /// What `expression` evaluates to when the context knows it better than
+    /// its parts tell, `None` to evaluate it as written. The evaluator asks
+    /// about every node but a reference, with its parentheses stripped, and
+    /// the answer stands for the node and its operands, so the context
+    /// answers for what they would raise. The answer is met with the
+    /// guarantee the node's subject satisfies.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's error when resolution fails.
+    fn expression(&mut self, expression: &Expr) -> Result<Option<Evaluation>, Self::Error> {
+        let _ = expression;
         Ok(None)
     }
 
