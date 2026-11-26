@@ -34,8 +34,8 @@ pub(super) const DEPTH_LIMIT: u32 = 32;
 ///
 /// # Errors
 ///
-/// Returns the context's error when a reference, a call or a subquery fails
-/// to resolve.
+/// Returns the context's error when a reference, a call, a subquery or an
+/// expression it is asked about fails to resolve.
 pub fn evaluate<D: EvalDialect, C: Context>(
     expression: &Expr,
     dialect: &D,
@@ -93,11 +93,16 @@ fn forward<D: EvalDialect, C: Context>(
             None => evaluation,
         });
     }
-    // An error abandons the pass, so only the success path restores the
-    // depth.
-    state.depth += 1;
-    let evaluation = evaluate_node(state, expression)?;
-    state.depth -= 1;
+    let evaluation = if let Some(answer) = state.context.expression(expression)? {
+        answer
+    } else {
+        // An error abandons the pass, so only the success path restores the
+        // depth.
+        state.depth += 1;
+        let evaluation = evaluate_node(state, expression)?;
+        state.depth -= 1;
+        evaluation
+    };
     Ok(match state.guarantees.expression(expression) {
         Some(guarantee) => evaluation.meet(guarantee),
         None => evaluation,
@@ -166,8 +171,9 @@ mod tests {
 
     use super::{
         super::{
+            backward::implied,
             context::{Builtin, Callee, NullInput, Rows},
-            domain::{Evaluation, Unlisted, Values},
+            domain::{Evaluation, Outcomes, Unlisted, Values},
             guarantees::Guarantees,
             postgres::PostgreSqlOptions,
             scalar::{ScalarType, TextRules},
@@ -829,5 +835,56 @@ mod tests {
             on_small_stack(expression, ColumnContext::new().with_column("x", integer_unknown()));
         assert!(!evaluation.is_impossible());
         assert_eq!(evaluation.constant(), None);
+    }
+
+    /// A setting declared `UUID` holds a canonical rendering, so a context
+    /// that knows it answers the cast as never raising, whatever its
+    /// unknown operands would raise.
+    #[test]
+    fn a_node_the_context_answers_reads_as_the_answer() {
+        let cast = "NULLIF(current_setting('app.installation_id', true), '')::UUID";
+        assert!(read(ColumnContext::new(), cast).may_raise());
+        let answered = || {
+            ColumnContext::new().with_expression(
+                cast,
+                Evaluation::unknown(ScalarType::Other).with_null(false).with_error(false),
+            )
+        };
+        assert!(!read(answered(), cast).may_raise());
+        let tested = read(answered(), &format!("({cast}) IS NULL"));
+        assert!(!tested.may_be_true() && tested.may_be_false() && !tested.may_raise());
+    }
+
+    /// A guarantee the backward pass keys on an answered node narrows a
+    /// later read of the same node.
+    #[test]
+    fn an_answered_node_meets_its_guarantee() {
+        let context = || {
+            ColumnContext::new()
+                .with_callee("f", test_context::strict_callee(ScalarType::Text(TextRules::DEFAULT)))
+                .with_expression(
+                    "f()",
+                    Evaluation::unknown(ScalarType::Text(TextRules::DEFAULT)).with_error(false),
+                )
+        };
+        let options = PostgreSqlOptions::default();
+        let guarantees = implied(
+            &test_context::parse("f() IS NOT NULL"),
+            Outcomes::TRUE,
+            &PostgreSqlDialect {},
+            &options,
+            &mut context(),
+            &Guarantees::new(),
+        )
+        .expect("the context resolves");
+        let read = evaluate(
+            &test_context::parse("f()"),
+            &PostgreSqlDialect {},
+            &options,
+            &mut context(),
+            &guarantees,
+        )
+        .expect("the context resolves");
+        assert!(!read.may_be_null() && !read.may_raise());
     }
 }

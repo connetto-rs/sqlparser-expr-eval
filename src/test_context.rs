@@ -21,6 +21,7 @@ pub struct ColumnContext {
     pub callees: BTreeMap<String, Vec<Callee>>,
     pub query: Option<QueryEvaluation>,
     pub bodies: BTreeMap<usize, Evaluation>,
+    pub expressions: Vec<(Expr, Evaluation)>,
 }
 
 impl ColumnContext {
@@ -32,6 +33,7 @@ impl ColumnContext {
             callees: BTreeMap::new(),
             query: None,
             bodies: BTreeMap::new(),
+            expressions: Vec::new(),
         }
     }
 
@@ -61,6 +63,14 @@ impl ColumnContext {
     #[must_use]
     pub fn with_body(mut self, token: usize, evaluation: Evaluation) -> Self {
         self.bodies.insert(token, evaluation);
+        self
+    }
+
+    /// The context that answers the expression `sql` spells with
+    /// `evaluation`.
+    #[must_use]
+    pub fn with_expression(mut self, sql: &str, evaluation: Evaluation) -> Self {
+        self.expressions.push((parse(sql), evaluation));
         self
     }
 }
@@ -117,6 +127,14 @@ impl Context for ColumnContext {
     ) -> Result<Option<Evaluation>, Self::Error> {
         let _ = arguments;
         Ok(self.bodies.get(&callee.token).cloned())
+    }
+
+    fn expression(&mut self, expression: &Expr) -> Result<Option<Evaluation>, Self::Error> {
+        Ok(self
+            .expressions
+            .iter()
+            .find(|(answered, _)| answered == expression)
+            .map(|(_, evaluation)| evaluation.clone()))
     }
 }
 

@@ -8,7 +8,7 @@
 
 Reads a [`sqlparser`](https://docs.rs/sqlparser) expression into what it can evaluate to over every row: whether it can be `NULL`, which values it can take, and whether it can raise. Every answer over-approximates, so unknown is always a safe answer. Values and their PostgreSQL rules come from [`sql-values`](https://docs.rs/sql-values), re-exported as [`sql_values`]. The crate is `no_std`, needing only `alloc`.
 
-An [`EvalDialect`] answers the questions an expression's meaning turns on, and carries its settings in `Options`. A [`Context`] resolves the columns, calls, collations and subqueries an expression reads. The dialect and its settings are passed to the entry points; nothing the context answers depends on them.
+An [`EvalDialect`] answers the questions an expression's meaning turns on, and carries its settings in `Options`. A [`Context`] resolves the columns, calls, collations and subqueries an expression reads, and may answer any node it knows better than its parts tell. The dialect and its settings are passed to the entry points; nothing the context answers depends on them.
 
 ```rust
 use sqlparser::{
