@@ -709,6 +709,9 @@ fn in_subquery<D: EvalDialect, C: Context>(
     subquery: &Query,
     outcomes: Outcomes,
 ) -> Result<(), C::Error> {
+    if let Expr::Tuple(fields) = support::unnest(value) {
+        return row_subquery(state, fields, subquery, CmpOp::Eq, Family::Any, outcomes);
+    }
     let Some(column) = subquery_column(state, subquery, Family::Any, outcomes)? else {
         return Ok(());
     };
@@ -717,25 +720,67 @@ fn in_subquery<D: EvalDialect, C: Context>(
     comparison_with(state, value, &column, CmpOp::Eq, Family::Single, outcomes)
 }
 
-/// The column a quantified subquery operand compares against, `None` where
-/// the subquery narrows nothing. A possibly empty row set reads `FALSE` to
-/// `ANY` and `TRUE` to `ALL` whatever the left side is, so those outcomes
-/// carry no input value.
+/// The inputs of `(field, ...) op ANY/ALL (subquery)` taking one outcome.
+fn row_subquery<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    fields: &[Expr],
+    subquery: &Query,
+    op: CmpOp,
+    family: Family,
+    outcomes: Outcomes,
+) -> Result<(), C::Error> {
+    // An unequal row may differ in any one field, so only equality narrows.
+    let equal = match op {
+        CmpOp::Eq => outcomes.truth,
+        CmpOp::NotEq => outcomes.falsity,
+        CmpOp::Less { .. } | CmpOp::Greater { .. } => false,
+    };
+    if !equal {
+        return Ok(());
+    }
+    let Some(columns) = subquery_columns(state, subquery, family, outcomes)? else {
+        return Ok(());
+    };
+    if columns.len() != fields.len() {
+        return Ok(());
+    }
+    for (field, column) in fields.iter().zip(&columns) {
+        comparison_with(state, field, column, CmpOp::Eq, Family::Single, Outcomes::TRUE)?;
+    }
+    Ok(())
+}
+
+/// The only column a quantified subquery operand compares against, `None`
+/// where the subquery narrows nothing.
 fn subquery_column<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     subquery: &Query,
     family: Family,
     outcomes: Outcomes,
 ) -> Result<Option<Evaluation>, C::Error> {
+    let columns = subquery_columns(state, subquery, family, outcomes)?;
+    Ok(columns.and_then(|columns| <[Evaluation; 1]>::try_from(columns).ok()).map(|[column]| column))
+}
+
+/// The columns a quantified subquery operand compares against, `None` where
+/// the subquery narrows nothing. A possibly empty row set reads `FALSE` to
+/// `ANY` and `TRUE` to `ALL` whatever the left side is, so those outcomes
+/// carry no input value.
+fn subquery_columns<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    subquery: &Query,
+    family: Family,
+    outcomes: Outcomes,
+) -> Result<Option<Vec<Evaluation>>, C::Error> {
     let qe = state.context.query(subquery, state.guarantees)?;
-    let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
+    let Some(columns) = qe.columns else {
         return Ok(None);
     };
     let empty_reading = if family == Family::All { outcomes.truth } else { outcomes.falsity };
     if !(qe.rows.one || qe.rows.many) || qe.rows.none && empty_reading {
         return Ok(None);
     }
-    Ok(Some(column.clone().with_error(qe.error)))
+    Ok(Some(columns.into_iter().map(|column| column.with_error(qe.error)).collect()))
 }
 
 /// The inputs of `left op ANY/ALL (right)` taking one outcome.
@@ -754,6 +799,9 @@ fn any_all<D: EvalDialect, C: Context>(
     };
     let other = match support::unnest(right) {
         Expr::Subquery(subquery) => {
+            if let Expr::Tuple(fields) = support::unnest(left) {
+                return row_subquery(state, fields, subquery, op, family, outcomes);
+            }
             let Some(column) = subquery_column(state, subquery, family, outcomes)? else {
                 return Ok(());
             };
@@ -2361,6 +2409,86 @@ mod tests {
             assert_eq!(unlisted.numbers.low, *low, "{sql} {outcomes:?}");
             assert_eq!(unlisted.numbers.high, *high, "{sql} {outcomes:?}");
         }
+    }
+
+    /// Non-`NULL` integers holding `values`.
+    fn listed_integers(values: &[i64]) -> Evaluation {
+        Evaluation::new(
+            ScalarType::Integer(IntegerType::Integer),
+            false,
+            false,
+            Values::Listed(values.iter().copied().map(PgValue::Integer).collect()),
+        )
+    }
+
+    /// The nullable integer columns `o` and `k` beside a nested query
+    /// projecting `{1, 2}` and `{5}` over `rows`.
+    fn row_context(rows: Rows) -> ColumnContext {
+        let int = || unknown_column(ScalarType::Integer(IntegerType::Integer));
+        ColumnContext::new()
+            .with_column("o", int())
+            .with_column("k", int())
+            .with_query_columns(rows, vec![listed_integers(&[1, 2]), listed_integers(&[5])])
+    }
+
+    /// Whether `held` admits exactly the non-`NULL` integers `values` among
+    /// `1` to `5`.
+    fn holds_only(held: &Evaluation, values: &[i64]) -> bool {
+        !held.may_be_null()
+            && (1..=5).all(|value| held.may_be(&PgValue::Integer(value)) == values.contains(&value))
+    }
+
+    /// A row reading equal to some query row holds, in each field, a value
+    /// of the column in its position.
+    #[test]
+    fn a_row_equal_to_a_query_row_narrows_each_field() {
+        let possibly_empty = Rows { none: true, one: true, many: true };
+        let nonempty = Rows { none: false, one: true, many: true };
+        for (rows, sql, outcomes) in [
+            (possibly_empty, "(o, k) IN (SELECT * FROM q)", Outcomes::TRUE),
+            (possibly_empty, "(o, k) = ANY (SELECT * FROM q)", Outcomes::TRUE),
+            (possibly_empty, "(o, k) NOT IN (SELECT * FROM q)", Outcomes::FALSE),
+            (possibly_empty, "(o, k) <> ALL (SELECT * FROM q)", Outcomes::FALSE),
+            (nonempty, "(o, k) = ALL (SELECT * FROM q)", Outcomes::TRUE),
+            (nonempty, "(o, k) <> ANY (SELECT * FROM q)", Outcomes::FALSE),
+        ] {
+            let guarantees = implied_with(row_context(rows), &parse(sql), outcomes);
+            assert!(holds_only(column(&guarantees, "o"), &[1, 2]), "{sql}");
+            assert!(holds_only(column(&guarantees, "k"), &[5]), "{sql}");
+        }
+    }
+
+    /// A row unequal to the query rows may differ in any one field, and an
+    /// empty query or an ordering decides nothing of a field.
+    #[test]
+    fn a_row_unequal_to_the_query_rows_narrows_no_field() {
+        let possibly_empty = Rows { none: true, one: true, many: true };
+        for (sql, outcomes) in [
+            ("(o, k) IN (SELECT * FROM q)", Outcomes::FALSE),
+            ("(o, k) IN (SELECT * FROM q)", Outcomes::NULL),
+            ("(o, k) NOT IN (SELECT * FROM q)", Outcomes::TRUE),
+            ("(o, k) = ALL (SELECT * FROM q)", Outcomes::TRUE),
+            ("(o, k) <> ANY (SELECT * FROM q)", Outcomes::FALSE),
+            ("(o, k) < ANY (SELECT * FROM q)", Outcomes::TRUE),
+        ] {
+            let guarantees = implied_with(row_context(possibly_empty), &parse(sql), outcomes);
+            for field in ["o", "k"] {
+                let open = guarantees
+                    .reference(&field.to_string())
+                    .is_none_or(|held| held.may_be_null() && held.may_be(&PgValue::Integer(3)));
+                assert!(open, "{sql} {outcomes:?} {field}");
+            }
+        }
+    }
+
+    /// A row membership narrows the terms that follow it in a conjunction.
+    #[test]
+    fn a_row_membership_narrows_the_conjuncts_after_it() {
+        let evaluation = crate::test_context::read(
+            row_context(Rows::ONE),
+            "(o, k) IN (SELECT * FROM q) AND o = 3",
+        );
+        assert!(!evaluation.may_be_true());
     }
 
     /// `IN` over an all-`NULL` projection reads `FALSE` on its empty rows,
