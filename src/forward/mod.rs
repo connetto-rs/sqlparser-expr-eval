@@ -108,7 +108,7 @@ fn forward<D: EvalDialect, C: Context>(
     if !state.guarantees.names_expression(expression) {
         return Ok(evaluation);
     }
-    Ok(match support::subject(state.context, expression)? {
+    Ok(match support::subject(state.dialect, state.options, state.context, expression)? {
         Some(subject) => {
             match state.guarantees.get(&subject) {
                 Some(guarantee) => evaluation.meet(guarantee),

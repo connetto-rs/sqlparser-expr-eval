@@ -414,8 +414,8 @@ fn routine(volatility: Volatility, returns: ScalarType, returns_set: bool) -> Ca
 }
 
 /// A nullable integer `o` and parameter `$1`, the stable functions `g`, a
-/// condition, and `f`, a set of integers, and their volatile counterparts
-/// `v` and `r`.
+/// condition, `f`, a set of integers, and `t`, a text, and their volatile
+/// counterparts `v` and `r`.
 fn atoms() -> Ctx {
     Ctx::with_columns(vec![
         ("o".into(), column(INTEGER, true)),
@@ -423,6 +423,7 @@ fn atoms() -> Ctx {
     ])
     .with_callee("g", routine(Volatility::Stable, ScalarType::Boolean, false))
     .with_callee("f", routine(Volatility::Stable, INTEGER, true))
+    .with_callee("t", routine(Volatility::Stable, ScalarType::Text(TextRules::DEFAULT), false))
     .with_callee("v", routine(Volatility::Volatile, ScalarType::Boolean, false))
     .with_callee("r", routine(Volatility::Volatile, INTEGER, true))
     .with_callee("random", routine(Volatility::Volatile, ScalarType::Float, false))
@@ -451,6 +452,23 @@ fn a_stable_atom_reads_as_it_was_assumed() {
 }
 
 #[test]
+fn a_call_recognised_by_name_over_stable_atoms_reads_as_it_was_assumed() {
+    for atom in [
+        "NULLIF(t(1), '') IS NULL",
+        "NULLIF(t(1), '') IS NOT NULL",
+        "NULLIF(t(1), '') = 'x'",
+        "COALESCE(t(1), '') = ''",
+        "GREATEST(t(1), 'a') = 'b'",
+        "LEAST(o, 1) = 0",
+    ] {
+        let truth = restrict(atoms(), atom, Outcomes::TRUE);
+        assert_eq!(outcomes_under(atoms(), atom, &truth), Outcomes::TRUE, "{atom}");
+    }
+    let null = restrict(atoms(), "NULLIF(t(1), '') IS NULL", Outcomes::TRUE);
+    assert_eq!(outcomes_under(atoms(), "NULLIF(t(1), '') IS NOT NULL", &null), Outcomes::FALSE);
+}
+
+#[test]
 fn an_atom_that_may_change_between_readings_keeps_nothing_assumed() {
     for atom in [
         "random() < 0.5",
@@ -461,6 +479,8 @@ fn an_atom_that_may_change_between_readings_keeps_nothing_assumed() {
         "o IN (SELECT * FROM f(1) LIMIT 1)",
         "o IN (SELECT * FROM t)",
         "o IN (SELECT * FROM f(1) WITH ORDINALITY)",
+        "NULLIF(v(o), TRUE)",
+        "COALESCE(random(), 0) < 0.5",
     ] {
         let truth = restrict(atoms(), atom, Outcomes::TRUE);
         assert!(outcomes_under(atoms(), atom, &truth).falsity, "{atom}");
