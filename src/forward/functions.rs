@@ -523,6 +523,13 @@ pub(super) fn in_target<D: EvalDialect, C: Context>(
     target: &InTarget,
     negated: bool,
 ) -> Result<Evaluation, C::Error> {
+    if let InTarget::Subquery(subquery) = target
+        && let Expr::Tuple(fields) = support::unnest(expr)
+    {
+        // `NOT IN` is `<> ALL`.
+        let op = if negated { BinaryOperator::NotEq } else { BinaryOperator::Eq };
+        return row_subquery(state, fields, &op, subquery, !negated);
+    }
     let value = forward(state, expr)?;
     if value.is_impossible() {
         return Ok(Evaluation::impossible(ScalarType::Boolean));
@@ -671,6 +678,23 @@ fn pattern_may_raise(pattern: &str, escape: Option<char>, similar: bool) -> bool
 
 /// The forward evaluation of `x op ANY/ALL (list | subquery)`.
 pub(super) fn any_all<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    is_any: bool,
+) -> Result<Evaluation, C::Error> {
+    if let (Expr::Tuple(fields), Expr::Subquery(subquery)) =
+        (support::unnest(left), support::unnest(right))
+    {
+        return row_subquery(state, fields, op, subquery, is_any);
+    }
+    value_any_all(state, left, op, right, is_any)
+}
+
+/// `x op ANY/ALL (list | subquery)` for a left side that is not a row
+/// compared with a subquery.
+fn value_any_all<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     left: &Expr,
     op: &BinaryOperator,
@@ -950,14 +974,15 @@ struct SubqueryOperand {
     /// The comparison, read over any subset of the column's values, as the
     /// subquery's rows may hold any of them.
     compared: Compared,
-    /// The values the subquery's first column may hold.
+    /// The values the subquery's only column may hold.
     column: Evaluation,
     /// The row counts the subquery may return.
     rows: Rows,
 }
 
-/// `value` compared by `op` with a subquery's first column. `Err` holds the
-/// unknown condition when the subquery projects no known column.
+/// `value` compared by `op` with a subquery's only column. `Err` holds the
+/// whole condition when the subquery projects no known column or more than
+/// one.
 fn subquery_comparison<D: EvalDialect, C: Context>(
     state: &mut State<'_, D, C>,
     value: Evaluation,
@@ -965,15 +990,76 @@ fn subquery_comparison<D: EvalDialect, C: Context>(
     subquery: &Query,
 ) -> Result<Result<SubqueryOperand, Evaluation>, C::Error> {
     let qe = state.context.query(subquery, state.guarantees)?;
-    let Some(column) = qe.columns.as_ref().and_then(|columns| columns.first()) else {
+    let Some(columns) = qe.columns else {
         let error = value.may_raise() || qe.error;
         let unknown = Values::Unlisted(Unlisted::any());
         return Ok(Err(Evaluation::new(ScalarType::Boolean, true, error, unknown)));
     };
+    let Ok([column]) = <[Evaluation; 1]>::try_from(columns) else {
+        return Ok(Err(Evaluation::raising(ScalarType::Boolean)));
+    };
     let mut compared = comparison_evals(state, value, op, column.clone());
     compared.rows = compared.rows.over_subsets();
     compared.error |= qe.error;
-    Ok(Ok(SubqueryOperand { compared, column: column.clone(), rows: qe.rows }))
+    Ok(Ok(SubqueryOperand { compared, column, rows: qe.rows }))
+}
+
+/// `(field, ...) op ANY (subquery)`, or `op ALL` when `is_any` is unset,
+/// each field compared with the query's column in its position.
+fn row_subquery<D: EvalDialect, C: Context>(
+    state: &mut State<'_, D, C>,
+    fields: &[Expr],
+    op: &BinaryOperator,
+    subquery: &Query,
+    is_any: bool,
+) -> Result<Evaluation, C::Error> {
+    let mut values = Vec::with_capacity(fields.len());
+    for field in fields {
+        values.push(forward(state, field)?);
+    }
+    if values.iter().any(Evaluation::is_impossible) {
+        return Ok(Evaluation::impossible(ScalarType::Boolean));
+    }
+    let qe = state.context.query(subquery, state.guarantees)?;
+    let Some(columns) = qe.columns else {
+        let error = qe.error || values.iter().any(Evaluation::may_raise);
+        let unknown = Values::Unlisted(Unlisted::any());
+        return Ok(Evaluation::new(ScalarType::Boolean, true, error, unknown));
+    };
+    if columns.len() != values.len() {
+        return Ok(Evaluation::raising(ScalarType::Boolean));
+    }
+    let mut row = match op {
+        BinaryOperator::Eq => Outcomes::TRUE,
+        BinaryOperator::NotEq => Outcomes::FALSE,
+        // Ordering rows by their first unequal field pair is left unread.
+        _ => Outcomes::ANY,
+    };
+    let compares_rows = matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    );
+    let mut error = qe.error || !compares_rows;
+    for (value, column) in values.into_iter().zip(columns) {
+        let compared = comparison_evals(state, value, op, column);
+        error |= compared.error;
+        row = match op {
+            BinaryOperator::Eq => support::and_outcomes_set(row, compared.outcomes()),
+            BinaryOperator::NotEq => support::or_outcomes_set(row, compared.outcomes()),
+            _ => row,
+        };
+    }
+    // A quantifier takes one of its rows' outcomes, or its own over no row.
+    let mut o = if qe.rows.one || qe.rows.many { row } else { Outcomes::NONE };
+    if qe.rows.none {
+        o = o.union(if is_any { Outcomes::FALSE } else { Outcomes::TRUE });
+    }
+    Ok(Evaluation::condition(o, error))
 }
 
 /// The forward evaluation of `EXISTS subquery`.
@@ -1730,6 +1816,85 @@ mod tests {
         assert!(read(context, "id IN (SELECT id FROM t)").may_be_true());
         let context = ColumnContext::new().with_column("id", int_col());
         assert!(read(context, "id IN (SELECT id FROM t)").may_be_null());
+    }
+
+    fn int_not_null() -> Evaluation {
+        Evaluation::new(
+            ScalarType::Integer(IntegerType::Integer),
+            false,
+            false,
+            Values::Unlisted(Unlisted::any()),
+        )
+    }
+
+    /// The context of non-`NULL` `o` and `k` beside a query projecting
+    /// `columns` over `rows`.
+    fn row_context(rows: Rows, columns: Vec<Evaluation>) -> ColumnContext {
+        ColumnContext::new()
+            .with_column("o", int_not_null())
+            .with_column("k", int_not_null())
+            .with_query_columns(rows, columns)
+    }
+
+    /// A row compared with a subquery of non-`NULL` columns that never
+    /// raises never raises, and is never `NULL` under equality.
+    #[test]
+    fn a_row_against_a_subquery_compares_field_by_field() {
+        let rows = Rows { none: true, one: true, many: true };
+        for condition in [
+            "(o, k) IN (SELECT * FROM t)",
+            "(o, k) NOT IN (SELECT * FROM t)",
+            "(o, k) = ANY (SELECT * FROM t)",
+            "(o, k) <> ALL (SELECT * FROM t)",
+        ] {
+            let evaluation =
+                read(row_context(rows, vec![int_not_null(), int_not_null()]), condition);
+            assert!(evaluation.may_be_true() && evaluation.may_be_false(), "{condition}");
+            assert!(!evaluation.may_be_null() && !evaluation.may_raise(), "{condition}");
+        }
+        let ordered = read(
+            row_context(rows, vec![int_not_null(), int_not_null()]),
+            "(o, k) < ANY (SELECT * FROM t)",
+        );
+        assert!(!ordered.may_raise());
+    }
+
+    /// A row is equal to a query row when every field pair is, unequal when
+    /// one pair is, and `NULL` otherwise.
+    #[test]
+    fn a_row_against_a_subquery_takes_three_valued_equality() {
+        let context = || row_context(Rows::ONE, vec![int(1), int(2)]);
+        let constant = |sql: &str| read(context(), sql).constant_value().cloned();
+        assert_eq!(constant("(1, 2) IN (SELECT * FROM t)"), Some(PgValue::Boolean(true)));
+        assert_eq!(constant("(1, 3) IN (SELECT * FROM t)"), Some(PgValue::Boolean(false)));
+        assert_eq!(constant("(3, NULL) IN (SELECT * FROM t)"), Some(PgValue::Boolean(false)));
+        assert_eq!(constant("(1, 3) <> ALL (SELECT * FROM t)"), Some(PgValue::Boolean(true)));
+        assert!(read(context(), "(1, NULL) IN (SELECT * FROM t)").is_always_null());
+        assert!(read(context(), "(1, NULL) NOT IN (SELECT * FROM t)").is_always_null());
+    }
+
+    /// An empty query reads `FALSE` to `IN` and `TRUE` to `ALL`.
+    #[test]
+    fn a_row_against_an_empty_subquery_reads_the_quantifier() {
+        let context = || row_context(Rows::NONE, vec![int_not_null(), int_not_null()]);
+        let constant = |sql: &str| read(context(), sql).constant_value().cloned();
+        assert_eq!(constant("(o, k) IN (SELECT * FROM t)"), Some(PgValue::Boolean(false)));
+        assert_eq!(constant("(o, NULL) = ALL (SELECT * FROM t)"), Some(PgValue::Boolean(true)));
+    }
+
+    /// A row and a query of different widths, or a field pair that does not
+    /// compare, raise.
+    #[test]
+    fn a_row_against_a_subquery_raises_on_mismatched_columns() {
+        let raises = |columns: Vec<Evaluation>, sql: &str| {
+            read(row_context(Rows::ONE, columns), sql).always_raises()
+        };
+        assert!(raises(vec![int_not_null()], "(o, k) IN (SELECT * FROM t)"));
+        assert!(raises(vec![int_not_null(); 3], "(o, k) = ANY (SELECT * FROM t)"));
+        assert!(raises(vec![int_not_null(); 2], "o IN (SELECT * FROM t)"));
+        let boolean = Evaluation::known(PgValue::Boolean(true), ScalarType::Boolean);
+        let context = row_context(Rows::ONE, vec![int_not_null(), boolean]);
+        assert!(read(context, "(o, k) IN (SELECT * FROM t)").may_raise());
     }
 
     /// `= ANY` over a row constructor reads the members and the raise.

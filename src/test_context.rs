@@ -53,8 +53,14 @@ impl ColumnContext {
 
     /// The context whose nested query projects `column` over `rows`.
     #[must_use]
-    pub fn with_query(mut self, rows: Rows, column: Evaluation) -> Self {
-        self.query = Some(QueryEvaluation { rows, columns: Some(vec![column]), error: false });
+    pub fn with_query(self, rows: Rows, column: Evaluation) -> Self {
+        self.with_query_columns(rows, vec![column])
+    }
+
+    /// The context whose nested query projects `columns` over `rows`.
+    #[must_use]
+    pub fn with_query_columns(mut self, rows: Rows, columns: Vec<Evaluation>) -> Self {
+        self.query = Some(QueryEvaluation { rows, columns: Some(columns), error: false });
         self
     }
 
