@@ -384,8 +384,8 @@ fn contradicting_comparisons_of_one_pair_are_decided() {
 
 #[test]
 fn an_operand_computed_from_columns_keeps_no_relation() {
-    // `y + z` reads columns, so it is no subject, and a negative `z` makes
-    // the conjunction true.
+    // `y + z` is a subject of its own that nothing relates to `y` or `z`,
+    // and a negative `z` makes the conjunction true.
     assert!(outcomes(integers(), "x < y AND y + z < x").truth);
 }
 
@@ -394,6 +394,86 @@ fn a_check_guarantee_decides_a_later_comparison() {
     let check = restrict(integers(), "x < y", Outcomes::NOT_FALSE);
     assert_eq!(outcomes_under(integers(), "x >= y", &check), Outcomes::FALSE);
     assert_eq!(outcomes_under(integers(), "y > x", &check), Outcomes::TRUE);
+}
+
+/// A strict, non-raising ordinary function returning `returns`, a set of
+/// them when `returns_set`.
+fn routine(volatility: Volatility, returns: ScalarType, returns_set: bool) -> Callee {
+    Callee::new(
+        None,
+        NullInput::Strict,
+        NullResult::AnyInput,
+        volatility,
+        CalleeKind::Normal,
+        returns,
+        returns_set,
+        false,
+        false,
+        0,
+    )
+}
+
+/// A nullable integer `o` and parameter `$1`, the stable functions `g`, a
+/// condition, and `f`, a set of integers, and their volatile counterparts
+/// `v` and `r`.
+fn atoms() -> Ctx {
+    Ctx::with_columns(vec![
+        ("o".into(), column(INTEGER, true)),
+        ("$1".into(), column(INTEGER, true)),
+    ])
+    .with_callee("g", routine(Volatility::Stable, ScalarType::Boolean, false))
+    .with_callee("f", routine(Volatility::Stable, INTEGER, true))
+    .with_callee("v", routine(Volatility::Volatile, ScalarType::Boolean, false))
+    .with_callee("r", routine(Volatility::Volatile, INTEGER, true))
+    .with_callee("random", routine(Volatility::Volatile, ScalarType::Float, false))
+}
+
+#[test]
+fn a_stable_atom_reads_as_it_was_assumed() {
+    for atom in [
+        "g(o)",
+        "o IN (SELECT * FROM f(1))",
+        "(o, 1) IN (SELECT * FROM f(1))",
+        "o = ANY (SELECT * FROM f($1))",
+        "NOT EXISTS (SELECT g(1))",
+    ] {
+        let truth = restrict(atoms(), atom, Outcomes::TRUE);
+        assert_eq!(outcomes_under(atoms(), atom, &truth), Outcomes::TRUE, "{atom}");
+        let negated = format!("NOT ({atom})");
+        assert_eq!(outcomes_under(atoms(), &negated, &truth), Outcomes::FALSE, "{atom}");
+        let falsity = restrict(atoms(), atom, Outcomes::FALSE);
+        assert_eq!(outcomes_under(atoms(), atom, &falsity), Outcomes::FALSE, "{atom}");
+        let known = restrict(atoms(), &format!("({atom}) IS NOT NULL"), Outcomes::TRUE);
+        assert!(!outcomes_under(atoms(), atom, &known).null, "{atom}");
+    }
+    let null = restrict(atoms(), "(SELECT g(1)) IS NULL", Outcomes::TRUE);
+    assert_eq!(outcomes_under(atoms(), "(SELECT g(1)) IS NOT NULL", &null), Outcomes::FALSE);
+}
+
+#[test]
+fn an_atom_that_may_change_between_readings_keeps_nothing_assumed() {
+    for atom in [
+        "random() < 0.5",
+        "v(o)",
+        "g(p)",
+        "o IN (SELECT * FROM r())",
+        "o IN (SELECT o FROM f(1))",
+        "o IN (SELECT * FROM f(1) LIMIT 1)",
+        "o IN (SELECT * FROM t)",
+        "o IN (SELECT * FROM f(1) WITH ORDINALITY)",
+    ] {
+        let truth = restrict(atoms(), atom, Outcomes::TRUE);
+        assert!(outcomes_under(atoms(), atom, &truth).falsity, "{atom}");
+    }
+}
+
+#[test]
+fn an_atom_spelled_alike_in_another_scope_keeps_nothing_assumed() {
+    for atom in ["g(o)", "o IN (SELECT * FROM f(1))", "1 IN (SELECT * FROM f($1))"] {
+        let truth = restrict(atoms(), atom, Outcomes::TRUE);
+        let nested = Ctx { scope: Some("nested".into()), ..atoms() };
+        assert!(outcomes_under(nested, atom, &truth).falsity, "{atom}");
+    }
 }
 
 #[test]

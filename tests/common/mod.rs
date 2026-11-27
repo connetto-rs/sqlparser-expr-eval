@@ -4,7 +4,7 @@
 use sqlparser::{
     ast::{
         ArrayElemTypeDef, DataType, Expr, Function, ObjectName, ObjectNamePart, Query, SelectItem,
-        SetExpr, Statement,
+        SetExpr, Statement, Value, ValueWithSpan,
     },
     dialect::PostgreSqlDialect,
     parser::{Parser, ParserError},
@@ -30,6 +30,10 @@ pub struct Ctx {
     pub query: Option<QueryEvaluation>,
     /// The references the engine may plan as constants.
     pub plan_constants: Vec<String>,
+    /// The scope the columns are read in, which names each reference it
+    /// resolves, as a nested query's column is another one than an outer
+    /// column spelled alike.
+    pub scope: Option<String>,
 }
 
 impl Ctx {
@@ -43,6 +47,7 @@ impl Ctx {
             checks: Vec::new(),
             query: None,
             plan_constants: Vec::new(),
+            scope: None,
         }
     }
 
@@ -78,14 +83,22 @@ impl Context for Ctx {
         let name = match expression {
             Expr::Identifier(ident) => Some(ident.value.clone()),
             Expr::CompoundIdentifier(parts) if parts.len() == 1 => Some(parts[0].value.clone()),
+            Expr::Value(ValueWithSpan { value: Value::Placeholder(name), .. }) => {
+                Some(name.clone())
+            }
             _ => None,
         };
         let Some(name) = name else {
             return Ok(None);
         };
-        Ok(self.columns.iter().find(|(key, _)| *key == name).map(|(_, evaluation)| {
-            Resolved { reference: name.clone(), evaluation: evaluation.clone() }
-        }))
+        let Some((_, evaluation)) = self.columns.iter().find(|(key, _)| *key == name) else {
+            return Ok(None);
+        };
+        let reference = match &self.scope {
+            Some(scope) => format!("{scope}.{name}"),
+            None => name,
+        };
+        Ok(Some(Resolved { reference, evaluation: evaluation.clone() }))
     }
 
     fn callees(&mut self, call: &Function) -> Result<Vec<Callee>, Self::Error> {

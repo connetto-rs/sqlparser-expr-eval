@@ -1,17 +1,19 @@
 //! Helpers shared by the forward and the backward evaluation passes.
 
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
-use core::ops::Bound;
+use core::ops::{Bound, ControlFlow};
 
 use sql_values::postgres::{PgArray, PgNumeric, PgValue};
 use sqlparser::ast::{
-    BinaryOperator, CastKind, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    InTarget, ObjectName, Value, ValueWithSpan,
+    BinaryOperator, CastKind, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, InTarget, ObjectName, Query, SetExpr, Statement, TableFactor,
+    TableFunctionArgs, Value, ValueWithSpan, Visit, Visitor,
 };
 
 use super::{
     context::{Callee, CalleeKind, Context, Resolved, Volatility},
     domain::{Evaluation, Interval, Outcomes, Values},
+    forward::DEPTH_LIMIT,
     guarantees::Subject,
     scalar::ScalarType,
 };
@@ -41,11 +43,13 @@ pub(crate) fn resolve_reference<C: Context>(
 /// context to resolve a reference, `None` when no guarantee may be keyed
 /// under it.
 ///
-/// An expression other than a reference is a subject only when every
-/// evaluation in one statement gives it one value, which a [`fixed`]
-/// expression over immutable or stable functions does. Two calls of
-/// `random()` differ, and a column named alike in a subquery may be another
-/// column.
+/// An expression other than a reference is a subject when it takes one
+/// value on a row of one statement. Its calls are ordinary functions no
+/// more volatile than stable, the names it reads outside its subqueries
+/// resolve through the context, and its subqueries read no outer column.
+/// Two calls of `random()` differ. The subject holds the references the
+/// names resolve to, so an expression spelled alike in a nested query,
+/// where a name may read another column, is another subject.
 pub(crate) fn subject<C: Context>(
     context: &mut C,
     expression: &Expr,
@@ -54,24 +58,234 @@ pub(crate) fn subject<C: Context>(
     if let Some(resolved) = resolve_reference(context, expression)? {
         return Ok(Some(Subject::Reference(resolved.reference)));
     }
-    let fixed = fixed(context, expression, Volatility::Stable)?;
-    Ok(fixed.then(|| Subject::Expression(expression.clone())))
+    let mut references = Vec::new();
+    let mut stack = vec![(expression, 0)];
+    while let Some((node, depth)) = stack.pop() {
+        // A subject is copied and compared by recursion, so one deeper than
+        // the passes read is none.
+        if depth >= DEPTH_LIMIT {
+            return Ok(None);
+        }
+        let mut operands = Deeper { stack: &mut stack, depth: depth + 1 };
+        if !stable_node(context, node, Some(depth), &mut operands, &mut references)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(Subject::Expression { expression: expression.clone(), references }))
+}
+
+/// Whether `node` keeps the expression it stands in one value on a row of
+/// one statement as [`subject`] reads it, extending `operands` with the
+/// operands that must as well and `references` with what its name resolves
+/// to. `depth` is how deep `node` stands in the subject, `None` in a
+/// subquery, whose own relations may hold a column of any name, so it
+/// names none, and whose nested queries the caller walks itself.
+fn stable_node<'a, C: Context>(
+    context: &mut C,
+    node: &'a Expr,
+    depth: Option<u32>,
+    operands: &mut impl Extend<&'a Expr>,
+    references: &mut Vec<C::Reference>,
+) -> Result<bool, C::Error> {
+    if is_reference(node) {
+        // A positional parameter is no column, so a subquery never hides
+        // one, and one the context leaves unbound holds one value per
+        // statement.
+        let parameter = matches!(node, Expr::Value(_));
+        if depth.is_none() && !parameter {
+            return Ok(false);
+        }
+        return Ok(match context.reference(node)? {
+            Some(resolved) => {
+                references.push(resolved.reference);
+                true
+            }
+            None => parameter,
+        });
+    }
+    let query = |context: &mut C, subquery: &Query, references: &mut Vec<C::Reference>| {
+        depth.map_or(Ok(true), |depth| stable_query(context, subquery, depth, references))
+    };
+    Ok(match node {
+        Expr::Function(call) => {
+            push_call_arguments(context, operands, call, |callee| {
+                callee.volatility <= Volatility::Stable
+            })?
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            query(context, subquery, references)?
+        }
+        Expr::In { expr, target: InTarget::Subquery(subquery), .. } => {
+            operands.extend([&**expr]);
+            query(context, subquery, references)?
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            operands.extend([&**left, &**right]);
+            true
+        }
+        _ => push_operands(operands, node),
+    })
+}
+
+/// The stack of the walk of [`subject`], taking operands one level below
+/// the node that extends it.
+struct Deeper<'s, 'a> {
+    stack: &'s mut Vec<(&'a Expr, u32)>,
+    depth: u32,
+}
+
+impl<'a> Extend<&'a Expr> for Deeper<'_, 'a> {
+    fn extend<I: IntoIterator<Item = &'a Expr>>(&mut self, operands: I) {
+        let depth = self.depth;
+        self.stack.extend(operands.into_iter().map(|operand| (operand, depth)));
+    }
+}
+
+/// Whether two readings of `query` in one statement return the same rows.
+/// The query names no column, since any may be an outer one, reads no table
+/// or view, since a view may run a volatile function, and takes no rows by
+/// an order that may change between two scans. Each node holds what
+/// [`stable_node`] asks of a nested one, and `references` gains what its
+/// parameters resolve to. The query stands `depth` deep in the subject.
+fn stable_query<C: Context>(
+    context: &mut C,
+    query: &Query,
+    depth: u32,
+    references: &mut Vec<C::Reference>,
+) -> Result<bool, C::Error> {
+    match query.visit(&mut StableQuery { context, references, depth }) {
+        ControlFlow::Continue(()) => Ok(true),
+        ControlFlow::Break(None) => Ok(false),
+        ControlFlow::Break(Some(error)) => Err(error),
+    }
+}
+
+/// The walk of [`stable_query`], breaking with `None` at the first part
+/// that may differ between two readings and with the context's error.
+struct StableQuery<'a, C: Context> {
+    context: &'a mut C,
+    references: &'a mut Vec<C::Reference>,
+    /// How deep the walk stands in the subject.
+    depth: u32,
+}
+
+impl<C: Context> StableQuery<'_, C> {
+    /// Continues when `stable` holds, breaking as [`StableQuery`] does.
+    fn proceed(stable: Result<bool, C::Error>) -> ControlFlow<Option<C::Error>> {
+        match stable {
+            Ok(true) => ControlFlow::Continue(()),
+            Ok(false) => ControlFlow::Break(None),
+            Err(error) => ControlFlow::Break(Some(error)),
+        }
+    }
+
+    /// Steps one level deeper, breaking past the depth [`subject`] reads.
+    fn descend(&mut self) -> ControlFlow<Option<C::Error>> {
+        self.depth += 1;
+        Self::proceed(Ok(self.depth < DEPTH_LIMIT))
+    }
+
+    /// Whether the set-returning call of `name` over `args` in a `FROM`
+    /// list reaches only ordinary functions no more volatile than stable.
+    fn stable_call(&mut self, name: &ObjectName, args: &[FunctionArg]) -> Result<bool, C::Error> {
+        let call = Function {
+            name: name.clone(),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: args.to_vec(),
+                clauses: Vec::new(),
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: Vec::new(),
+        };
+        push_call_arguments(self.context, &mut Discard, &call, |callee| {
+            callee.volatility <= Volatility::Stable
+        })
+    }
+}
+
+impl<C: Context> Visitor for StableQuery<'_, C> {
+    type Break = Option<C::Error>;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        self.descend()?;
+        let unordered = query.limit_clause.is_none() && query.fetch.is_none();
+        let plain = query.for_clause.is_none()
+            && query.settings.is_none()
+            && query.format_clause.is_none()
+            && query.pipe_operators.is_empty();
+        Self::proceed(Ok(unordered && plain && !reads_table(&query.body)))
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<Self::Break> {
+        // A data-modifying statement runs once per reading.
+        ControlFlow::Break(None)
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        Self::proceed(match factor {
+            TableFactor::Table {
+                name,
+                args: Some(TableFunctionArgs { args, settings: None }),
+                version: None,
+                with_ordinality: false,
+                sample: None,
+                ..
+            }
+            | TableFactor::Function { name, args, with_ordinality: false, .. } => {
+                self.stable_call(name, args)
+            }
+            TableFactor::Derived { sample: None, .. }
+            | TableFactor::NestedJoin { .. }
+            | TableFactor::TableFunction { .. }
+            | TableFactor::UNNEST { .. } => Ok(true),
+            _ => Ok(false),
+        })
+    }
+
+    fn pre_visit_expr(&mut self, node: &Expr) -> ControlFlow<Self::Break> {
+        self.descend()?;
+        Self::proceed(stable_node(self.context, node, None, &mut Discard, self.references))
+    }
+
+    fn post_visit_expr(&mut self, _node: &Expr) -> ControlFlow<Self::Break> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether `body` reads a table through `TABLE name` outside its nested
+/// queries.
+fn reads_table(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Table(_) => true,
+        SetExpr::SetOperation { left, right, .. } => reads_table(left) || reads_table(right),
+        _ => false,
+    }
+}
+
+/// A sink dropping the operands a check extends it with, for a walk that
+/// visits them itself.
+struct Discard;
+
+impl<T> Extend<T> for Discard {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, _items: I) {}
 }
 
 /// Whether `expression` is built from literals, operators, casts,
 /// collations, `CASE`, lists and calls of ordinary functions no more volatile
-/// than `most_volatile` alone, so it reads no column and holds no subquery.
+/// than `most_volatile` alone, so it reads no column and holds no subquery,
+/// with no node `excluded` answers `true` for.
 pub(crate) fn fixed<C: Context>(
-    context: &mut C,
-    expression: &Expr,
-    most_volatile: Volatility,
-) -> Result<bool, C::Error> {
-    fixed_unless(context, expression, most_volatile, |_, _| Ok(false))
-}
-
-/// Whether `expression` is [`fixed`] with no node `excluded` answers `true`
-/// for.
-pub(crate) fn fixed_unless<C: Context>(
     context: &mut C,
     expression: &Expr,
     most_volatile: Volatility,
@@ -102,7 +316,7 @@ pub(crate) fn fixed_unless<C: Context>(
 /// Pushes the operands of `node` when it is a literal, or an operator, a
 /// cast, a collation, a test, a list or a `CASE` over operands, answering
 /// `false` for any other node.
-pub(crate) fn push_operands<'a>(stack: &mut Vec<&'a Expr>, node: &'a Expr) -> bool {
+pub(crate) fn push_operands<'a>(stack: &mut impl Extend<&'a Expr>, node: &'a Expr) -> bool {
     match node {
         Expr::Value(_) | Expr::TypedString(_) => {}
         Expr::Nested(value)
@@ -116,13 +330,13 @@ pub(crate) fn push_operands<'a>(stack: &mut Vec<&'a Expr>, node: &'a Expr) -> bo
         | Expr::IsFalse(value)
         | Expr::IsNotFalse(value)
         | Expr::IsUnknown(value)
-        | Expr::IsNotUnknown(value) => stack.push(value),
+        | Expr::IsNotUnknown(value) => stack.extend([&**value]),
         Expr::BinaryOp { left, right, .. }
         | Expr::IsDistinctFrom(left, right)
         | Expr::IsNotDistinctFrom(left, right) => stack.extend([&**left, &**right]),
         Expr::Between { expr, low, high, .. } => stack.extend([&**expr, &**low, &**high]),
         Expr::In { expr, target: InTarget::List(list), .. } => {
-            stack.push(expr);
+            stack.extend([&**expr]);
             stack.extend(list);
         }
         Expr::Tuple(values) => stack.extend(values),
@@ -156,7 +370,7 @@ pub(crate) fn push_unfolded_call<'a, C: Context>(
 /// it was otherwise.
 fn push_call_arguments<'a, C: Context>(
     context: &mut C,
-    stack: &mut Vec<&'a Expr>,
+    stack: &mut impl Extend<&'a Expr>,
     call: &'a Function,
     admits: impl Fn(&Callee) -> bool,
 ) -> Result<bool, C::Error> {
@@ -173,22 +387,15 @@ fn push_call_arguments<'a, C: Context>(
         || call.filter.is_some()
         || !call.within_group.is_empty()
         || !matches!(call.parameters, FunctionArguments::None)
+        || arguments.iter().any(|argument| argument_expression(argument).is_none())
     {
         return Ok(false);
-    }
-    let height = stack.len();
-    for argument in arguments {
-        let Some(value) = argument_expression(argument) else {
-            stack.truncate(height);
-            return Ok(false);
-        };
-        stack.push(value);
     }
     let callees = context.callees(call)?;
     let admitted = !callees.is_empty()
         && callees.iter().all(|callee| callee.kind == CalleeKind::Normal && admits(callee));
-    if !admitted {
-        stack.truncate(height);
+    if admitted {
+        stack.extend(arguments.iter().filter_map(argument_expression));
     }
     Ok(admitted)
 }
@@ -634,24 +841,29 @@ mod tests {
         assert!(is_reference(&parse("$1")));
         assert!(matches!(
             subject(&mut context, &parse("$1")).expect("resolves"),
-            Some(Subject::Expression(_))
+            Some(Subject::Expression { .. })
         ));
         assert!(!is_reference(&parse("1 + 2")));
     }
 
     #[test]
-    fn a_stable_expression_is_a_subject_and_a_column_is_not() {
+    fn a_stable_expression_is_a_subject_holding_the_columns_it_reads() {
         let text = ScalarType::Text(TextRules::DEFAULT);
         let mut context = ColumnContext::new().with_callee("upper", strict_callee(text.clone()));
         // a call of a stable function over constants reads no column
         assert!(matches!(
             subject(&mut context, &parse("upper('a') + 1")).expect("resolves"),
-            Some(Subject::Expression(_))
+            Some(Subject::Expression { references, .. }) if references.is_empty()
         ));
-        // the same shape that reads a column is no subject at all
+        // the same shape reading a column holds the column it resolves to
         let mut context = context
             .with_column("x", Evaluation::known(PgValue::Text("a".to_string()), text.clone()));
-        assert!(subject(&mut context, &parse("upper(x)")).expect("resolves").is_none());
+        assert!(matches!(
+            subject(&mut context, &parse("upper(x) || x")).expect("resolves"),
+            Some(Subject::Expression { references, .. }) if references == ["x", "x"]
+        ));
+        // a name the context cannot resolve may read any column
+        assert!(subject(&mut context, &parse("upper(y)")).expect("resolves").is_none());
         // a volatile callee changes between two evaluations of one statement
         let mut context = ColumnContext::new().with_callee("random", volatile_callee());
         assert!(subject(&mut context, &parse("random()")).expect("resolves").is_none());
@@ -664,12 +876,14 @@ mod tests {
         // a callee the context cannot read is no subject
         let mut context = ColumnContext::new();
         assert!(subject(&mut context, &parse("nosuch('a')")).expect("resolves").is_none());
-        // a subquery names another query's columns
-        assert!(subject(&mut context, &parse("EXISTS (SELECT 1)")).expect("resolves").is_none());
+        // a subquery naming a column may read an outer one
+        assert!(subject(&mut context, &parse("EXISTS (SELECT x)")).expect("resolves").is_none());
         let mut context = FailingCallees;
         // a reference the context cannot name is still no expression subject
         assert!(subject(&mut context, &parse("x")).expect("resolves").is_none());
         assert!(subject(&mut context, &parse("nosuch('a')")).is_err());
+        // a failing lookup inside a subquery fails the walk too
+        assert!(subject(&mut context, &parse("EXISTS (SELECT nosuch('a'))")).is_err());
     }
 
     #[test]
@@ -700,16 +914,23 @@ mod tests {
             "CASE WHEN true THEN 'a' END",
             "now()",
             "upper(arg => 'a')",
+            "1 IN (SELECT 1)",
+            "(SELECT upper('a'))",
+            "1 = ANY (SELECT * FROM now() UNION SELECT 2)",
+            "1 IN (SELECT * FROM (SELECT 1) AS d)",
         ] {
             assert!(
-                matches!(subject(&mut context, &parse(sql)), Ok(Some(Subject::Expression(_)))),
+                matches!(subject(&mut context, &parse(sql)), Ok(Some(Subject::Expression { .. }))),
                 "{sql}"
             );
         }
         // every refusal is a shape that may differ between rows or evaluations
         for sql in [
-            "1 IN (SELECT 1)",
-            "(SELECT 1)",
+            "1 IN (SELECT 1 LIMIT 1)",
+            "(SELECT * FROM t)",
+            "EXISTS (TABLE t)",
+            "EXISTS (SELECT * FROM now() WITH ORDINALITY)",
+            "EXISTS (WITH d AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT 1)",
             "upper('a') FILTER (WHERE true)",
             "upper(DISTINCT 'a')",
             "upper('a' ORDER BY 1)",
@@ -731,7 +952,8 @@ mod tests {
                 &parse("((1 + 2))")
             )
             .expect("resolves"),
-            Some(Subject::Expression(expr)) if matches!(&unnest(&expr), Expr::BinaryOp { .. })
+            Some(Subject::Expression { expression, .. })
+                if matches!(&unnest(&expression), Expr::BinaryOp { .. })
         ));
     }
 

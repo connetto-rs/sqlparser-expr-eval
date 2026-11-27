@@ -25,7 +25,13 @@ pub enum Subject<R> {
     Reference(R),
     /// Any other expression, matched as written, such as a call reading a
     /// session setting.
-    Expression(Expr),
+    Expression {
+        /// The expression as written.
+        expression: Expr,
+        /// What the names the expression reads resolve to, in the order a
+        /// walk of it meets them.
+        references: Vec<R>,
+    },
 }
 
 impl<R: Ord> Ord for Subject<R> {
@@ -34,9 +40,12 @@ impl<R: Ord> Ord for Subject<R> {
         literal(self).cmp(&literal(other)).then_with(|| {
             match (self, other) {
                 (Self::Reference(left), Self::Reference(right)) => left.cmp(right),
-                (Self::Reference(_), Self::Expression(_)) => Ordering::Less,
-                (Self::Expression(_), Self::Reference(_)) => Ordering::Greater,
-                (Self::Expression(left), Self::Expression(right)) => left.cmp(right),
+                (Self::Reference(_), Self::Expression { .. }) => Ordering::Less,
+                (Self::Expression { .. }, Self::Reference(_)) => Ordering::Greater,
+                (
+                    Self::Expression { expression: left, references: left_references },
+                    Self::Expression { expression: right, references: right_references },
+                ) => left.cmp(right).then_with(|| left_references.cmp(right_references)),
             }
         })
     }
@@ -56,7 +65,8 @@ impl<R: Ord> PartialOrd for Subject<R> {
 pub struct Guarantees<R> {
     impossible: bool,
     references: Map<R, Evaluation>,
-    expressions: Map<Expr, Evaluation>,
+    /// Per expression, the guarantee about each resolution of its names.
+    expressions: Map<Expr, Map<Vec<R>, Evaluation>>,
     /// Per order, the relation of each subject to each other one, kept in
     /// both directions so the neighbours of a subject read in one lookup.
     /// Each network is closed under composition through every subject that
@@ -461,11 +471,16 @@ impl<R: Ord + Clone> Guarantees<R> {
             .iter()
             .filter(|(_, evaluation)| evaluation.values().is_empty())
             .map(|(reference, _)| Subject::Reference(reference.clone()));
-        let expressions = self
-            .expressions
-            .iter()
-            .filter(|(_, evaluation)| evaluation.values().is_empty())
-            .map(|(expression, _)| Subject::Expression(expression.clone()));
+        let expressions = self.expressions.iter().flat_map(|(expression, keyed)| {
+            keyed.iter().filter(|(_, evaluation)| evaluation.values().is_empty()).map(
+                |(references, _)| {
+                    Subject::Expression {
+                        expression: expression.clone(),
+                        references: references.clone(),
+                    }
+                },
+            )
+        });
         references.chain(expressions)
     }
 
@@ -474,7 +489,9 @@ impl<R: Ord + Clone> Guarantees<R> {
     pub fn get(&self, subject: &Subject<R>) -> Option<&Evaluation> {
         match subject {
             Subject::Reference(reference) => self.references.get(reference),
-            Subject::Expression(expression) => self.expressions.get(expression),
+            Subject::Expression { expression, references } => {
+                self.expression(expression, references)
+            }
         }
     }
 
@@ -484,10 +501,17 @@ impl<R: Ord + Clone> Guarantees<R> {
         self.references.get(reference)
     }
 
-    /// The guarantee about the expression `expression`, matched as written.
+    /// The guarantee about the expression `expression`, matched as written,
+    /// whose names resolve to `references`.
     #[must_use]
-    pub fn expression(&self, expression: &Expr) -> Option<&Evaluation> {
-        self.expressions.get(expression)
+    pub fn expression(&self, expression: &Expr, references: &[R]) -> Option<&Evaluation> {
+        self.expressions.get(expression)?.get(references)
+    }
+
+    /// Whether some guarantee is about `expression` as written, under any
+    /// resolution of its names.
+    pub(crate) fn names_expression(&self, expression: &Expr) -> bool {
+        self.expressions.contains_key(expression)
     }
 
     /// Every guarantee about a reference.
@@ -495,9 +519,13 @@ impl<R: Ord + Clone> Guarantees<R> {
         self.references.iter()
     }
 
-    /// Every guarantee about an expression.
-    pub fn expressions(&self) -> impl Iterator<Item = (&Expr, &Evaluation)> {
-        self.expressions.iter()
+    /// Every guarantee about an expression, with what its names resolve to.
+    pub fn expressions(&self) -> impl Iterator<Item = (&Expr, &[R], &Evaluation)> {
+        self.expressions.iter().flat_map(|(expression, keyed)| {
+            keyed.iter().map(move |(references, evaluation)| {
+                (expression, references.as_slice(), evaluation)
+            })
+        })
     }
 
     /// Narrows `subject` to the outcomes `evaluation` allows as well.
@@ -525,8 +553,13 @@ impl<R: Ord + Clone> Guarantees<R> {
             Subject::Reference(reference) => {
                 self.references.insert_mut(reference, narrowed);
             }
-            Subject::Expression(expression) => {
-                self.expressions.insert_mut(expression, narrowed);
+            Subject::Expression { expression, references } => {
+                if let Some(keyed) = self.expressions.get_mut(&expression) {
+                    keyed.insert_mut(references, narrowed);
+                } else {
+                    let keyed = Map::new_sync().insert(references, narrowed);
+                    self.expressions.insert_mut(expression, keyed);
+                }
             }
         }
         let Some(subject) = follow else {
@@ -556,8 +589,12 @@ impl<R: Ord + Clone> Guarantees<R> {
         for (reference, evaluation) in &other.references {
             met.restrict(Subject::Reference(reference.clone()), evaluation.clone());
         }
-        for (expression, evaluation) in &other.expressions {
-            met.restrict(Subject::Expression(expression.clone()), evaluation.clone());
+        for (expression, references, evaluation) in other.expressions() {
+            let subject = Subject::Expression {
+                expression: expression.clone(),
+                references: references.to_vec(),
+            };
+            met.restrict(subject, evaluation.clone());
         }
         for (order, network) in &other.relations {
             for (left, row) in network {
@@ -599,11 +636,16 @@ impl<R: Ord + Clone> Guarantees<R> {
             expressions: self
                 .expressions
                 .iter()
-                .filter_map(|(expression, evaluation)| {
-                    other
-                        .expressions
-                        .get(expression)
-                        .map(|theirs| (expression.clone(), evaluation.join(theirs)))
+                .filter_map(|(expression, ours)| {
+                    let theirs = other.expressions.get(expression)?;
+                    let joined: Map<_, _> = ours
+                        .iter()
+                        .filter_map(|(references, evaluation)| {
+                            let theirs = theirs.get(references)?;
+                            Some((references.clone(), evaluation.join(theirs)))
+                        })
+                        .collect();
+                    (!joined.is_empty()).then(|| (expression.clone(), joined))
                 })
                 .collect(),
             ..Self::new()
@@ -668,6 +710,21 @@ impl<R: Ord + Clone> Guarantees<R> {
         joined
     }
 
+    /// Every subject the guarantees hold an evaluation of.
+    pub(crate) fn evaluated(&self) -> impl Iterator<Item = Subject<R>> + '_ {
+        let references =
+            self.references.keys().map(|reference| Subject::Reference(reference.clone()));
+        let expressions = self.expressions.iter().flat_map(|(expression, keyed)| {
+            keyed.keys().map(|references| {
+                Subject::Expression {
+                    expression: expression.clone(),
+                    references: references.clone(),
+                }
+            })
+        });
+        references.chain(expressions)
+    }
+
     /// Forgets every subject `keep` refuses, with its evaluation, relations
     /// and pairs held apart, keeping what held among the kept subjects.
     ///
@@ -677,11 +734,7 @@ impl<R: Ord + Clone> Guarantees<R> {
             return;
         }
         let mut forgotten = Vec::new();
-        let evaluated =
-            self.references.keys().map(|reference| Subject::Reference(reference.clone())).chain(
-                self.expressions.keys().map(|expression| Subject::Expression(expression.clone())),
-            );
-        forgotten.extend(evaluated.filter(|subject| !keep(subject)));
+        forgotten.extend(self.evaluated().filter(|subject| !keep(subject)));
         let mut unevaluated: Vec<_> = self
             .relations
             .values()
@@ -697,9 +750,18 @@ impl<R: Ord + Clone> Guarantees<R> {
         }
         for subject in &forgotten {
             match subject {
-                Subject::Reference(reference) => self.references.remove_mut(reference),
-                Subject::Expression(expression) => self.expressions.remove_mut(expression),
-            };
+                Subject::Reference(reference) => {
+                    self.references.remove_mut(reference);
+                }
+                Subject::Expression { expression, references } => {
+                    if let Some(keyed) = self.expressions.get_mut(expression) {
+                        keyed.remove_mut(references);
+                        if keyed.is_empty() {
+                            self.expressions.remove_mut(expression);
+                        }
+                    }
+                }
+            }
             isolate(&mut self.apart, subject);
         }
         self.relations = self
@@ -754,7 +816,7 @@ impl<R: Ord + Clone> Guarantees<R> {
 /// Whether `subject` is a literal. Composition never relates two literals,
 /// which stand in the order their values decide.
 fn literal<R>(subject: &Subject<R>) -> bool {
-    matches!(subject, Subject::Expression(Expr::Value(_)))
+    matches!(subject, Subject::Expression { expression: Expr::Value(_), .. })
 }
 
 /// The subjects `row` relates to, without the literals when `plain`, which
@@ -845,6 +907,15 @@ mod tests {
 
     fn ref_subject(name: &str) -> Subject<String> {
         Subject::Reference(name.to_string())
+    }
+
+    /// The expression subject of the identifier `name` read as written,
+    /// resolving no name.
+    fn written(name: &str) -> Subject<String> {
+        Subject::Expression {
+            expression: Expr::Identifier(Ident::new(name)),
+            references: Vec::new(),
+        }
     }
 
     fn int4_known(value: i64) -> Evaluation {
@@ -1216,7 +1287,7 @@ mod tests {
 
     #[test]
     fn retain_forgets_a_written_subject_and_keeps_what_it_implied() {
-        let now = Subject::Expression(Expr::Identifier(Ident::new("now")));
+        let now = written("now");
         let (x, y, z) = (ref_subject("x"), ref_subject("y"), ref_subject("z"));
         let mut guarantees = integers(&["x", "y", "z"], &[]);
         guarantees.restrict(now.clone(), int4_known(3));
@@ -1236,6 +1307,30 @@ mod tests {
         let mut impossible = Guarantees::<String>::impossible();
         impossible.retain(|_| false);
         assert!(impossible.is_impossible());
+    }
+
+    #[test]
+    fn retain_forgets_one_resolution_of_an_expression_and_keeps_the_other() {
+        let read = |column: &str| {
+            Subject::Expression {
+                expression: Expr::Identifier(Ident::new("g")),
+                references: vec![column.to_string()],
+            }
+        };
+        let mut guarantees = Guarantees::<String>::new();
+        guarantees.restrict(read("outer.o"), int4_known(1));
+        guarantees.restrict(read("nested.o"), int4_known(2));
+        guarantees.retain(|subject| *subject != read("nested.o"));
+        assert_eq!(guarantees.get(&read("outer.o")), Some(&int4_known(1)));
+        assert_eq!(guarantees.get(&read("nested.o")), None);
+        // An expression only a relation names is forgotten with it.
+        let lone = Subject::Expression {
+            expression: Expr::Identifier(Ident::new("h")),
+            references: Vec::new(),
+        };
+        guarantees.relate(Order::Number, &lone, &read("outer.o"), Relation::LESS);
+        guarantees.retain(|_| false);
+        assert!(guarantees.is_empty());
     }
 
     #[test]
@@ -1376,7 +1471,7 @@ mod tests {
         let mut guarantees = Guarantees::<String>::new();
         guarantees.restrict(ref_subject("x"), int4_known(1));
         guarantees.restrict(
-            Subject::Expression(Expr::Identifier(Ident::new("f"))),
+            written("f"),
             Evaluation::known(
                 PgValue::Text(alloc::string::String::from("a")),
                 ScalarType::Text(TextRules::DEFAULT),
@@ -1386,13 +1481,16 @@ mod tests {
         assert_eq!(guarantees.reference(&"y".to_string()), None);
         assert_eq!(guarantees.get(&Subject::Reference("x".to_string())), Some(&int4_known(1)));
         assert_eq!(
-            guarantees.expression(&Expr::Identifier(Ident::new("f"))),
+            guarantees.expression(&Expr::Identifier(Ident::new("f")), &[]),
             Some(&Evaluation::known(
                 PgValue::Text(alloc::string::String::from("a")),
                 ScalarType::Text(TextRules::DEFAULT)
             ))
         );
-        assert_eq!(guarantees.expression(&Expr::Identifier(Ident::new("g"))), None);
+        assert_eq!(guarantees.expression(&Expr::Identifier(Ident::new("g")), &[]), None);
+        // The same expression whose names resolve otherwise is another subject
+        let elsewhere = ["x".to_string()];
+        assert_eq!(guarantees.expression(&Expr::Identifier(Ident::new("f")), &elsewhere), None);
         // The iterators list every stored subject
         assert_eq!(
             guarantees.references().map(|(reference, _)| reference.as_str()).collect::<Vec<_>>(),
@@ -1443,11 +1541,11 @@ mod tests {
         left.restrict(ref_subject("x"), int4_known(1));
         let mut right = Guarantees::<String>::new();
         right.restrict(ref_subject("y"), int4_known(2));
-        right.restrict(Subject::Expression(Expr::Identifier(Ident::new("f"))), int4_known(3));
+        right.restrict(written("f"), int4_known(3));
         let met = left.meet(&right);
         assert_eq!(met.reference(&"x".to_string()), Some(&int4_known(1)));
         assert_eq!(met.reference(&"y".to_string()), Some(&int4_known(2)));
-        assert_eq!(met.expression(&Expr::Identifier(Ident::new("f"))), Some(&int4_known(3)));
+        assert_eq!(met.expression(&Expr::Identifier(Ident::new("f")), &[]), Some(&int4_known(3)));
         // An impossible side meets to impossible
         assert!(left.meet(&Guarantees::impossible()).is_impossible());
         assert!(Guarantees::<String>::impossible().meet(&left).is_impossible());
@@ -1458,16 +1556,19 @@ mod tests {
         let mut left = Guarantees::<String>::new();
         left.restrict(ref_subject("x"), int4_known(1));
         left.restrict(ref_subject("left_only"), int4_known(4));
-        left.restrict(Subject::Expression(Expr::Identifier(Ident::new("f"))), int4_known(5));
+        left.restrict(written("f"), int4_known(5));
         let mut right = Guarantees::<String>::new();
         right.restrict(ref_subject("x"), int4_known(1));
         right.restrict(ref_subject("right_only"), int4_known(6));
-        right.restrict(Subject::Expression(Expr::Identifier(Ident::new("f"))), int4_known(5));
+        right.restrict(written("f"), int4_known(5));
         let joined = left.join(&right);
         assert_eq!(joined.reference(&"x".to_string()), Some(&int4_known(1)));
         assert_eq!(joined.reference(&"left_only".to_string()), None);
         assert_eq!(joined.reference(&"right_only".to_string()), None);
-        assert_eq!(joined.expression(&Expr::Identifier(Ident::new("f"))), Some(&int4_known(5)));
+        assert_eq!(
+            joined.expression(&Expr::Identifier(Ident::new("f")), &[]),
+            Some(&int4_known(5))
+        );
         // An impossible side joins to the other side
         let mut other = Guarantees::<String>::new();
         other.restrict(ref_subject("y"), int4_known(7));

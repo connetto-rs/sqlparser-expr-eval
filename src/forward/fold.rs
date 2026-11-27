@@ -697,12 +697,7 @@ impl Planned {
 /// it does a [`support::fixed`] expression over immutable functions with no
 /// cast whose checks run at run time.
 fn planner_constant<C: Context>(context: &mut C, expression: &Expr) -> Result<bool, C::Error> {
-    support::fixed_unless(
-        context,
-        expression,
-        Volatility::Immutable,
-        super::literals::checks_at_run_time,
-    )
+    support::fixed(context, expression, Volatility::Immutable, super::literals::checks_at_run_time)
 }
 
 /// Whether a strict operator over `left` and `right`, both with an outcome,
