@@ -526,19 +526,13 @@ fn disjunctive_side<R: Ord + Clone>(
     let non_impossible = branch_impossible.iter().filter(|&&impossible| !impossible).count();
     let mut readers: BTreeMap<Subject<R>, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (i, guarantees) in sides.iter().enumerate() {
-        for (reference, _) in guarantees.references() {
-            readers.entry(Subject::Reference(reference.clone())).or_default().0.push(i);
-        }
-        for (expression, _) in guarantees.expressions() {
-            readers.entry(Subject::Expression(expression.clone())).or_default().0.push(i);
+        for subject in guarantees.evaluated() {
+            readers.entry(subject).or_default().0.push(i);
         }
     }
     for (i, guarantees) in distributed.iter().enumerate() {
-        for (reference, _) in guarantees.references() {
-            readers.entry(Subject::Reference(reference.clone())).or_default().1.push(i);
-        }
-        for (expression, _) in guarantees.expressions() {
-            readers.entry(Subject::Expression(expression.clone())).or_default().1.push(i);
+        for subject in guarantees.evaluated() {
+            readers.entry(subject).or_default().1.push(i);
         }
     }
     readers.iter().fold(
@@ -4818,7 +4812,7 @@ mod tests {
             &parse("f(1) IS NULL"),
             Outcomes::TRUE,
         );
-        let call = guarantees.expression(&parse("f(1)")).expect("the call is guaranteed");
+        let call = guarantees.expression(&parse("f(1)"), &[]).expect("the call is guaranteed");
         assert!(call.is_always_null());
         // A `NULL` equality with a strict call side reads the call as
         // `NULL`, or the other side as `NULL`.

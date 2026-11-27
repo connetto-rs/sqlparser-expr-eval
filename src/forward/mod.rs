@@ -103,8 +103,18 @@ fn forward<D: EvalDialect, C: Context>(
         state.depth -= 1;
         evaluation
     };
-    Ok(match state.guarantees.expression(expression) {
-        Some(guarantee) => evaluation.meet(guarantee),
+    // Only an expression some guarantee is about pays for resolving the
+    // names that key it.
+    if !state.guarantees.names_expression(expression) {
+        return Ok(evaluation);
+    }
+    Ok(match support::subject(state.context, expression)? {
+        Some(subject) => {
+            match state.guarantees.get(&subject) {
+                Some(guarantee) => evaluation.meet(guarantee),
+                None => evaluation,
+            }
+        }
         None => evaluation,
     })
 }
