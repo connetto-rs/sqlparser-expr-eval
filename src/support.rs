@@ -882,6 +882,8 @@ mod tests {
         // a reference the context cannot name is still no expression subject
         assert!(subject(&mut context, &parse("x")).expect("resolves").is_none());
         assert!(subject(&mut context, &parse("nosuch('a')")).is_err());
+        // a failing lookup inside a subquery fails the walk too
+        assert!(subject(&mut context, &parse("EXISTS (SELECT nosuch('a'))")).is_err());
     }
 
     #[test]
@@ -915,6 +917,7 @@ mod tests {
             "1 IN (SELECT 1)",
             "(SELECT upper('a'))",
             "1 = ANY (SELECT * FROM now() UNION SELECT 2)",
+            "1 IN (SELECT * FROM (SELECT 1) AS d)",
         ] {
             assert!(
                 matches!(subject(&mut context, &parse(sql)), Ok(Some(Subject::Expression { .. }))),

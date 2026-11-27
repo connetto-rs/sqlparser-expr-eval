@@ -1310,6 +1310,30 @@ mod tests {
     }
 
     #[test]
+    fn retain_forgets_one_resolution_of_an_expression_and_keeps_the_other() {
+        let read = |column: &str| {
+            Subject::Expression {
+                expression: Expr::Identifier(Ident::new("g")),
+                references: vec![column.to_string()],
+            }
+        };
+        let mut guarantees = Guarantees::<String>::new();
+        guarantees.restrict(read("outer.o"), int4_known(1));
+        guarantees.restrict(read("nested.o"), int4_known(2));
+        guarantees.retain(|subject| *subject != read("nested.o"));
+        assert_eq!(guarantees.get(&read("outer.o")), Some(&int4_known(1)));
+        assert_eq!(guarantees.get(&read("nested.o")), None);
+        // An expression only a relation names is forgotten with it.
+        let lone = Subject::Expression {
+            expression: Expr::Identifier(Ident::new("h")),
+            references: Vec::new(),
+        };
+        guarantees.relate(Order::Number, &lone, &read("outer.o"), Relation::LESS);
+        guarantees.retain(|_| false);
+        assert!(guarantees.is_empty());
+    }
+
+    #[test]
     fn retain_forgets_subjects_only_a_relation_names_deciding_each_once() {
         let (y, u, w) = (ref_subject("y"), ref_subject("u"), ref_subject("w"));
         let mut guarantees = integers(&["y"], &[]);
