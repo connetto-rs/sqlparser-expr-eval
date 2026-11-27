@@ -752,9 +752,10 @@ fn related<D: EvalDialect, C: Context>(
     if !state.guarantees.has_relations() && left != right {
         return Ok(compared);
     }
-    let (Some(left), Some(right)) =
-        (support::subject(state.context, left)?, support::subject(state.context, right)?)
-    else {
+    let (Some(left), Some(right)) = (
+        support::subject(state.dialect, state.options, state.context, left)?,
+        support::subject(state.dialect, state.options, state.context, right)?,
+    ) else {
         return Ok(compared);
     };
     let relation = state.guarantees.relation(order, &left, &right);

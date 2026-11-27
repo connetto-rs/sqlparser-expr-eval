@@ -145,6 +145,14 @@ pub trait EvalDialect {
         None
     }
 
+    /// Whether a call of `name` that [`named_call`](Self::named_call)
+    /// recognises is an immutable function of its arguments, such as
+    /// `COALESCE`, so that it takes one value wherever they do.
+    fn named_call_is_immutable(&self, name: &str, options: &Self::Options) -> bool {
+        let _ = (name, options);
+        false
+    }
+
     /// The operand of `left = right` when the dialect reads the form as
     /// `operand IS NULL`, `None` when no side is a literal `NULL`.
     fn null_equals_operand<'a>(

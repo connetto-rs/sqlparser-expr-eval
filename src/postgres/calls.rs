@@ -11,6 +11,12 @@ use crate::{
     support,
 };
 
+/// Whether `name` is one of `COALESCE`, `NULLIF`, `GREATEST` and `LEAST`,
+/// which PostgreSQL evaluates as immutable expressions over their arguments.
+pub(super) fn folds_by_name(name: &str) -> bool {
+    matches!(name, "coalesce" | "nullif" | "greatest" | "least")
+}
+
 /// `COALESCE`, `NULLIF`, `GREATEST` and `LEAST`, recognised by name under
 /// PostgreSQL before the context is asked.
 pub(super) fn name_recognised(
@@ -18,7 +24,7 @@ pub(super) fn name_recognised(
     argument_evaluations: &[Evaluation],
     error: bool,
 ) -> Option<Evaluation> {
-    if !matches!(name, "coalesce" | "nullif" | "greatest" | "least") {
+    if !folds_by_name(name) {
         return None;
     }
     let first = argument_evaluations.first()?;

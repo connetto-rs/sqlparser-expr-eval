@@ -296,7 +296,9 @@ fn restrict_subject<D: EvalDialect, C: Context>(
     } else {
         expression
     };
-    if let Some(subject) = support::subject(state.context, expression)? {
+    if let Some(subject) =
+        support::subject(state.dialect, state.options, state.context, expression)?
+    {
         state.guarantees.restrict(subject, evaluation);
     }
     Ok(())
@@ -1160,9 +1162,10 @@ fn relate<D: EvalDialect, C: Context>(
     let Some(order) = state.dialect.comparison_order(left_type, right_type, state.options) else {
         return Ok(());
     };
-    let (Some(left), Some(right)) =
-        (support::subject(state.context, left)?, support::subject(state.context, right)?)
-    else {
+    let (Some(left), Some(right)) = (
+        support::subject(state.dialect, state.options, state.context, left)?,
+        support::subject(state.dialect, state.options, state.context, right)?,
+    ) else {
         return Ok(());
     };
     let relation = if is_true { op.relation() } else { op.relation().complement() };

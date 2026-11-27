@@ -150,6 +150,11 @@ impl EvalDialect for PostgreSqlDialect {
         })
     }
 
+    fn named_call_is_immutable(&self, name: &str, options: &PostgreSqlOptions) -> bool {
+        let _ = options;
+        calls::folds_by_name(name)
+    }
+
     fn null_equals_operand<'a>(
         &self,
         left: &'a Expr,

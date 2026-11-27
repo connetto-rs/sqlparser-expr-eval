@@ -12,6 +12,7 @@ use sqlparser::ast::{
 
 use super::{
     context::{Callee, CalleeKind, Context, Resolved, Volatility},
+    dialect::EvalDialect,
     domain::{Evaluation, Interval, Outcomes, Values},
     forward::DEPTH_LIMIT,
     guarantees::Subject,
@@ -45,12 +46,15 @@ pub(crate) fn resolve_reference<C: Context>(
 ///
 /// An expression other than a reference is a subject when it takes one
 /// value on a row of one statement. Its calls are ordinary functions no
-/// more volatile than stable, the names it reads outside its subqueries
-/// resolve through the context, and its subqueries read no outer column.
-/// Two calls of `random()` differ. The subject holds the references the
-/// names resolve to, so an expression spelled alike in a nested query,
-/// where a name may read another column, is another subject.
-pub(crate) fn subject<C: Context>(
+/// more volatile than stable, or calls the dialect recognises as immutable
+/// by name, the names it reads outside its subqueries resolve through the
+/// context, and its subqueries read no outer column. Two calls of
+/// `random()` differ. The subject holds the references the names resolve
+/// to, so an expression spelled alike in a nested query, where a name may
+/// read another column, is another subject.
+pub(crate) fn subject<D: EvalDialect, C: Context>(
+    dialect: &D,
+    options: &D::Options,
     context: &mut C,
     expression: &Expr,
 ) -> Result<Option<Subject<C::Reference>>, C::Error> {
@@ -58,7 +62,7 @@ pub(crate) fn subject<C: Context>(
     if let Some(resolved) = resolve_reference(context, expression)? {
         return Ok(Some(Subject::Reference(resolved.reference)));
     }
-    let mut references = Vec::new();
+    let mut walk = SubjectWalk { dialect, options, context, references: Vec::new() };
     let mut stack = vec![(expression, 0)];
     while let Some((node, depth)) = stack.pop() {
         // A subject is copied and compared by recursion, so one deeper than
@@ -67,25 +71,33 @@ pub(crate) fn subject<C: Context>(
             return Ok(None);
         }
         let mut operands = Deeper { stack: &mut stack, depth: depth + 1 };
-        if !stable_node(context, node, Some(depth), &mut operands, &mut references)? {
+        if !stable_node(&mut walk, node, Some(depth), &mut operands)? {
             return Ok(None);
         }
     }
-    Ok(Some(Subject::Expression { expression: expression.clone(), references }))
+    Ok(Some(Subject::Expression { expression: expression.clone(), references: walk.references }))
+}
+
+/// The dialect, its settings and the context [`subject`] reads an
+/// expression under, with the references its names resolved to so far.
+struct SubjectWalk<'a, D: EvalDialect, C: Context> {
+    dialect: &'a D,
+    options: &'a D::Options,
+    context: &'a mut C,
+    references: Vec<C::Reference>,
 }
 
 /// Whether `node` keeps the expression it stands in one value on a row of
 /// one statement as [`subject`] reads it, extending `operands` with the
-/// operands that must as well and `references` with what its name resolves
-/// to. `depth` is how deep `node` stands in the subject, `None` in a
-/// subquery, whose own relations may hold a column of any name, so it
+/// operands that must as well and the walk's references with what its name
+/// resolves to. `depth` is how deep `node` stands in the subject, `None` in
+/// a subquery, whose own relations may hold a column of any name, so it
 /// names none, and whose nested queries the caller walks itself.
-fn stable_node<'a, C: Context>(
-    context: &mut C,
+fn stable_node<'a, D: EvalDialect, C: Context>(
+    walk: &mut SubjectWalk<'_, D, C>,
     node: &'a Expr,
     depth: Option<u32>,
     operands: &mut impl Extend<&'a Expr>,
-    references: &mut Vec<C::Reference>,
 ) -> Result<bool, C::Error> {
     if is_reference(node) {
         // A positional parameter is no column, so a subquery never hides
@@ -95,29 +107,35 @@ fn stable_node<'a, C: Context>(
         if depth.is_none() && !parameter {
             return Ok(false);
         }
-        return Ok(match context.reference(node)? {
+        return Ok(match walk.context.reference(node)? {
             Some(resolved) => {
-                references.push(resolved.reference);
+                walk.references.push(resolved.reference);
                 true
             }
             None => parameter,
         });
     }
-    let query = |context: &mut C, subquery: &Query, references: &mut Vec<C::Reference>| {
-        depth.map_or(Ok(true), |depth| stable_query(context, subquery, depth, references))
+    let query = |walk: &mut SubjectWalk<'_, D, C>, subquery: &Query| {
+        depth.map_or(Ok(true), |depth| stable_query(walk, subquery, depth))
     };
     Ok(match node {
+        Expr::Function(call)
+            if simple_name(&call.name)
+                .is_some_and(|name| walk.dialect.named_call_is_immutable(&name, walk.options)) =>
+        {
+            let arguments = plain_arguments(call);
+            operands.extend(arguments.into_iter().flatten().filter_map(argument_expression));
+            arguments.is_some()
+        }
         Expr::Function(call) => {
-            push_call_arguments(context, operands, call, |callee| {
+            push_call_arguments(walk.context, operands, call, |callee| {
                 callee.volatility <= Volatility::Stable
             })?
         }
-        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
-            query(context, subquery, references)?
-        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => query(walk, subquery)?,
         Expr::In { expr, target: InTarget::Subquery(subquery), .. } => {
             operands.extend([&**expr]);
-            query(context, subquery, references)?
+            query(walk, subquery)?
         }
         Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
             operands.extend([&**left, &**right]);
@@ -145,15 +163,15 @@ impl<'a> Extend<&'a Expr> for Deeper<'_, 'a> {
 /// The query names no column, since any may be an outer one, reads no table
 /// or view, since a view may run a volatile function, and takes no rows by
 /// an order that may change between two scans. Each node holds what
-/// [`stable_node`] asks of a nested one, and `references` gains what its
-/// parameters resolve to. The query stands `depth` deep in the subject.
-fn stable_query<C: Context>(
-    context: &mut C,
+/// [`stable_node`] asks of a nested one, and the walk's references gain
+/// what its parameters resolve to. The query stands `depth` deep in the
+/// subject.
+fn stable_query<D: EvalDialect, C: Context>(
+    walk: &mut SubjectWalk<'_, D, C>,
     query: &Query,
     depth: u32,
-    references: &mut Vec<C::Reference>,
 ) -> Result<bool, C::Error> {
-    match query.visit(&mut StableQuery { context, references, depth }) {
+    match query.visit(&mut StableQuery { walk, depth }) {
         ControlFlow::Continue(()) => Ok(true),
         ControlFlow::Break(None) => Ok(false),
         ControlFlow::Break(Some(error)) => Err(error),
@@ -162,14 +180,13 @@ fn stable_query<C: Context>(
 
 /// The walk of [`stable_query`], breaking with `None` at the first part
 /// that may differ between two readings and with the context's error.
-struct StableQuery<'a, C: Context> {
-    context: &'a mut C,
-    references: &'a mut Vec<C::Reference>,
+struct StableQuery<'w, 'a, D: EvalDialect, C: Context> {
+    walk: &'w mut SubjectWalk<'a, D, C>,
     /// How deep the walk stands in the subject.
     depth: u32,
 }
 
-impl<C: Context> StableQuery<'_, C> {
+impl<D: EvalDialect, C: Context> StableQuery<'_, '_, D, C> {
     /// Continues when `stable` holds, breaking as [`StableQuery`] does.
     fn proceed(stable: Result<bool, C::Error>) -> ControlFlow<Option<C::Error>> {
         match stable {
@@ -202,13 +219,13 @@ impl<C: Context> StableQuery<'_, C> {
             over: None,
             within_group: Vec::new(),
         };
-        push_call_arguments(self.context, &mut Discard, &call, |callee| {
+        push_call_arguments(self.walk.context, &mut Discard, &call, |callee| {
             callee.volatility <= Volatility::Stable
         })
     }
 }
 
-impl<C: Context> Visitor for StableQuery<'_, C> {
+impl<D: EvalDialect, C: Context> Visitor for StableQuery<'_, '_, D, C> {
     type Break = Option<C::Error>;
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
@@ -254,7 +271,7 @@ impl<C: Context> Visitor for StableQuery<'_, C> {
 
     fn pre_visit_expr(&mut self, node: &Expr) -> ControlFlow<Self::Break> {
         self.descend()?;
-        Self::proceed(stable_node(self.context, node, None, &mut Discard, self.references))
+        Self::proceed(stable_node(self.walk, node, None, &mut Discard))
     }
 
     fn post_visit_expr(&mut self, _node: &Expr) -> ControlFlow<Self::Break> {
@@ -374,23 +391,9 @@ fn push_call_arguments<'a, C: Context>(
     call: &'a Function,
     admits: impl Fn(&Callee) -> bool,
 ) -> Result<bool, C::Error> {
-    let arguments = match &call.args {
-        FunctionArguments::None => &[][..],
-        FunctionArguments::List(list)
-            if list.clauses.is_empty() && list.duplicate_treatment.is_none() =>
-        {
-            &list.args[..]
-        }
-        _ => return Ok(false),
-    };
-    if call.over.is_some()
-        || call.filter.is_some()
-        || !call.within_group.is_empty()
-        || !matches!(call.parameters, FunctionArguments::None)
-        || arguments.iter().any(|argument| argument_expression(argument).is_none())
-    {
+    let Some(arguments) = plain_arguments(call) else {
         return Ok(false);
-    }
+    };
     let callees = context.callees(call)?;
     let admitted = !callees.is_empty()
         && callees.iter().all(|callee| callee.kind == CalleeKind::Normal && admits(callee));
@@ -398,6 +401,27 @@ fn push_call_arguments<'a, C: Context>(
         stack.extend(arguments.iter().filter_map(argument_expression));
     }
     Ok(admitted)
+}
+
+/// The arguments of `call` when it is a plain call, one with no window,
+/// filter, ordered set, parameters, `DISTINCT` or argument clause, whose
+/// every argument is an expression.
+fn plain_arguments(call: &Function) -> Option<&[FunctionArg]> {
+    let arguments = match &call.args {
+        FunctionArguments::None => &[][..],
+        FunctionArguments::List(list)
+            if list.clauses.is_empty() && list.duplicate_treatment.is_none() =>
+        {
+            &list.args[..]
+        }
+        _ => return None,
+    };
+    let plain = call.over.is_none()
+        && call.filter.is_none()
+        && call.within_group.is_empty()
+        && matches!(call.parameters, FunctionArguments::None)
+        && arguments.iter().all(|argument| argument_expression(argument).is_some());
+    plain.then_some(arguments)
 }
 
 /// Whether the planner may fold `expression` to a `NULL` constant, which a
@@ -772,19 +796,31 @@ mod tests {
     use core::ops::Bound;
 
     use sql_values::postgres::{IntegerType, PgNumeric, PgValue};
-    use sqlparser::ast::{Expr, Function};
+    use sqlparser::{
+        ast::{Expr, Function},
+        dialect::{GenericDialect, PostgreSqlDialect},
+    };
 
     use super::{
         and_outcomes, intervals_disjoint, is_reference, not_outcomes, number_bounds, or_outcomes,
-        prune, subject, unnest, values_share,
+        prune, unnest, values_share,
     };
     use crate::{
+        PostgreSqlOptions,
         context::{Callee, CalleeKind, Context, NullInput, NullResult, Resolved, Volatility},
         domain::{Evaluation, Interval, Outcomes, Unlisted, Values},
         guarantees::Subject,
         scalar::{ScalarType, TextRules},
         test_context::{ColumnContext, parse, strict_callee},
     };
+
+    /// [`super::subject`] under PostgreSQL with its default settings.
+    fn subject<C: Context>(
+        context: &mut C,
+        expression: &Expr,
+    ) -> Result<Option<Subject<C::Reference>>, C::Error> {
+        super::subject(&PostgreSqlDialect {}, &PostgreSqlOptions::default(), context, expression)
+    }
 
     /// A context whose callee lookup always fails.
     struct FailingCallees;
@@ -942,6 +978,37 @@ mod tests {
         ] {
             assert!(matches!(subject(&mut context, &parse(sql)), Ok(None)), "{sql}");
         }
+    }
+
+    #[test]
+    fn a_call_the_dialect_folds_by_name_is_a_subject_over_stable_arguments() {
+        let text = ScalarType::Text(TextRules::DEFAULT);
+        let mut context = ColumnContext::new().with_callee("upper", strict_callee(text));
+        for sql in [
+            "NULLIF(upper('a'), '')",
+            "COALESCE(upper('a'), 'b')",
+            "GREATEST(1, 2)",
+            "LEAST(1, 2)",
+            "1 IN (SELECT coalesce(1, 2))",
+        ] {
+            assert!(
+                matches!(subject(&mut context, &parse(sql)), Ok(Some(Subject::Expression { .. }))),
+                "{sql}"
+            );
+        }
+        // a quoted or qualified name names a routine the context must know,
+        // and every argument must hold one value
+        for sql in [
+            "\"nullif\"(1, 2)",
+            "pg_catalog.coalesce(1, 2)",
+            "coalesce(nosuch('a'), 1)",
+            "coalesce(1, 2) FILTER (WHERE true)",
+        ] {
+            assert!(matches!(subject(&mut context, &parse(sql)), Ok(None)), "{sql}");
+        }
+        // a dialect recognising no call by name asks the context for each
+        let generic = super::subject(&GenericDialect, &(), &mut context, &parse("coalesce(1, 2)"));
+        assert!(matches!(generic, Ok(None)));
     }
 
     #[test]
