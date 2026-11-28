@@ -872,8 +872,8 @@ fn listed_union<D: EvalDialect, C: Context>(
 /// The members of an `IN` list or an `ANY`/`ALL` array, typed by their
 /// constants so each compares under its own type: integers as `bigint`,
 /// which holds every one, integers among `numeric`s as `numeric`s, `jsonb`
-/// as the unmodelled type a `jsonb` column reads as, and text untyped, as
-/// the literal a column reads under its own type.
+/// and `uuid` as the unmodelled types a column of each reads as, and text
+/// untyped, as the literal a column reads under its own type.
 fn typed_members(values: Values, null: bool) -> Evaluation {
     let Values::Listed(listed) = values else {
         return Evaluation::new(ScalarType::Unknown, null, false, values);
@@ -886,6 +886,7 @@ fn typed_members(values: Values, null: bool) -> Evaluation {
             PgValue::Date(_) => ScalarType::Date,
             PgValue::Timestamp(_) => ScalarType::Timestamp,
             PgValue::Jsonb(_) => ScalarType::catalog("jsonb"),
+            PgValue::Uuid(_) => ScalarType::catalog("uuid"),
             PgValue::Text(_) | PgValue::Array(_) => ScalarType::Unknown,
         }
     };
@@ -2056,6 +2057,30 @@ mod tests {
         let j = column(&guarantees, "j");
         assert!(j.may_be(&jsonb("[1, 2]")));
         assert!(!j.may_be(&jsonb("[]")));
+    }
+
+    /// `uuid` members read as the type a `uuid` column has, so they narrow
+    /// it to themselves, while a list mixing them with text has no type.
+    #[test]
+    fn uuid_members_narrow_a_uuid_column() {
+        let uuid = |text: &str| PgValue::Uuid(sql_values::postgres::PgUuid::parse(text).unwrap());
+        let member = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+        let other = "00000000-0000-0000-0000-000000000000";
+        let context = ColumnContext::new()
+            .with_column("u", plain_column(ScalarType::catalog("uuid")))
+            .with_column("k", Evaluation::known(uuid(member), ScalarType::catalog("uuid")));
+        let guarantees = implied_with(context, &parse("u IN (k)"), Outcomes::TRUE);
+        let u = column(&guarantees, "u");
+        assert!(u.may_be(&uuid(member)));
+        assert!(!u.may_be(&uuid(other)));
+
+        let uuids = typed_members(Values::Listed([uuid(member), uuid(other)].into()), false);
+        assert_eq!(uuids.ty(), &ScalarType::catalog("uuid"));
+        let mixed = typed_members(
+            Values::Listed([uuid(member), PgValue::Text(other.into())].into()),
+            false,
+        );
+        assert_eq!(mixed.ty(), &ScalarType::Unknown);
     }
 
     #[test]
