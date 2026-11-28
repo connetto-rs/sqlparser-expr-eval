@@ -54,7 +54,7 @@ pub(crate) fn comparison_category<'a>(
         (ScalarType::Enum(a), ScalarType::Enum(b)) if a == b => Category::Enum(a),
         // PostgreSQL compares arrays of one element type only, without the
         // implicit casts between the elements.
-        (ScalarType::Array(a), ScalarType::Array(b)) if same_element(*a, *b) => {
+        (ScalarType::Array(a), ScalarType::Array(b)) if same_element(a, b) => {
             Category::Array(a.scalar())
         }
         _ => return None,
@@ -63,11 +63,11 @@ pub(crate) fn comparison_category<'a>(
 
 /// Whether two array element types are the one type an array comparison
 /// takes, text of any collation being `text`.
-fn same_element(left: ArrayElement, right: ArrayElement) -> bool {
+fn same_element(left: &ArrayElement, right: &ArrayElement) -> bool {
     match (left, right) {
         (ArrayElement::Text(_), ArrayElement::Text(_))
-        | (ArrayElement::Unknown | ArrayElement::Other, _)
-        | (_, ArrayElement::Unknown | ArrayElement::Other) => true,
+        | (ArrayElement::Unknown | ArrayElement::Other(_), _)
+        | (_, ArrayElement::Unknown | ArrayElement::Other(_)) => true,
         _ => left == right,
     }
 }
@@ -312,7 +312,7 @@ fn comparable(left: &Evaluation, right: &Evaluation) -> bool {
                 || matches!(
                     (l, r),
                     (ScalarType::Array(a), ScalarType::Array(b))
-                        if same_element(*a, *b) && !a.is_text()
+                        if same_element(a, b) && !a.is_text()
                 )
         }
     }
