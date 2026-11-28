@@ -41,13 +41,6 @@ pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluatio
                 .is_none_or(|category| text_arrays(&category));
         return Comparison::new(RowKinds::NONE, error || refused);
     }
-    // An unmodelled type may have the operator, with any outcome.
-    if !modelled {
-        return crate::forward::fold::standard_comparison(&left, op, &right, true);
-    }
-    let Some(category) = comparison_category(left.ty(), right.ty()) else {
-        return Comparison::new(RowKinds::NONE, true);
-    };
     let valid_op = matches!(
         op,
         BinaryOperator::Eq
@@ -57,6 +50,16 @@ pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluatio
             | BinaryOperator::Gt
             | BinaryOperator::GtEq
     );
+    if !modelled {
+        if valid_op && ordered_builtin(left.ty(), right.ty()) {
+            return Comparison::new(RowKinds::ANY, error);
+        }
+        // An unmodelled type may have the operator, with any outcome.
+        return crate::forward::fold::standard_comparison(&left, op, &right, true);
+    }
+    let Some(category) = comparison_category(left.ty(), right.ty()) else {
+        return Comparison::new(RowKinds::NONE, true);
+    };
     if !valid_op {
         return Comparison::new(RowKinds::NONE, true);
     }
@@ -69,6 +72,34 @@ pub(super) fn comparison(left: Evaluation, op: &BinaryOperator, right: Evaluatio
     }
     let refused = text_arrays(&category);
     Comparison::new(pair_analysis(&left, &right, &category, op), error || refused)
+}
+
+/// Whether both sides are one built-in type whose default btree operator
+/// class compares any two of its values without raising. A type goes by its
+/// name, as [`OtherType`](crate::OtherType) identifies it, so a bare or a
+/// `pg_catalog` spelling names the built-in.
+fn ordered_builtin(left: &ScalarType, right: &ScalarType) -> bool {
+    let (ScalarType::Other(Some(left)), ScalarType::Other(Some(right))) = (left, right) else {
+        return false;
+    };
+    left == right
+        && matches!(
+            left.name(),
+            "uuid"
+                | "timestamptz"
+                | "time"
+                | "timetz"
+                | "interval"
+                | "bytea"
+                | "inet"
+                | "cidr"
+                | "macaddr"
+                | "macaddr8"
+                | "jsonb"
+                | "bit"
+                | "varbit"
+                | "money"
+        )
 }
 
 /// The operands with their unknown-literal types resolved against the other
@@ -581,5 +612,63 @@ mod tests {
         );
         assert!(matches!(resolved.values(), Values::Unlisted(_)));
         assert!(resolved.may_be_null());
+    }
+
+    /// A column of the type `sql` spells, as a table definition spells it.
+    fn spelled_column(sql: &str) -> Evaluation {
+        let data_type = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(sql)
+            .and_then(|mut parser| parser.parse_data_type())
+            .expect("a data type");
+        Evaluation::new(ScalarType::of(&data_type), true, false, Values::Unlisted(Unlisted::any()))
+    }
+
+    /// The columns of `uuid`, `timestamptz`, `inet`, `json`, `point`,
+    /// `citext`, `timestamp`, `jsonb` and a `public.inet`, and a query
+    /// projecting `uuid`.
+    fn typed_columns() -> ColumnContext {
+        ColumnContext::new()
+            .with_column("p", spelled_column("UUID"))
+            .with_column("e", spelled_column("TIMESTAMP WITH TIME ZONE"))
+            .with_column("i", spelled_column("pg_catalog.INET"))
+            .with_column("j", spelled_column("JSON"))
+            .with_column("g", spelled_column("POINT"))
+            .with_column("c", spelled_column("citext"))
+            .with_column("d", spelled_column("TIMESTAMP"))
+            .with_column("b", spelled_column("JSONB"))
+            .with_column("o", spelled_column("public.inet"))
+            .with_query(crate::Rows { none: true, one: true, many: true }, spelled_column("UUID"))
+    }
+
+    #[test]
+    fn two_values_of_one_ordered_builtin_type_compare_without_raising() {
+        for condition in [
+            "p = p",
+            "p <> p",
+            "p < p",
+            "p >= p",
+            "p IS NOT DISTINCT FROM p",
+            "p IS DISTINCT FROM p",
+            "p IN (p, p)",
+            "p NOT IN (p, p)",
+            "p IN (SELECT p FROM t)",
+            "p = ANY (SELECT p FROM t)",
+            "p = ANY (ARRAY[p, p])",
+            "e = e",
+            "e > CURRENT_TIMESTAMP",
+            "i <= i",
+            "b = b",
+        ] {
+            let result = read(typed_columns(), condition);
+            assert!(!result.may_raise(), "{condition} never raises");
+            assert!(result.may_be_true() && result.may_be_false(), "{condition} takes both truths");
+        }
+    }
+
+    #[test]
+    fn a_type_without_a_btree_order_or_a_pair_of_types_may_raise() {
+        for condition in ["j = j", "g = g", "c = c", "o = o", "e > d", "p = b", "p = 'x'"] {
+            assert!(read(typed_columns(), condition).may_raise(), "{condition} may raise");
+        }
     }
 }
