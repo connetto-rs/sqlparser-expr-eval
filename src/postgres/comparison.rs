@@ -140,7 +140,7 @@ mod tests {
     use super::comparison;
     use crate::{
         domain::{Evaluation, Unlisted, Values},
-        scalar::{ScalarType, TextRules},
+        scalar::{EnumType, ScalarType, TextRules},
         test_context::{ColumnContext, read},
     };
 
@@ -623,9 +623,16 @@ mod tests {
         Evaluation::new(ScalarType::of(&data_type), true, false, Values::Unlisted(Unlisted::any()))
     }
 
+    /// The array a context answers `ARRAY(query)` with for a query projecting
+    /// `column`, never `NULL` and of unlisted values.
+    fn query_array(column: &Evaluation) -> Evaluation {
+        let ty = ScalarType::Array(crate::ArrayElement::of(column.ty()));
+        Evaluation::new(ty, false, false, Values::Unlisted(Unlisted::any()))
+    }
+
     /// The columns of `uuid`, `timestamptz`, `inet`, `json`, `point`,
     /// `citext`, `timestamp`, `jsonb` and a `public.inet`, and a query
-    /// projecting `uuid`.
+    /// projecting `uuid`, which `ARRAY(SELECT p FROM t)` collects.
     fn typed_columns() -> ColumnContext {
         ColumnContext::new()
             .with_column("p", spelled_column("UUID"))
@@ -638,6 +645,7 @@ mod tests {
             .with_column("b", spelled_column("JSONB"))
             .with_column("o", spelled_column("public.inet"))
             .with_query(crate::Rows { none: true, one: true, many: true }, spelled_column("UUID"))
+            .with_expression("ARRAY(SELECT p FROM t)", query_array(&spelled_column("UUID")))
     }
 
     #[test]
@@ -654,6 +662,8 @@ mod tests {
             "p IN (SELECT p FROM t)",
             "p = ANY (SELECT p FROM t)",
             "p = ANY (ARRAY[p, p])",
+            "p = ANY (ARRAY(SELECT p FROM t))",
+            "p <> ALL (ARRAY(SELECT p FROM t))",
             "e = e",
             "e > CURRENT_TIMESTAMP",
             "i <= i",
@@ -667,8 +677,46 @@ mod tests {
 
     #[test]
     fn a_type_without_a_btree_order_or_a_pair_of_types_may_raise() {
-        for condition in ["j = j", "g = g", "c = c", "o = o", "e > d", "p = b", "p = 'x'"] {
+        for condition in [
+            "j = j",
+            "g = g",
+            "c = c",
+            "o = o",
+            "e > d",
+            "p = b",
+            "p = 'x'",
+            "b = ANY (ARRAY(SELECT p FROM t))",
+        ] {
             assert!(read(typed_columns(), condition).may_raise(), "{condition} may raise");
         }
+    }
+
+    /// An enum value against an array a query builds of its own enum and
+    /// one of another enum, and arrays of the one enum and of two.
+    #[test]
+    fn an_array_element_keeps_its_enum_type() {
+        let enumeration = |name: &str| {
+            let ty = EnumType::new(name, ["note", "task"]);
+            Evaluation::new(
+                ScalarType::Enum(alloc::sync::Arc::new(ty)),
+                true,
+                false,
+                Values::Unlisted(Unlisted::any()),
+            )
+        };
+        let condition = "k = ANY (ARRAY(SELECT k FROM t))";
+        let context = |element: &str| {
+            ColumnContext::new()
+                .with_column("k", enumeration("kinds"))
+                .with_column("s", enumeration("states"))
+                .with_expression("ARRAY(SELECT k FROM t)", query_array(&enumeration(element)))
+        };
+        let own = read(context("kinds"), condition);
+        assert!(!own.may_raise(), "{condition} over its own enum never raises");
+        assert!(own.may_be_true() && own.may_be_false(), "{condition} takes both truths");
+        assert!(read(context("states"), condition).may_raise(), "another enum may raise");
+        assert!(!read(context("kinds"), "ARRAY[k] = ARRAY[k]").may_raise());
+        // PostgreSQL has no operator between arrays of two enums.
+        assert!(read(context("kinds"), "ARRAY[k] = ARRAY[s]").may_raise());
     }
 }

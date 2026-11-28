@@ -302,7 +302,7 @@ pub enum ScalarType {
 
 /// The element type of an array, any scalar type that is not itself an
 /// array, since PostgreSQL types an array by its element alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArrayElement {
     /// The element type is not known.
     Unknown,
@@ -320,15 +320,16 @@ pub enum ArrayElement {
     Date,
     /// `timestamp` without time zone.
     Timestamp,
-    /// Any other known type whose values are not modelled.
-    Other,
+    /// A PostgreSQL enum type.
+    Enum(Arc<EnumType>),
+    /// Any other known type whose values are not modelled, with the type it
+    /// stands for, `None` when the reading cannot name one type.
+    Other(Option<OtherType>),
 }
 
 impl ArrayElement {
     /// The element type of an array of `ty`, the element of an array being
-    /// its own element, an untyped literal being `text`, and an enum, whose
-    /// arrays the evaluator does not model, being `Other`. An array of an
-    /// unmodelled type keeps no identity for its element.
+    /// its own element and an untyped literal being `text`.
     #[must_use]
     pub fn of(ty: &ScalarType) -> Self {
         match ty {
@@ -341,24 +342,26 @@ impl ArrayElement {
             ScalarType::Text(rules) => ArrayElement::Text(*rules),
             ScalarType::Date => ArrayElement::Date,
             ScalarType::Timestamp => ArrayElement::Timestamp,
-            ScalarType::Enum(_) | ScalarType::Other(_) => ArrayElement::Other,
-            ScalarType::Array(element) => *element,
+            ScalarType::Enum(enumeration) => ArrayElement::Enum(Arc::clone(enumeration)),
+            ScalarType::Other(other) => ArrayElement::Other(other.clone()),
+            ScalarType::Array(element) => element.clone(),
         }
     }
 
     /// The element type as a scalar type.
     #[must_use]
-    pub fn scalar(self) -> ScalarType {
+    pub fn scalar(&self) -> ScalarType {
         match self {
             ArrayElement::Unknown => ScalarType::Unknown,
             ArrayElement::Boolean => ScalarType::Boolean,
-            ArrayElement::Integer(integer) => ScalarType::Integer(integer),
+            ArrayElement::Integer(integer) => ScalarType::Integer(*integer),
             ArrayElement::Numeric => ScalarType::Numeric,
             ArrayElement::Float => ScalarType::Float,
-            ArrayElement::Text(rules) => ScalarType::Text(rules),
+            ArrayElement::Text(rules) => ScalarType::Text(*rules),
             ArrayElement::Date => ScalarType::Date,
             ArrayElement::Timestamp => ScalarType::Timestamp,
-            ArrayElement::Other => ScalarType::Other(None),
+            ArrayElement::Enum(enumeration) => ScalarType::Enum(Arc::clone(enumeration)),
+            ArrayElement::Other(other) => ScalarType::Other(other.clone()),
         }
     }
 
@@ -366,7 +369,7 @@ impl ArrayElement {
     /// `varchar`, and whose arrays it compares between one `text` spelling
     /// only.
     #[must_use]
-    pub fn is_text(self) -> bool {
+    pub fn is_text(&self) -> bool {
         matches!(self, ArrayElement::Text(_))
     }
 }
@@ -1139,6 +1142,9 @@ mod tests {
             ScalarType::Date,
             ScalarType::Timestamp,
             ScalarType::Other(None),
+            ScalarType::Other(Some(OtherType::catalog("uuid"))),
+            ScalarType::Other(Some(OtherType::new("money_amount"))),
+            ScalarType::Enum(Arc::new(EnumType::new("kinds", ["note", "task"]))),
         ] {
             let array = ScalarType::Array(ArrayElement::of(&ty));
             assert_eq!(ArrayElement::of(&array), ArrayElement::of(&ty));
